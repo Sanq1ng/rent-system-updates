@@ -1,0 +1,280 @@
+"use strict";
+
+const fs = require("node:fs");
+const path = require("node:path");
+const os = require("node:os");
+const crypto = require("node:crypto");
+const { DatabaseSync } = require("node:sqlite");
+const { SCHEMA_VERSION } = require("../server/push-schema.cjs");
+const { defaultConfigFile, UUID } = require("./layout.cjs");
+const { regularFile, assertDirectory, sameOrInside, writeFile, digest, syncDirectory } = require("../updates/files.cjs");
+const { loadState, TERMINAL } = require("../updates/state.cjs");
+const { lanError, networkChoices, subnetOf, lanOrigin } = require("../shared/lan-policy.cjs");
+
+const PROGRAM = path.resolve(__dirname, "..");
+const RECORD = "lan-change.json";
+const CONFIRMATION = "请先让所有设备同步或导出加密本机工作，再停止主机；须明确提供 --offline-work confirmed。";
+
+function readJSON(file, maximum = 65536) {
+  regularFile(file, maximum);
+  const bytes = fs.readFileSync(file);
+  let value;
+  try { value = JSON.parse(bytes.toString("utf8")); }
+  catch (error) {
+    if (!(error instanceof SyntaxError)) throw error;
+    lanError("局域网配置或恢复记录不是完整 JSON，请保留文件，不要重新建账。");
+  }
+  return { bytes, value, hash: digest(bytes) };
+}
+
+function loadContext(configFile, program = PROGRAM) {
+  if (configFile !== undefined && (typeof configFile !== "string" || !path.isAbsolute(configFile))) {
+    lanError("请使用绝对路径指定主机配置，不会按工作目录猜测另一套安装。");
+  }
+  const file = configFile === undefined ? defaultConfigFile(program).file : path.resolve(configFile);
+  assertDirectory(path.dirname(file));
+  const config = readJSON(file);
+  if (!config.value || typeof config.value !== "object" || Array.isArray(config.value)) lanError("主机配置须是完整的设置对象。");
+  const recordFile = path.join(path.dirname(file), RECORD);
+  let change;
+  if (fs.existsSync(recordFile)) {
+    change = readJSON(recordFile).value;
+    if (!change || typeof change !== "object" || Array.isArray(change) ||
+        change.format !== "industrial-rent-lan-change" || change.formatVersion !== 1 ||
+        !UUID.test(change.id || "") || !UUID.test(change.serverId || "") ||
+        change.configFile !== file || !/^[a-f0-9]{64}$/.test(change.originalSha256 || "") ||
+        !/^[a-f0-9]{64}$/.test(change.configuredSha256 || "") ||
+        change.originalFile !== `config.before-lan-${change.id}.json` ||
+        typeof change.certificateDirectory !== "string" || !path.isAbsolute(change.certificateDirectory) ||
+        ![change.originalSha256, change.configuredSha256].includes(config.hash)) {
+      lanError("局域网维护记录与当前配置不一致，不能覆盖别人修改的配置。请保留记录交维护人员处理。");
+    }
+    const original = readJSON(path.join(path.dirname(file), change.originalFile));
+    if (original.hash !== change.originalSha256) lanError("原本机配置备份被修改，不能自动恢复。");
+  }
+  if (config.value.lan && !change) lanError("局域网配置的归属恢复记录缺失，请保留现有配置和证书交维护人员处理，不能重新覆盖登记。");
+  const baselineFile = change ? path.join(path.dirname(file), change.originalFile) : file;
+  const { resolveConfig } = require(path.join(program, "config.cjs"));
+  const baseline = resolveConfig(baselineFile);
+  return { program, file, config, change, recordFile, baseline };
+}
+
+function ledgerIdentity(config) {
+  const file = path.join(config.dataDir, "rent.sqlite");
+  if (!fs.existsSync(file)) return { serverId: null, initialized: false, schemaVersion: null };
+  assertDirectory(config.dataDir);
+  regularFile(file);
+  const db = new DatabaseSync(path.toNamespacedPath(file), { readOnly: true });
+  try {
+    const schemaVersion = db.prepare("PRAGMA user_version").get().user_version;
+    if (schemaVersion !== SCHEMA_VERSION || !db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='meta'").get()) {
+      lanError(`局域网向导要求同版本格式 ${SCHEMA_VERSION} 的正式账本。旧版本请先走完整维护升级，不能在这里新建或替换。`);
+    }
+    const serverId = db.prepare("SELECT value FROM meta WHERE key='server_id'").get()?.value;
+    if (!UUID.test(serverId || "")) lanError("账套身份记录无效，不能打开另一套空账。");
+    return { serverId, initialized: Boolean(db.prepare("SELECT 1 FROM users LIMIT 1").get()), schemaVersion };
+  } finally { db.close(); }
+}
+
+function status(options = {}, environment = {}) {
+  const context = loadContext(options.config, environment.program || PROGRAM);
+  const identity = ledgerIdentity(context.baseline);
+  const interfaces = networkChoices(environment.interfaces || os.networkInterfaces());
+  const lanEnabled = Boolean(context.change && context.config.hash === context.change.configuredSha256);
+  const current = context.config.value;
+  return {
+    format: "industrial-rent-lan-status", formatVersion: 1,
+    configFile: context.file, programDirectory: context.program, dataDir: context.baseline.dataDir,
+    backupDir: context.baseline.backupDir, updateDir: context.baseline.updateDir || null,
+    ...identity, sourceOrigin: current.publicOrigin || context.baseline.publicOrigin,
+    port: current.port ?? context.baseline.port, lanEnabled,
+    recoveryAvailable: Boolean(context.change), interfaces,
+    addressChanged: lanEnabled && !interfaces.some(item =>
+      item.address === current.lan?.address && item.prefixLength === current.lan?.prefixLength),
+    certificateDirectory: context.change?.certificateDirectory || null,
+    connectionFile: context.change ? path.join(context.change.certificateDirectory, "connection.rent-lan") : null,
+    networkSettings: lanEnabled ? current.lan : null,
+    firewallConfigured: false, trustConfigured: false, remoteReachabilityConfirmed: false,
+    note: "此命令只读取账套和网络候选；防火墙、证书信任及另一台电脑能否连接由向导分别确认。",
+  };
+}
+
+function certificateMaterial(directory, address, port, serverId) {
+  const root = path.resolve(directory);
+  assertDirectory(root);
+  const files = Object.fromEntries(["ca.pem", "ca.cer", "server.pem", "server-key.pem", "connection.rent-lan"]
+    .map(name => {
+      const file = path.join(root, name);
+      regularFile(file, 65536);
+      return [name, { file, bytes: fs.readFileSync(file) }];
+    }));
+  const ca = new crypto.X509Certificate(files["ca.pem"].bytes);
+  const certificate = new crypto.X509Certificate(files["server.pem"].bytes);
+  const key = crypto.createPrivateKey(files["server-key.pem"].bytes);
+  const now = Date.now();
+  if (!ca.raw.equals(files["ca.cer"].bytes) || !ca.ca || ca.issuer !== ca.subject || !ca.verify(ca.publicKey) ||
+      certificate.ca || !certificate.verify(ca.publicKey) || !certificate.checkPrivateKey(key) ||
+      certificate.checkIP(address) !== address || certificate.subjectAltName !== `IP Address:${address}` ||
+      !certificate.keyUsage?.includes("1.3.6.1.5.5.7.3.1") ||
+      Date.parse(certificate.validTo) > Date.parse(ca.validTo) ||
+      [ca, certificate].some(item => Date.parse(item.validFrom) > now || Date.parse(item.validTo) <= now + 86400000) ||
+      [ca.publicKey, certificate.publicKey].some(item => item.asymmetricKeyType !== "rsa" ||
+        item.asymmetricKeyDetails.modulusLength < 2048)) {
+    lanError("局域网证书、地址、用途、有效期或私钥不匹配，不会启用 HTTPS。");
+  }
+  const descriptor = readJSON(files["connection.rent-lan"].file, 32768).value;
+  const expectedOrigin = lanOrigin(address, port);
+  const caSha256 = digest(ca.raw);
+  if (!descriptor || typeof descriptor !== "object" || Array.isArray(descriptor) ||
+      Object.keys(descriptor).sort().join(",") !== "caCertificate,caSha256,createdAt,expiresAt,format,formatVersion,origin,serverId" ||
+      descriptor.format !== "industrial-rent-lan-connection" || descriptor.formatVersion !== 1 ||
+      descriptor.serverId !== serverId || descriptor.origin !== expectedOrigin ||
+      descriptor.caSha256 !== caSha256 || descriptor.caCertificate !== ca.raw.toString("base64") ||
+      !Number.isFinite(Date.parse(descriptor.createdAt)) ||
+      Date.parse(descriptor.expiresAt) !== Date.parse(certificate.validTo)) {
+    lanError("员工接入文件与本次账套、证书和地址不一致；不能发出错误接入包。");
+  }
+  return { root, certificate, caSha256, descriptor,
+    keyFile: files["server-key.pem"].file, certFile: files["server.pem"].file,
+    hashes: Object.fromEntries(Object.entries(files).map(([name, value]) => [name, digest(value.bytes)])) };
+}
+
+function requireUnchangedMaterial(material) {
+  for (const [name, hash] of Object.entries(material.hashes)) {
+    const file = path.join(material.root, name);
+    regularFile(file, 65536);
+    if (digest(fs.readFileSync(file)) !== hash) lanError("证书材料在配置期间发生变化，已停止。");
+  }
+}
+
+function atomicConfig(file, bytes, expectedHash) {
+  regularFile(file, 65536);
+  if (digest(fs.readFileSync(file)) !== expectedHash) lanError("原配置已变化，未覆盖。");
+  const temporary = path.join(path.dirname(file), `.lan-config-${crypto.randomUUID()}.pending`);
+  writeFile(temporary, bytes);
+  try {
+    if (digest(fs.readFileSync(file)) !== expectedHash) lanError("配置在提交前变化，未覆盖。");
+    fs.renameSync(temporary, file);
+    syncDirectory(path.dirname(file));
+  } finally {
+    if (fs.existsSync(temporary)) {
+      regularFile(temporary, 65536);
+      if (digest(fs.readFileSync(temporary)) !== digest(bytes)) lanError("临时配置被修改，已保留而非删除。");
+      fs.unlinkSync(temporary);
+    }
+  }
+}
+
+function withStoppedLedger(context, action) {
+  if (process.platform !== "win32") lanError("自动局域网配置仅适用于 Windows 主机。Linux 请使用独立部署流程。");
+  const identity = ledgerIdentity(context.baseline);
+  if (!identity.initialized) lanError("请先在主机本机完成管理员初始化，再启用局域网。不会把注册口令发到员工电脑。");
+  if (context.change && identity.serverId !== context.change.serverId) lanError("当前账套与局域网配置记录不符，不能接管。");
+  const job = loadState(context.baseline.updateDir || context.program).job;
+  if (job && !TERMINAL.has(job.phase)) lanError("程序更新尚未完成，请先完成或取消更新再改网络。");
+  const { acquireLock } = require(path.join(context.program, "host.cjs"));
+  const release = acquireLock(context.baseline.dataDir);
+  try {
+    const checked = ledgerIdentity(context.baseline);
+    if (checked.serverId !== identity.serverId || !checked.initialized) lanError("准备期间账套身份变化，已停止。");
+    return action(identity);
+  } finally { release(); }
+}
+
+function enable(options, environment = {}) {
+  if (options["offline-work"] !== "confirmed") lanError(CONFIRMATION);
+  if (!options["certificate-dir"]) lanError("缺少本次生成的证书目录。");
+  const context = loadContext(options.config, environment.program || PROGRAM);
+  if (context.change || context.config.value.lan) lanError("已有局域网配置或未完成记录；先在向导中恢复本机，再重新配置，不能覆盖来源。");
+  if (!["127.0.0.1", "::1", "localhost"].includes(context.baseline.host) ||
+      context.baseline.tls || context.baseline.reverseProxy) {
+    lanError("自动向导只接管普通本机模式，不覆盖已有 HTTPS、云端或反向代理配置。");
+  }
+  const address = options.address, prefixLength = Number(options["prefix-length"]);
+  const subnet = subnetOf(address, prefixLength);
+  if (!networkChoices(environment.interfaces || os.networkInterfaces()).some(item =>
+    item.address === address && item.prefixLength === prefixLength)) lanError("所选地址和子网不属于当前主机，请刷新网卡列表。");
+  return withStoppedLedger(context, identity => {
+    const material = certificateMaterial(options["certificate-dir"], address, context.baseline.port, identity.serverId);
+    if ([context.program, context.baseline.dataDir, context.baseline.backupDir, context.baseline.updateDir].filter(Boolean)
+      .some(protectedPath => sameOrInside(protectedPath, material.root) || sameOrInside(material.root, protectedPath))) {
+      lanError("证书必须放在程序、账本、备份和更新目录之外，不得随着程序重打包。");
+    }
+    const value = { ...context.config.value, host: address,
+      publicOrigin: lanOrigin(address, context.baseline.port), reverseProxy: false,
+      tls: { keyFile: path.relative(path.dirname(context.file), material.keyFile),
+        certFile: path.relative(path.dirname(context.file), material.certFile) },
+      lan: { formatVersion: 1, serverId: identity.serverId, address, prefixLength, subnet, caSha256: material.caSha256 },
+    };
+    const bytes = Buffer.from(`${JSON.stringify(value, null, 2)}\n`);
+    const id = crypto.randomUUID();
+    const originalFile = `config.before-lan-${id}.json`;
+    const record = { format: "industrial-rent-lan-change", formatVersion: 1, id,
+      serverId: identity.serverId, configFile: context.file, originalFile, originalSha256: context.config.hash,
+      configuredSha256: digest(bytes), sourceOrigin: context.baseline.publicOrigin, targetOrigin: value.publicOrigin,
+      certificateDirectory: material.root, createdAt: new Date().toISOString() };
+    requireUnchangedMaterial(material);
+    writeFile(path.join(path.dirname(context.file), originalFile), context.config.bytes);
+    writeFile(context.recordFile, Buffer.from(`${JSON.stringify(record, null, 2)}\n`));
+    requireUnchangedMaterial(material);
+    atomicConfig(context.file, bytes, context.config.hash);
+    return { status: "configured", origin: value.publicOrigin, serverId: identity.serverId,
+      configFile: context.file, subnet, certificateExpiresAt: material.descriptor.expiresAt,
+      connectionFile: path.join(material.root, "connection.rent-lan"), needsHostRestart: true,
+      firewallConfigured: false, trustConfigured: false, remoteReachabilityConfirmed: false,
+      accountDataChanged: false, note: "网络配置已保存；尚须向导分别完成防火墙、证书信任并重启主机。员工首次运行接入包后才可连接。" };
+  });
+}
+
+function disable(options, environment = {}) {
+  if (options["offline-work"] !== "confirmed") lanError(CONFIRMATION);
+  const context = loadContext(options.config, environment.program || PROGRAM);
+  if (!context.change) lanError("没有本向导登记的局域网配置，未改动原配置。");
+  return withStoppedLedger(context, identity => {
+    const original = readJSON(path.join(path.dirname(context.file), context.change.originalFile));
+    if (original.hash !== context.change.originalSha256) lanError("原配置备份不匹配，未恢复。");
+    if (context.config.hash !== original.hash) atomicConfig(context.file, original.bytes, context.change.configuredSha256);
+    const archived = path.join(path.dirname(context.file), `lan-change-${context.change.id}.completed.json`);
+    if (fs.existsSync(archived)) lanError("局域网恢复记录目标已存在，配置保留，请维护人员核对。");
+    fs.renameSync(context.recordFile, archived);
+    syncDirectory(path.dirname(context.file));
+    return { status: "configured", origin: context.baseline.publicOrigin, serverId: identity.serverId,
+      needsHostRestart: true, accountDataChanged: false, certificateDirectory: context.change.certificateDirectory,
+      note: "原本机配置已恢复，账本和账号未变。向导还须停用本次防火墙规则；证书和员工信任只能按各自归属记录撤销。" };
+  });
+}
+
+function argumentsOf(args) {
+  const command = args[0];
+  const allowed = { status: ["config"], enable: ["config", "certificate-dir", "address", "prefix-length", "offline-work"],
+    disable: ["config", "offline-work"] };
+  if (!Object.hasOwn(allowed, command)) lanError("用法：lan.cjs status | enable | disable；修改操作须由局域网向导确认。");
+  const options = {};
+  for (let index = 1; index < args.length; index += 2) {
+    const name = args[index].slice(2), value = args[index + 1];
+    if (!args[index].startsWith("--") || !allowed[command].includes(name) ||
+        Object.hasOwn(options, name) || value === undefined || value.startsWith("--")) {
+      lanError("不支持、重复或不完整的局域网参数。");
+    }
+    options[name] = value;
+  }
+  return { command, options };
+}
+
+function main(args = process.argv.slice(2)) {
+  require("../config.cjs").assertRuntime();
+  const { command, options } = argumentsOf(args);
+  console.log(JSON.stringify(({ status, enable, disable })[command](options)));
+}
+
+if (require.main === module) {
+  try { main(); }
+  catch (error) {
+    console.error(JSON.stringify({ status: "failed", code: error.code || "LAN_FAILED",
+      message: error.code === "LAN_CONFIG" || error.code === "HOST_IN_USE" ? error.message :
+        "局域网配置未完成。请核对程序、配置、证书和目录权限，原账本不会被重建。" }));
+    process.exitCode = 1;
+  }
+}
+
+module.exports = { status, enable, disable, argumentsOf, certificateMaterial, ledgerIdentity, loadContext };

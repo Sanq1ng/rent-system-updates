@@ -1,0 +1,44 @@
+(function (root, factory) {
+  "use strict";
+  if (typeof module === "object" && module.exports) module.exports = factory();
+  else root.RentNavigation = factory();
+})(globalThis, function () {
+  "use strict";
+
+  const filters = ["month", "basis", "kind", "status", "q", "reviewStatus", "contractStatus", "invoiceStatus"];
+  const titles = Object.freeze({
+    dashboard: "我的工作台", contracts: "合同台账", "my-work": "我的待处理", wizard: "合同填写",
+    review: "申请清单", reports: "收租报表", sync: "本机工作", admin: "系统管理", devices: "通知设置",
+    "contract-detail": "合同详情", "application-detail": "申请详情",
+  });
+
+  function capture(view, ui, scrollY = 0) {
+    return {
+      view, filters: Object.fromEntries(filters.map(key => [key, ui[key]])),
+      selectedContract: ui.selectedContract, appId: ui.appId,
+      editorId: view === "wizard" ? ui.editor?.id || null : null,
+      step: view === "wizard" ? ui.step : 0, scrollY: Math.max(0, scrollY),
+    };
+  }
+
+  function samePage(left, right) {
+    const { scrollY: leftScroll, ...a } = left;
+    const { scrollY: rightScroll, ...b } = right;
+    return JSON.stringify(a) === JSON.stringify(b);
+  }
+
+  class Trail {
+    constructor() { this.entries = []; }
+    push(previous, next) {
+      if (samePage(previous, next)) return;
+      // 只在当前登录期间记住页面位置；不复制账目，也不把租户资料写进网址或浏览器历史。
+      this.entries.push(structuredClone(previous));
+      if (this.entries.length > 60) this.entries.shift();
+    }
+    peek() { return this.entries.length ? structuredClone(this.entries.at(-1)) : null; }
+    pop() { return this.entries.length ? this.entries.pop() : null; }
+    reset() { this.entries = []; }
+  }
+
+  return Object.freeze({ capture, samePage, Trail, titles });
+});

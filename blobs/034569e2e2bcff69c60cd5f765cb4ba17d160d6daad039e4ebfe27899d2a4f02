@@ -1,0 +1,49 @@
+"use strict";
+
+const fs = require("node:fs");
+const path = require("node:path");
+const { formatWithOptions } = require("node:util");
+
+function installLogging(dataDir) {
+  const directory = path.join(dataDir, "logs");
+  fs.mkdirSync(directory, { recursive: true, mode: 0o700 });
+  const file = path.join(directory, "host.log");
+  const previous = { error: console.error, warn: console.warn };
+  let writing = false;
+
+  function append(level, args) {
+    if (writing) return;
+    writing = true;
+    try {
+      if (fs.existsSync(file) && fs.statSync(file).size >= 4 * 1024 * 1024) {
+        const oldest = `${file}.3`;
+        if (fs.existsSync(oldest)) fs.unlinkSync(oldest);
+        for (let index = 2; index >= 1; index--) {
+          const old = `${file}.${index}`;
+          if (fs.existsSync(old)) fs.renameSync(old, `${file}.${index + 1}`);
+        }
+        fs.renameSync(file, `${file}.1`);
+      }
+      const message = formatWithOptions({ colors: false, depth: 2, maxStringLength: 2000 }, ...args);
+      fs.appendFileSync(file, `${new Date().toISOString()} ${level} ${message}\n`, { mode: 0o600 });
+    } catch (error) {
+      previous.error(`无法写入维护日志：${error.message}`);
+    } finally { writing = false; }
+  }
+
+  console.error = (...args) => { append("ERROR", args); previous.error(...args); };
+  console.warn = (...args) => { append("WARN", args); previous.warn(...args); };
+  function monitor(error, origin) {
+    append("FATAL", [origin, error]);
+  }
+  process.on("uncaughtExceptionMonitor", monitor);
+  append("INFO", ["Centre host started", process.version]);
+  return function restore() {
+    append("INFO", ["Centre host stopped"]);
+    process.removeListener("uncaughtExceptionMonitor", monitor);
+    console.error = previous.error;
+    console.warn = previous.warn;
+  };
+}
+
+module.exports = { installLogging };

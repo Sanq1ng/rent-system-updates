@@ -1,0 +1,137 @@
+"use strict";
+
+const fs = require("node:fs");
+const path = require("node:path");
+const { DatabaseSync } = require("node:sqlite");
+const { fail, hashFile, verifyEnvelope, COMPATIBILITY } = require("./files.cjs");
+const { resolveRelease, verifySlot, setActive } = require("./releases.cjs");
+const { HANDOFF, loadState, saveState, acquireUpdateLease, configFingerprint } = require("./state.cjs");
+const { resolveUpdateConfig } = require("./transport.cjs");
+
+async function coordinate(program, config, command, jobId) {
+  if (!["activate", "rollback", "recover"].includes(command) || !/^[a-f0-9-]{36}$/.test(jobId || "")) {
+    fail("UPDATE_REQUEST", "主机更新交接参数无效。");
+  }
+  const storage = config.updateDir || program;
+  const releaseUpdate = acquireUpdateLease(storage);
+  let releaseData;
+  try {
+    const state = loadState(storage);
+    const job = state.job;
+    if (!job || job.id !== jobId || !HANDOFF.has(job.phase) || job.fingerprint !== configFingerprint(config)) {
+      fail("UPDATE_RECOVERY_REQUIRED", "更新交接记录或配置不符；不会回退已投入使用的程序或打开其他账本。");
+    }
+    const databasePath = path.join(config.dataDir, "rent.sqlite");
+    if (!fs.existsSync(databasePath)) fail("UPDATE_IDENTITY", "原账本不存在；不会为更新新建空账。");
+    const { acquireLock } = require(path.join(program, "host.cjs"));
+    releaseData = acquireLock(config.dataDir);
+    const db = new DatabaseSync(path.toNamespacedPath(databasePath), { readOnly: true });
+    let actualSchema;
+    try {
+      actualSchema = db.prepare("PRAGMA user_version").get().user_version;
+      if (!job.fullProgram && (actualSchema !== COMPATIBILITY.schema ||
+          job.identity?.schemaVersion !== COMPATIBILITY.schema)) fail("UPDATE_COMPATIBILITY", "账本格式已变化，不能自动回退程序。");
+    } finally { db.close(); }
+    const previous = await verifySlot(storage, job.previousReleaseId);
+    if (previous.manifest.version !== job.identity.applicationVersion) fail("UPDATE_IDENTITY", "保留的旧程序与更新前版本不一致。");
+    const { verifyBackup } = require(path.join(previous.root, "server", "backup.cjs"));
+    if (!job.backup || await hashFile(path.join(job.backup.path, "manifest.json")) !== job.backup.manifestHash ||
+        await hashFile(path.join(job.backup.path, "update-context.json")) !== job.backup.contextHash) {
+      fail("UPDATE_BACKUP", "更新前备份及配置记录缺失或变化；未激活新程序。");
+    }
+    await verifyBackup(job.backup.path);
+    if (job.fullProgram) {
+      const settings = resolveUpdateConfig(config.updates);
+      const checked = verifyEnvelope(state.staged?.envelope, settings.trustedKeys);
+      if (checked.releaseId !== job.candidateReleaseId || checked.manifest.packageKind !== "windows-program")
+        fail("UPDATE_SIGNATURE", "整程序暂存版本与批准记录不符。");
+      const candidate = await verifySlot(storage, checked.releaseId);
+      if (command !== "activate" && actualSchema !== job.identity.schemaVersion)
+        fail("UPDATE_COMPATIBILITY", "账本格式已升级，不能自动退回旧程序；当前账本和升级前备份均保留。");
+      if (command === "activate" && !["restart-pending", "full-apply-pending"].includes(job.phase))
+        fail("UPDATE_STATE", "整程序任务不在待交接阶段。");
+      job.phase = "full-apply-pending"; job.fullRollback = command !== "activate";
+      job.updatedAt = new Date().toISOString(); saveState(storage, state);
+      const helper = path.join(candidate.root, "desktop", "应用程序更新.exe");
+      return { jobId, version: job.fullRollback ? previous.manifest.version : candidate.manifest.version,
+        rollback: job.fullRollback, fullProgram: true, helper, helperSha256: await hashFile(helper) };
+    }
+    if (command === "activate") {
+      if (!["restart-pending", "activating"].includes(job.phase)) fail("UPDATE_STATE", "此任务不在待激活阶段。");
+      const settings = resolveUpdateConfig(config.updates);
+      const candidate = verifyEnvelope(state.staged?.envelope, settings.trustedKeys);
+      if (candidate.releaseId !== job.candidateReleaseId || candidate.manifest.sequence < state.highestSequence ||
+          candidate.manifest.version !== job.targetVersion) fail("UPDATE_SIGNATURE", "暂存更新与已批准任务不一致。");
+      await verifySlot(storage, candidate.releaseId);
+      job.phase = "activating";
+      saveState(storage, state);
+      setActive(storage, candidate.releaseId);
+      job.phase = "trial";
+    } else {
+      // No database restore: only pre-commit program selection is reversible.
+      job.phase = "rolling-back";
+      saveState(storage, state);
+      setActive(storage, previous.releaseId);
+      job.phase = "rollback-trial";
+      job.error = { code: "UPDATE_ROLLED_BACK", message: "新程序尚未开放业务即中断，已保留备份并切回更新前程序；账本未恢复或覆盖。" };
+    }
+    job.updatedAt = new Date().toISOString();
+    saveState(storage, state);
+    return { jobId: job.id, version: resolveRelease(program, storage).version, rollback: job.phase === "rollback-trial" };
+  } finally {
+    try { if (releaseData) releaseData(); } finally { releaseUpdate(); }
+  }
+}
+
+async function main(args = process.argv.slice(2)) {
+  const piped = args.includes("--pipe");
+  if (piped) args = args.filter(value => value !== "--pipe");
+  const command = args[0];
+  let jobId, configFile;
+  for (let index = 1; index < args.length; index += 2) {
+    if (!args[index + 1]) fail("UPDATE_REQUEST", "更新主机参数不完整。");
+    if (args[index] === "--job" && jobId === undefined) jobId = args[index + 1];
+    else if (args[index] === "--config" && configFile === undefined) configFile = args[index + 1];
+    else fail("UPDATE_REQUEST", "更新主机参数不受支持。");
+  }
+  const program = path.resolve(__dirname, "..");
+  const { resolveConfig, assertRuntime } = require(path.join(program, "config.cjs"));
+  assertRuntime();
+  if (piped) {
+    await new Promise((resolve, reject) => {
+      let pending = "";
+      const timeout = setTimeout(() => done(new Error("更新组件未收到自有主机确认。")), 15_000);
+      function done(error) {
+        clearTimeout(timeout);
+        process.stdin.removeListener("data", receive);
+        process.stdin.removeListener("end", ended);
+        process.stdin.pause();
+        if (error) reject(error); else resolve();
+      }
+      function ended() { done(new Error("更新组件的私有管道已关闭，未打开账本。")); }
+      function receive(chunk) {
+        pending += chunk;
+        if (pending.length > 256) { done(new Error("更新私有管道格式无效。")); return; }
+        if (!pending.includes("\n")) return;
+        let message;
+        try { message = JSON.parse(pending.trim()); }
+        catch { done(new Error("更新私有管道格式无效。")); return; }
+        done(message.command === "apply" && message.protocol === 2 ? null : new Error("更新组件与图形主机协议不一致。"));
+      }
+      process.stdin.setEncoding("utf8");
+      process.stdin.on("data", receive);
+      process.stdin.once("end", ended);
+      process.stdin.resume();
+    });
+  }
+  console.log(JSON.stringify(await coordinate(program, resolveConfig(configFile), command, jobId)));
+  if (piped) process.stdin.destroy();
+}
+
+if (require.main === module) main().catch(error => {
+  process.stdin.destroy();
+  console.error(`更新交接未完成：${error.message}`);
+  process.exitCode = 1;
+});
+
+module.exports = { coordinate, main };

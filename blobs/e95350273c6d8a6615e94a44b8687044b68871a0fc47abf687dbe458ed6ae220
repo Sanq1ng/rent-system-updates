@@ -1,0 +1,157 @@
+using System;
+using System.Collections.Generic;
+using System.Globalization;
+using System.IO;
+using System.Linq;
+using System.Security.Cryptography;
+using System.Security.Cryptography.X509Certificates;
+using System.Text;
+
+namespace RentLan
+{
+    internal static class Der
+    {
+        internal static byte[] Tag(byte tag, params byte[][] values)
+        {
+            byte[] content = values.SelectMany(v => v).ToArray();
+            var result = new List<byte> { tag };
+            if (content.Length < 128) result.Add((byte)content.Length);
+            else
+            {
+                var length = new List<byte>();
+                for (int n = content.Length; n > 0; n >>= 8) length.Insert(0, (byte)n);
+                result.Add((byte)(0x80 | length.Count)); result.AddRange(length);
+            }
+            result.AddRange(content); return result.ToArray();
+        }
+        private static byte[] Integer(byte[] bytes)
+        {
+            int start = 0;
+            while (start < bytes.Length - 1 && bytes[start] == 0) start++;
+            byte[] value = bytes.Skip(start).ToArray();
+            if (value.Length == 0) value = new byte[] { 0 };
+            if ((value[0] & 0x80) != 0) value = new byte[] { 0 }.Concat(value).ToArray();
+            return Tag(2, value);
+        }
+        internal static byte[] PrivateKey(RSA rsa)
+        {
+            RSAParameters key = rsa.ExportParameters(true);
+            try
+            {
+                return Tag(0x30, Integer(new byte[] { 0 }), Integer(key.Modulus), Integer(key.Exponent), Integer(key.D),
+                    Integer(key.P), Integer(key.Q), Integer(key.DP), Integer(key.DQ), Integer(key.InverseQ));
+            }
+            finally
+            {
+                foreach (byte[] bytes in new[] { key.D, key.P, key.Q, key.DP, key.DQ, key.InverseQ })
+                    if (bytes != null) Array.Clear(bytes, 0, bytes.Length);
+            }
+        }
+        private static byte[] Element(byte[] bytes, ref int index, byte tag, bool includeTag)
+        {
+            int start = index;
+            if (index + 2 > bytes.Length || bytes[index++] != tag) throw new IOException("证书 DER 结构无效。");
+            int size = bytes[index++];
+            if ((size & 128) != 0)
+            {
+                int count = size & 127; size = 0;
+                if (count == 0 || count > 3 || index + count > bytes.Length || bytes[index] == 0) throw new IOException("证书 DER 长度无效。");
+                for (int i = 0; i < count; i++) size = (size << 8) | bytes[index++];
+                if (size < 128) throw new IOException("证书 DER 长度不是最短形式。");
+            }
+            if (size < 0 || index + size > bytes.Length) throw new IOException("证书 DER 长度越界。");
+            int content = index; index += size;
+            return bytes.Skip(includeTag ? start : content).Take(includeTag ? index - start : size).ToArray();
+        }
+        internal static bool VerifyCertificate(byte[] raw, RSA publicKey)
+        {
+            int outer = 0;
+            byte[] sequence = Element(raw, ref outer, 0x30, false);
+            if (outer != raw.Length) return false;
+            int index = 0;
+            byte[] body = Element(sequence, ref index, 0x30, true);
+            byte[] algorithm = Element(sequence, ref index, 0x30, true);
+            byte[] expected = new byte[] { 0x30, 0x0d, 0x06, 0x09, 0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x0b, 0x05, 0 };
+            byte[] signature = Element(sequence, ref index, 3, false);
+            return Product.Equal(algorithm, expected) && index == sequence.Length && signature.Length > 1 && signature[0] == 0 &&
+                publicKey.VerifyData(body, signature.Skip(1).ToArray(), HashAlgorithmName.SHA256, RSASignaturePadding.Pkcs1);
+        }
+    }
+
+    internal static class Certificates
+    {
+        internal static string Pem(string label, byte[] bytes)
+        {
+            string text = Convert.ToBase64String(bytes);
+            var result = new StringBuilder("-----BEGIN " + label + "-----\n");
+            for (int i = 0; i < text.Length; i += 64) result.Append(text.Substring(i, Math.Min(64, text.Length - i))).Append('\n');
+            return result.Append("-----END ").Append(label).Append("-----\n").ToString();
+        }
+        internal static Connection Make(string directory, string address, int port, string serverId)
+        {
+            Paths.Absolute(directory, false); Paths.NotSystem(directory);
+            byte[] ip = Network.PrivateV4(address);
+            Network.Port(port); Product.Uuid(serverId);
+            using (var parent = new DirectoryPins(Path.GetDirectoryName(directory)))
+            {
+                if (NativeFiles.Exists(directory)) throw new IOException("证书目录必须尚不存在；不会覆盖或重复使用任何旧私钥。");
+                DateTimeOffset now = DateTimeOffset.FromUnixTimeSeconds(DateTimeOffset.UtcNow.ToUnixTimeSeconds());
+                DateTimeOffset expires = now.AddDays(365);
+                // CNG keys constructed without a name are ephemeral. No CSP container, registry key,
+                // PFX import or certificate-store operation is used in material-only mode.
+                using (var rootKey = new RSACng(3072))
+                using (var leafKey = new RSACng(2048))
+                {
+                    var caRequest = new CertificateRequest(new X500DistinguishedName("CN=Rent LAN " + serverId + " CA"),
+                        rootKey, HashAlgorithmName.SHA256, RSASignaturePadding.Pkcs1);
+                    caRequest.CertificateExtensions.Add(new X509BasicConstraintsExtension(true, true, 0, true));
+                    caRequest.CertificateExtensions.Add(new X509KeyUsageExtension(X509KeyUsageFlags.KeyCertSign | X509KeyUsageFlags.CrlSign, true));
+                    caRequest.CertificateExtensions.Add(new X509SubjectKeyIdentifierExtension(caRequest.PublicKey, false));
+                    using (var ca = caRequest.CreateSelfSigned(now.AddMinutes(-5), now.AddYears(5)))
+                    {
+                        var request = new CertificateRequest(new X500DistinguishedName("CN=Rent LAN " + serverId),
+                            leafKey, HashAlgorithmName.SHA256, RSASignaturePadding.Pkcs1);
+                        request.CertificateExtensions.Add(new X509BasicConstraintsExtension(false, false, 0, true));
+                        request.CertificateExtensions.Add(new X509KeyUsageExtension(X509KeyUsageFlags.DigitalSignature | X509KeyUsageFlags.KeyEncipherment, true));
+                        request.CertificateExtensions.Add(new X509EnhancedKeyUsageExtension(new OidCollection { new Oid("1.3.6.1.5.5.7.3.1") }, false));
+                        request.CertificateExtensions.Add(new X509Extension("2.5.29.17", Der.Tag(0x30, Der.Tag(0x87, ip)), false));
+                        request.CertificateExtensions.Add(new X509SubjectKeyIdentifierExtension(request.PublicKey, false));
+                        byte[] serial = new byte[16];
+                        using (var random = RandomNumberGenerator.Create()) random.GetBytes(serial);
+                        serial[0] = (byte)((serial[0] & 0x7f) | 0x01);
+                        using (var leaf = request.Create(ca.SubjectName, X509SignatureGenerator.CreateForRSA(rootKey, RSASignaturePadding.Pkcs1),
+                            now.AddMinutes(-5), expires, serial))
+                        {
+                            byte[] caBytes = ca.Export(X509ContentType.Cert);
+                            var connection = new Connection {
+                                serverId = serverId, origin = Network.Origin(address, port), caCertificate = Convert.ToBase64String(caBytes),
+                                caSha256 = Product.Hash(caBytes), createdAt = now.ToString("yyyy-MM-dd'T'HH:mm:ss'Z'", CultureInfo.InvariantCulture),
+                                expiresAt = leaf.NotAfter.ToUniversalTime().ToString("yyyy-MM-dd'T'HH:mm:ss'Z'", CultureInfo.InvariantCulture)
+                            };
+                            connection.Validate(false);
+                            byte[] key = Der.PrivateKey(leafKey);
+                            try
+                            {
+                                using (var target = new PrivateDirectory(directory))
+                                {
+                                    target.Write("ca.cer", caBytes);
+                                    target.Text("ca.pem", Pem("CERTIFICATE", caBytes));
+                                    target.Text("server.pem", Pem("CERTIFICATE", leaf.RawData));
+                                    target.Text("server-key.pem", Pem("RSA PRIVATE KEY", key));
+                                    target.Text("connection.rent-lan", Json.Encode(connection) + "\n");
+                                }
+                            }
+                            catch (Exception error)
+                            {
+                                throw new IOException("证书生成未全部完成；本次受限目录（如已创建）已保留，不会覆盖或自动删除。未更改配置、系统信任或防火墙。" +
+                                    "请保留错误信息，重试时使用新目录：" + error.Message, error);
+                            }
+                            finally { Array.Clear(key, 0, key.Length); }
+                            return connection;
+                        }
+                    }
+                }
+            }
+        }
+    }
+}

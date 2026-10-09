@@ -1,0 +1,130 @@
+"use strict";
+
+const crypto = require("node:crypto");
+
+const TAB_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const REASONS = Object.freeze({
+  busy: "正在提交或读取附件",
+  form: "还有未完成的弹窗",
+  queue: "还有未同步或待处理的工作",
+  saving: "草稿正在保存",
+  storage: "本机保存失败，请保留当前页面",
+  "old-client": "页面版本较旧，需要保存后刷新",
+  waiting: "等待页面保存并暂停",
+});
+
+function conflict(message) {
+  const error = new Error(message);
+  error.code = "UPDATE_CONFLICT";
+  error.status = 409;
+  throw error;
+}
+
+class Workspaces {
+  constructor(version, { clock = Date.now, activeMs = 90_000, prepareMs = 120_000 } = {}) {
+    this.version = version;
+    this.clock = clock;
+    this.activeMs = activeMs;
+    this.prepareMs = prepareMs;
+    this.pages = new Map();
+    this.maintenance = null;
+    this.lastMessage = "";
+  }
+
+  touch(session, user, tabId, version, writing = false) {
+    this.expire();
+    const tab = typeof tabId === "string" && TAB_ID.test(tabId) ? tabId : "legacy";
+    const key = `${session}:${tab}`;
+    const page = this.pages.get(key) || { session, userId: user.id, name: user.displayName, readyFor: null };
+    Object.assign(page, { name: user.displayName, lastSeen: this.clock(),
+      version: typeof version === "string" && version.length <= 40 ? version : "", tab });
+    if (writing || page.version !== this.version) page.readyFor = null;
+    if (page.version !== this.version || tab === "legacy") page.reason = "old-client";
+    this.pages.set(key, page);
+    if (this.maintenance?.phase === "preparing") this.maintenance.required.add(key);
+    if (!this.maintenance) {
+      for (const [id, old] of this.pages) if (old.lastSeen < this.clock() - this.activeMs) this.pages.delete(id);
+    }
+    return key;
+  }
+
+  heartbeat(key, body) {
+    this.expire();
+    const page = this.pages.get(key);
+    if (!page) conflict("工作页面已失效，请重新登录。");
+    const current = this.maintenance;
+    if (current?.phase === "installing") return;
+    const eligible = page.version === this.version && page.tab !== "legacy";
+    page.readyFor = eligible && current?.phase === "preparing" &&
+      body.maintenanceId === current.id && body.ready === true ? current.id : null;
+    page.reason = !eligible ? "old-client" : Object.hasOwn(REASONS, body.reason) ? body.reason : "waiting";
+  }
+
+  begin(targetVersion, actorId, { id = crypto.randomUUID(), deadline = this.clock() + this.prepareMs } = {}) {
+    this.expire();
+    if (this.maintenance) conflict("已有更新准备或安装正在进行。");
+    const at = this.clock();
+    const required = new Set([...this.pages].filter(([, page]) => page.lastSeen >= at - this.activeMs).map(([id]) => id));
+    this.lastMessage = "";
+    if (!TAB_ID.test(id) || !Number.isFinite(deadline) || deadline <= at) conflict("更新准备标识或截止时间无效。");
+    this.maintenance = { id, phase: "preparing", targetVersion, actorId,
+      startedAt: at, expiresAt: deadline, required };
+    return this.maintenance.id;
+  }
+
+  expire() {
+    if (this.maintenance?.phase === "preparing" && this.clock() >= this.maintenance.expiresAt) {
+      this.maintenance.phase = "expired";
+      this.lastMessage = "更新准备超时，尚未替换程序；请处理未完成工作后重试。";
+    }
+  }
+
+  status(admin = false) {
+    this.expire();
+    const current = this.maintenance;
+    if (!current) return { phase: "idle", id: null, message: this.lastMessage };
+    const blocked = [...current.required].filter(key => this.pages.get(key)?.readyFor !== current.id);
+    return {
+      phase: current.phase, id: current.id, targetVersion: current.targetVersion,
+      expiresAt: new Date(current.expiresAt).toISOString(), pageCount: current.required.size,
+      readyCount: current.required.size - blocked.length, message: this.lastMessage,
+      ...(admin ? { blockers: blocked.map(key => {
+        const page = this.pages.get(key);
+        return { name: page?.name || "未响应页面", reason: REASONS[page?.reason] || REASONS.waiting };
+      }) } : {}),
+    };
+  }
+
+  commit(id) {
+    this.expire();
+    const current = this.maintenance;
+    if (!current || current.id !== id || current.phase !== "preparing") conflict("更新准备已失效，请重新发起。");
+    if ([...current.required].some(key => this.pages.get(key)?.readyFor !== id)) {
+      conflict("仍有页面尚未保存并暂停，不会强行更新。");
+    }
+    current.phase = "installing";
+  }
+
+  cancel(message = "本次更新已取消，程序和账目未被替换。") {
+    this.expire();
+    if (this.maintenance?.phase === "installing") conflict("程序正在安装，不能中途取消；请等待主机结果。");
+    this.maintenance = null;
+    this.lastMessage = message;
+  }
+
+  removeSession(session) {
+    for (const [key, page] of this.pages) {
+      if (page.session !== session) continue;
+      this.pages.delete(key);
+      this.maintenance?.required.delete(key);
+    }
+  }
+
+  finish(id, message = "") {
+    if (this.maintenance && this.maintenance.id !== id) conflict("不能结束其他更新的维护窗口。");
+    this.maintenance = null;
+    this.lastMessage = message;
+  }
+}
+
+module.exports = { Workspaces, REASONS, TAB_ID };

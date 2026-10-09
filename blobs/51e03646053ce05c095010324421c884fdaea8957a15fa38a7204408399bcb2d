@@ -1,0 +1,20 @@
+{
+  "formatVersion": 1,
+  "dataDirectoryName": "业务数据",
+  "dataDir": null,
+  "backupDir": null,
+  "host": "127.0.0.1",
+  "port": 8765,
+  "publicOrigin": "http://127.0.0.1:8765",
+  "reverseProxy": false,
+  "tls": null,
+  "sessionHours": 8,
+  "backupIntervalMinutes": 60,
+  "updateDir": null,
+  "pushCredentialsFile": null,
+  "updates": {
+    "feedUrl": null,
+    "trustedKeys": {},
+    "allowPrivateNetwork": false
+  }
+}

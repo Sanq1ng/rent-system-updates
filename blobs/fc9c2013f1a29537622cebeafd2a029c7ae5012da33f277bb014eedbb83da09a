@@ -1,0 +1,112 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+  <meta name="referrer" content="no-referrer">
+  <script src="/invitation-entry.js?v=0.4.6&amp;r=1"></script>
+  <meta name="theme-color" content="#197b70">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-title" content="园区租赁">
+  <meta name="apple-mobile-web-app-status-bar-style" content="default">
+  <title>园区租赁 · 工作台</title>
+  <link rel="icon" href="/icon.svg" type="image/svg+xml">
+  <link rel="manifest" href="/manifest.webmanifest">
+  <link rel="apple-touch-icon" href="/icons/apple-touch-icon.png">
+  <link rel="stylesheet" href="/base.css?v=0.4.6&amp;r=1">
+  <link rel="stylesheet" href="/app.css?v=0.4.6&amp;r=1">
+  <link rel="stylesheet" href="/mobile.css?v=0.4.6&amp;r=1">
+  <script src="/domain.js?v=0.4.6&amp;r=1" defer></script>
+  <script src="/business.js?v=0.4.6&amp;r=1" defer></script>
+  <script src="/reporting.js?v=0.4.6&amp;r=1" defer></script>
+  <script src="/offline.js?v=0.4.6&amp;r=1" defer></script>
+  <script src="/ui.js?v=0.4.6&amp;r=1" defer></script>
+  <script src="/invitation-panel.js?v=0.4.6&amp;r=1" defer></script>
+  <script src="/navigation.js?v=0.4.6&amp;r=1" defer></script>
+  <script src="/contract-form.js?v=0.4.6&amp;r=1" defer></script>
+  <script src="/update-client.js?v=0.4.6&amp;r=1" defer></script>
+  <script src="/update-panel.js?v=0.4.6&amp;r=1" defer></script>
+  <script src="/mobile.js?v=0.4.6&amp;r=1" defer></script>
+  <script src="/native-client.js?v=0.4.6&amp;r=1" defer></script>
+  <script src="/desktop-client.js?v=0.4.6&amp;r=1" defer></script>
+  <script src="/push-client.js?v=0.4.6&amp;r=1" defer></script>
+  <script src="/push-panel.js?v=0.4.6&amp;r=1" defer></script>
+  <script src="/app.js?v=0.4.6&amp;r=1" defer></script>
+</head>
+<body>
+  <svg class="icon-definitions" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
+    <symbol id="i-home" viewBox="0 0 24 24"><path d="m3 10 9-7 9 7v10a1 1 0 0 1-1 1h-5v-7H9v7H4a1 1 0 0 1-1-1Z"/></symbol>
+    <symbol id="i-building" viewBox="0 0 24 24"><path d="M3 21h18M5 21V7l7-4v18M12 9h7v12M8 8v1m0 3v1m0 3v1m7-5h1m-1 4h1"/></symbol>
+    <symbol id="i-file" viewBox="0 0 24 24"><path d="M14 3H6a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V9Zm0 0v6h6M8 13h8m-8 4h5"/></symbol>
+    <symbol id="i-review" viewBox="0 0 24 24"><path d="M9 3H6a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V5a2 2 0 0 0-2-2h-3M9 2h6v4H9Zm-1 12 3 3 5-6"/></symbol>
+    <symbol id="i-chart" viewBox="0 0 24 24"><path d="M4 3v17h17M8 16v-5m5 5V6m5 10V9"/></symbol>
+    <symbol id="i-bell" viewBox="0 0 24 24"><path d="M18 8a6 6 0 0 0-12 0c0 7-3 7-3 9h18c0-2-3-2-3-9M10 21h4"/></symbol>
+    <symbol id="i-arrow" viewBox="0 0 24 24"><path d="M4 12h16m-6-6 6 6-6 6"/></symbol>
+    <symbol id="i-info" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 11v6m0-10v.2"/></symbol>
+    <symbol id="i-wifi" viewBox="0 0 24 24"><path d="M3 8a15 15 0 0 1 18 0M6 12a10 10 0 0 1 12 0m-9 4a5 5 0 0 1 6 0m-3 4v.1"/></symbol>
+    <symbol id="i-clock" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></symbol>
+    <symbol id="i-wallet" viewBox="0 0 24 24"><path d="M20 8V5H5a2 2 0 0 0 0 4h16v11H5a2 2 0 0 1-2-2V7m18 6h-6v4h6"/></symbol>
+    <symbol id="i-calendar" viewBox="0 0 24 24"><rect x="3" y="5" width="18" height="16" rx="2"/><path d="M7 3v4m10-4v4M3 11h18M7 15h2m3 0h2m-7 3h2"/></symbol>
+    <symbol id="i-upload" viewBox="0 0 24 24"><path d="M12 16V3m-5 5 5-5 5 5M4 15v6h16v-6"/></symbol>
+    <symbol id="i-download" viewBox="0 0 24 24"><path d="M12 3v13m-5-5 5 5 5-5M4 17v4h16v-4"/></symbol>
+    <symbol id="i-close" viewBox="0 0 24 24"><path d="m6 6 12 12M6 18 18 6"/></symbol>
+    <symbol id="i-history" viewBox="0 0 24 24"><path d="M3 10a9 9 0 1 1 0 5m0-10v5h5m4-3v5l4 2"/></symbol>
+    <symbol id="i-shield" viewBox="0 0 24 24"><path d="m12 3 8 3v6c0 5-8 9-8 9s-8-4-8-9V6Zm-4 9 3 3 5-6"/></symbol>
+    <symbol id="i-plus" viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></symbol>
+  </svg>
+
+  <section id="auth-screen" class="auth-screen" aria-label="登录"></section>
+  <div id="app-shell" class="app-shell" hidden>
+    <button id="mobile-menu-backdrop" class="mobile-menu-backdrop" type="button" data-mobile-action="close-menu" aria-label="关闭导航菜单" hidden></button>
+    <aside id="main-navigation" class="sidebar" aria-label="主导航">
+      <a class="brand" href="#dashboard" data-action="navigate" data-route="dashboard"><span class="brand-mark"><svg class="icon"><use href="#i-building"/></svg></span><span><strong>园区租赁</strong><small>合同 · 收租 · 协作</small></span></a>
+      <div class="workspace-label">租赁管理工作空间</div>
+      <div id="mobile-identity" class="mobile-only mobile-identity"></div>
+      <nav id="nav-list" class="nav-list"></nav>
+      <div class="sidebar-note"><svg class="icon"><use href="#i-shield"/></svg><strong>每笔业务，都有来处</strong><p>录入与复核分开，修改和审批过程留痕。</p></div>
+      <div class="sidebar-bottom">
+        <button class="sidebar-link" type="button" data-action="navigate" data-route="sync"><svg class="icon"><use href="#i-wifi"/></svg><span>本机工作与同步</span></button>
+        <button class="sidebar-link" type="button" data-mobile-action="install-help"><svg class="icon"><use href="#i-download"/></svg><span>添加桌面入口</span></button>
+        <button class="sidebar-link" type="button" data-action="password"><svg class="icon"><use href="#i-shield"/></svg><span>修改密码</span></button>
+        <button class="sidebar-link" type="button" data-action="logout"><svg class="icon"><use href="#i-close"/></svg><span>退出并锁定</span></button>
+        <div class="prototype-version"><span class="status-dot"></span>正式工作区 · 数据以主机审核为准</div>
+      </div>
+    </aside>
+    <div class="workspace">
+      <header class="topbar">
+        <div class="page-location"><button id="mobile-menu-button" type="button" class="button small mobile-only" data-mobile-action="menu" aria-controls="main-navigation" aria-expanded="false">☰ 菜单</button>
+          <button id="page-back" type="button" class="button small" data-action="go-back" hidden>← 返回</button>
+          <div class="breadcrumb"><strong id="page-title">我的工作台</strong></div></div>
+        <div class="topbar-tools">
+          <label class="global-search"><svg class="icon"><use href="#i-file"/></svg><input id="global-search" type="search" placeholder="搜索租户、合同、主体或位置" aria-label="搜索租户、合同、出租方主体或位置"></label>
+          <button id="connection-button" class="connection-button" type="button" data-action="navigate" data-route="sync" aria-label="查看连接与同步状态"></button>
+          <button class="icon-button notification-button" type="button" data-action="notifications" aria-label="查看提醒"><svg class="icon"><use href="#i-bell"/></svg><span id="notification-dot" class="notification-dot" hidden></span></button>
+          <div class="role-control"><span id="role-avatar" class="avatar"></span><span><strong id="identity"></strong><small id="scope"></small></span></div>
+        </div>
+      </header>
+      <div id="status-ribbon" class="prototype-ribbon"></div>
+      <div id="update-notice" class="notice warning network-banner update-notice" role="status" hidden></div>
+      <div id="error-banner" class="notice danger network-banner" role="alert" hidden></div>
+      <main id="main" tabindex="-1"></main>
+    </div>
+  </div>
+  <dialog id="install-help" class="install-help" aria-labelledby="install-help-title">
+    <h2 id="install-help-title">添加桌面入口</h2>
+    <p id="install-help-text"></p>
+    <div class="button-row"><button id="install-app-button" type="button" class="button primary" data-mobile-action="install" hidden>安装到桌面</button><button type="button" class="button" data-mobile-action="close-help">知道了</button></div>
+  </dialog>
+  <dialog id="invitation-guard" class="install-help" aria-labelledby="invitation-guard-title">
+    <h2 id="invitation-guard-title">当前已有账号登录</h2>
+    <p>请先在原窗口保存工作并退出账号，再打开邀请；也可换一个浏览器打开。</p>
+    <button type="button" class="button primary" data-action="invitation-dismiss">返回当前账号</button>
+  </dialog>
+  <dialog id="modal" class="modal" aria-labelledby="modal-title">
+    <div class="modal-header"><div><div class="eyebrow">业务协作</div><h2 id="modal-title"></h2></div><button class="icon-button" type="button" data-action="close-modal" aria-label="关闭窗口"><svg class="icon"><use href="#i-close"/></svg></button></div>
+    <div id="modal-body" class="modal-body"></div>
+    <div id="modal-actions" class="modal-actions"></div>
+  </dialog>
+  <div id="toast-container" class="toast-container" aria-live="polite"></div>
+  <div id="print-area" class="print-area"></div>
+  <noscript><div class="notice danger">请使用支持 JavaScript 的现代浏览器，或打开安卓租约客户端。</div></noscript>
+</body>
+</html>

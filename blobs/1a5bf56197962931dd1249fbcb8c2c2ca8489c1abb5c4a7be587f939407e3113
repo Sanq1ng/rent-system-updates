@@ -1,0 +1,82 @@
+"use strict";
+
+const crypto = require("node:crypto");
+const UUID = /^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/;
+const hash = value => crypto.createHash("sha256").update(value).digest("hex");
+const eligible = user => Boolean(user?.active && user.receiveReminders && user.roles.some(role => role !== "admin"));
+
+class DesktopError extends Error {
+  constructor(message, status = 400, code = "DESKTOP_NOTIFICATION") {
+    super(message); this.status = status; this.code = code;
+  }
+}
+
+function createDesktopNotifications({ store, visibleNotifications, clock = Date.now }) {
+  function revokeUser(userId) {
+    store.db.prepare("UPDATE desktop_devices SET revoked_at=? WHERE user_id=? AND revoked_at IS NULL").run(clock(), userId);
+  }
+  function revokeSession(sessionHash) {
+    store.db.prepare("UPDATE desktop_devices SET revoked_at=? WHERE session_hash=? AND revoked_at IS NULL").run(clock(), sessionHash);
+  }
+  function register(user, sessionHash, input) {
+    if (!input || Object.keys(input).sort().join(",") !== "installationId" || !UUID.test(input.installationId || "")) {
+      throw new DesktopError("这台电脑的通知身份无效，请重新打开软件。");
+    }
+    if (!eligible(user)) throw new DesktopError("请先开启接收提醒。", 403);
+    return store.transaction(() => {
+      if (!eligible(store.read("users", user.id))) throw new DesktopError("提醒权限已变化，请重新登录。", 403);
+      const at = clock();
+      const count = store.db.prepare(`SELECT COUNT(*) AS n FROM desktop_devices
+        WHERE user_id=? AND revoked_at IS NULL AND expires_at>? AND installation_id<>?`)
+        .get(user.id, at, input.installationId).n;
+      if (count >= 20) throw new DesktopError("已绑定的电脑过多，请先在通知设置中停用旧电脑。", 409);
+      store.db.prepare("UPDATE desktop_devices SET revoked_at=? WHERE installation_id=? AND revoked_at IS NULL")
+        .run(at, input.installationId);
+      const token = crypto.randomBytes(32).toString("base64url");
+      const id = crypto.randomUUID(), expiresAt = at + 90 * 86400_000;
+      store.db.prepare(`INSERT INTO desktop_devices
+        (id,user_id,installation_id,token_hash,session_hash,user_version,created_at,expires_at)
+        VALUES(?,?,?,?,?,?,?,?)`).run(id, user.id, input.installationId, hash(token), sessionHash, user.version, at, expiresAt);
+      store.changed();
+      return { id, token, serverId: store.serverId, userId: user.id, expiresAt };
+    });
+  }
+  function authenticate(token) {
+    if (typeof token !== "string" || !/^[A-Za-z0-9_-]{43}$/.test(token)) throw new DesktopError("电脑通知需要重新登录。", 401);
+    const device = store.db.prepare("SELECT * FROM desktop_devices WHERE token_hash=?").get(hash(token));
+    const user = device && store.read("users", device.user_id);
+    if (!device || device.revoked_at !== null || device.expires_at <= clock() || !eligible(user) ||
+        user.version !== device.user_version) throw new DesktopError("电脑通知授权已失效，请重新登录。", 401);
+    return { device, user };
+  }
+  function poll(token) {
+    const { user, device } = authenticate(token);
+    const items = visibleNotifications(user).filter(item => !item.read);
+    return { serverId: store.serverId, userId: user.id, deviceId: device.id, expiresAt: device.expires_at,
+      events: items.map(item => ({ id: item.id,
+        title: item.type === "application" ? "园区租赁 · 审批提醒" : "园区租赁 · 收租提醒",
+        body: "有待处理事项，点击查看。",
+        target: item.applicationId ? { kind: "application", id: item.applicationId } :
+          item.invoiceId ? { kind: "invoice", id: item.invoiceId } : { kind: "notifications" } })) };
+  }
+  return { register, poll, authenticate, revokeUser, revokeSession };
+}
+
+function workflowNotifications(store, user, canSeeApplication) {
+  if (!eligible(user)) return [];
+  const reads = new Set(store.db.prepare("SELECT event_id FROM inbox_reads WHERE user_id=?").all(user.id).map(row => row.event_id));
+  return store.all("applications").flatMap(app => {
+    if (!canSeeApplication(app)) return [];
+    const pending = app.status === "pending";
+    const own = app.creator === user.id;
+    if (pending ? !(user.roles.includes("admin") || user.roles.includes("reviewer") && !own) :
+      !(user.roles.includes("admin") || own)) return [];
+    const id = `application:${app.id}:${app.version}:${app.status}`;
+    const title = pending ? "有申请待审核" : app.status === "returned" ? "申请已退回" : "申请已通过";
+    return [{ id, type: "application", date: (app.trail.at(-1)?.at || app.submittedAt || "").slice(0, 10),
+      title, detail: app.status === "returned" ? app.reviewReason || "请查看审核意见并修改。" : "点击查看申请和处理记录。",
+      applicationId: app.id, read: reads.has(id) }];
+  });
+}
+
+module.exports = { createDesktopNotifications, workflowNotifications, DesktopError, eligible };

@@ -1,0 +1,330 @@
+using System;
+using System.Collections.Generic;
+using System.Globalization;
+using System.IO;
+using System.Linq;
+using System.Net;
+using System.Security.Cryptography;
+using System.Security.Cryptography.X509Certificates;
+using System.Text;
+using System.Text.RegularExpressions;
+using System.Web.Script.Serialization;
+
+namespace RentLan
+{
+    internal static class Json
+    {
+        internal static string Encode(object value, int maximum = 131072) { return new JavaScriptSerializer { MaxJsonLength = maximum, RecursionLimit = 24 }.Serialize(value); }
+        internal static Dictionary<string, object> Object(string text, int maximum = 65536)
+        {
+            if (text == null || maximum < 1 || maximum > 8388608 || text.Length > maximum) throw new IOException("JSON 文件超过大小限制。");
+            var value = new Parser(text).Parse() as Dictionary<string, object>;
+            if (value == null) throw new IOException("JSON 顶层必须是对象。");
+            return value;
+        }
+        internal static T Decode<T>(string text, int maximum = 65536)
+        {
+            Object(text, maximum);
+            return new JavaScriptSerializer { MaxJsonLength = maximum, RecursionLimit = 24 }.Deserialize<T>(text);
+        }
+        internal static string String(Dictionary<string, object> value, string key)
+        {
+            object item;
+            if (!value.TryGetValue(key, out item) || !(item is string)) throw new IOException("JSON 缺少文本字段：" + key);
+            return (string)item;
+        }
+        internal static int Integer(Dictionary<string, object> value, string key)
+        {
+            object item;
+            if (!value.TryGetValue(key, out item) || !(item is long) || (long)item < Int32.MinValue || (long)item > Int32.MaxValue)
+                throw new IOException("JSON 整数字段无效：" + key);
+            return (int)(long)item;
+        }
+        internal static bool Boolean(Dictionary<string, object> value, string key)
+        {
+            object item;
+            if (!value.TryGetValue(key, out item) || !(item is bool)) throw new IOException("JSON 布尔字段无效：" + key);
+            return (bool)item;
+        }
+        internal static void Keys(Dictionary<string, object> value, params string[] keys)
+        {
+            if (!new HashSet<string>(keys, StringComparer.Ordinal).SetEquals(value.Keys)) throw new IOException("JSON 字段不符合白名单，拒绝额外内容或缺项。");
+        }
+        private sealed class Parser
+        {
+            private readonly string text;
+            private int index;
+            internal Parser(string text) { this.text = text; }
+            private IOException Error() { return new IOException("JSON 格式不正确、存在重复字段或嵌套过深。"); }
+            private void Space() { while (index < text.Length && (text[index] == ' ' || text[index] == '\r' || text[index] == '\n' || text[index] == '\t')) index++; }
+            internal object Parse() { object value = Value(0); Space(); if (index != text.Length) throw Error(); return value; }
+            private string Text()
+            {
+                if (index >= text.Length || text[index++] != '"') throw Error();
+                var result = new StringBuilder();
+                while (index < text.Length)
+                {
+                    char c = text[index++];
+                    if (c == '"') return result.ToString();
+                    if (c < 32) throw Error();
+                    if (c != '\\') { result.Append(c); continue; }
+                    if (index >= text.Length) throw Error();
+                    c = text[index++];
+                    switch (c)
+                    {
+                        case '"': case '\\': case '/': result.Append(c); break;
+                        case 'b': result.Append('\b'); break;
+                        case 'f': result.Append('\f'); break;
+                        case 'n': result.Append('\n'); break;
+                        case 'r': result.Append('\r'); break;
+                        case 't': result.Append('\t'); break;
+                        case 'u':
+                            ushort code;
+                            if (index + 4 > text.Length || !UInt16.TryParse(text.Substring(index, 4), NumberStyles.AllowHexSpecifier, CultureInfo.InvariantCulture, out code)) throw Error();
+                            result.Append((char)code); index += 4; break;
+                        default: throw Error();
+                    }
+                }
+                throw Error();
+            }
+            private object Value(int depth)
+            {
+                if (depth > 24) throw Error();
+                Space();
+                if (index >= text.Length) throw Error();
+                char c = text[index];
+                if (c == '"') return Text();
+                if (c == '{')
+                {
+                    index++; Space();
+                    var result = new Dictionary<string, object>(StringComparer.Ordinal);
+                    if (index < text.Length && text[index] == '}') { index++; return result; }
+                    while (true)
+                    {
+                        Space(); string key = Text(); Space();
+                        if (index >= text.Length || text[index++] != ':' || result.ContainsKey(key)) throw Error();
+                        result.Add(key, Value(depth + 1)); Space();
+                        if (index >= text.Length) throw Error();
+                        char end = text[index++];
+                        if (end == '}') return result;
+                        if (end != ',') throw Error();
+                    }
+                }
+                if (c == '[')
+                {
+                    index++; Space(); var items = new List<object>();
+                    if (index < text.Length && text[index] == ']') { index++; return items; }
+                    while (true)
+                    {
+                        items.Add(Value(depth + 1)); Space();
+                        if (index >= text.Length) throw Error();
+                        char end = text[index++];
+                        if (end == ']') return items;
+                        if (end != ',') throw Error();
+                    }
+                }
+                foreach (string literal in new[] { "true", "false", "null" })
+                {
+                    if (index + literal.Length <= text.Length && text.Substring(index, literal.Length) == literal)
+                    {
+                        index += literal.Length;
+                        return literal == "null" ? null : (object)(literal == "true");
+                    }
+                }
+                int start = index;
+                while (index < text.Length && "-+0123456789.eE".IndexOf(text[index]) >= 0) index++;
+                string number = text.Substring(start, index - start);
+                if (!Regex.IsMatch(number, @"^-?(0|[1-9][0-9]*)(\.[0-9]+)?([eE][+-]?[0-9]+)?$")) throw Error();
+                long integer;
+                if (Int64.TryParse(number, NumberStyles.AllowLeadingSign, CultureInfo.InvariantCulture, out integer)) return integer;
+                double floating;
+                if (!Double.TryParse(number, NumberStyles.Float, CultureInfo.InvariantCulture, out floating) || Double.IsInfinity(floating) || Double.IsNaN(floating)) throw Error();
+                return floating;
+            }
+        }
+    }
+
+    internal static class Network
+    {
+        internal static byte[] PrivateV4(string address)
+        {
+            if (address == null || !Regex.IsMatch(address, @"^(0|[1-9][0-9]{0,2})(\.(0|[1-9][0-9]{0,2})){3}$"))
+                throw new IOException("只接受规范的 RFC1918 局域网 IPv4 地址。");
+            string[] parts = address.Split('.');
+            var bytes = new byte[4];
+            for (int i = 0; i < 4; i++)
+                if (!Byte.TryParse(parts[i], NumberStyles.None, CultureInfo.InvariantCulture, out bytes[i])) throw new IOException("IPv4 地址超出范围。");
+            if (!(bytes[0] == 10 || (bytes[0] == 172 && bytes[1] >= 16 && bytes[1] <= 31) || (bytes[0] == 192 && bytes[1] == 168)))
+                throw new IOException("不能使用公网、回环、链路本地、IPv6 或主机名；仅支持 RFC1918 IPv4。");
+            return bytes;
+        }
+        internal static int Port(int value) { if (value < 1 || value > 65535) throw new IOException("端口必须在 1–65535 内。"); return value; }
+        internal static string Origin(string address, int port) { PrivateV4(address); Port(port); return "https://" + address + (port == 443 ? "" : ":" + port.ToString(CultureInfo.InvariantCulture)); }
+        internal static string AddressOf(string origin, out int port)
+        {
+            var match = Regex.Match(origin ?? "", @"^https://([0-9.]+)(?::([1-9][0-9]{0,4}))?$", RegexOptions.CultureInvariant);
+            if (!match.Success) throw new IOException("接入地址必须是没有路径、用户信息或查询参数的 HTTPS 私网 IPv4 来源。");
+            string address = match.Groups[1].Value;
+            port = match.Groups[2].Success ? Int32.Parse(match.Groups[2].Value, CultureInfo.InvariantCulture) : 443;
+            if (Origin(address, port) != origin) throw new IOException("接入来源不是规范形式（443 端口必须省略）。");
+            return address;
+        }
+        internal static string Subnet(string address, int prefix)
+        {
+            byte[] bytes = PrivateV4(address);
+            int privatePrefix = bytes[0] == 10 ? 8 : bytes[0] == 172 ? 12 : 16;
+            if (prefix < privatePrefix || prefix > 30) throw new IOException("网段必须完全位于所选 RFC1918 私网内，且前缀为 /8–/30 的有效办公网段。");
+            uint ip = ((uint)bytes[0] << 24) | ((uint)bytes[1] << 16) | ((uint)bytes[2] << 8) | bytes[3];
+            uint mask = UInt32.MaxValue << (32 - prefix);
+            uint first = ip & mask, last = first | ~mask;
+            if (ip == first || ip == last) throw new IOException("不能使用所选网段的网络地址或广播地址。");
+            return String.Format(CultureInfo.InvariantCulture, "{0}.{1}.{2}.{3}/{4}", first >> 24, (first >> 16) & 255, (first >> 8) & 255, first & 255, prefix);
+        }
+    }
+
+    internal sealed class Connection
+    {
+        public string format = "industrial-rent-lan-connection";
+        public int formatVersion = 1;
+        public string serverId;
+        public string origin;
+        public string caCertificate;
+        public string caSha256;
+        public string createdAt;
+        public string expiresAt;
+
+        internal byte[] CaBytes { get { return Convert.FromBase64String(caCertificate); } }
+        internal static DateTimeOffset Time(string value)
+        {
+            DateTimeOffset time;
+            if (value == null || !Regex.IsMatch(value, @"^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\.[0-9]{1,7})?Z$") ||
+                !DateTimeOffset.TryParse(value, CultureInfo.InvariantCulture, DateTimeStyles.AssumeUniversal | DateTimeStyles.AdjustToUniversal, out time))
+                throw new IOException("证书时间必须是有效的 UTC ISO 时间。");
+            return time;
+        }
+        internal static Connection Read(string path, bool allowExpired)
+        {
+            byte[] bytes = Paths.Read(path, 32768);
+            if (bytes.Length >= 3 && bytes[0] == 0xef && bytes[1] == 0xbb && bytes[2] == 0xbf) throw new IOException("接入文件必须是无 BOM 的 UTF-8 JSON。");
+            return Parse(Product.Utf8.GetString(bytes), allowExpired);
+        }
+        internal static Connection Parse(string text, bool allowExpired)
+        {
+            if (Product.Utf8.GetByteCount(text) > 32768) throw new IOException("接入文件超过 32 KiB。");
+            var value = Json.Object(text);
+            Json.Keys(value, "format", "formatVersion", "serverId", "origin", "caCertificate", "caSha256", "createdAt", "expiresAt");
+            if (Json.String(value, "format") != "industrial-rent-lan-connection" || Json.Integer(value, "formatVersion") != 1) throw new IOException("不支持的员工接入文件版本。");
+            var result = new Connection {
+                serverId = Json.String(value, "serverId"), origin = Json.String(value, "origin"),
+                caCertificate = Json.String(value, "caCertificate"), caSha256 = Json.String(value, "caSha256"),
+                createdAt = Json.String(value, "createdAt"), expiresAt = Json.String(value, "expiresAt")
+            };
+            result.Validate(allowExpired);
+            return result;
+        }
+        internal void Validate(bool allowExpired)
+        {
+            Product.Uuid(serverId); Product.Sha256(caSha256);
+            int port; Network.AddressOf(origin, out port);
+            if (caCertificate.Length < 256 || caCertificate.Length > 16384 || !Regex.IsMatch(caCertificate, @"^[A-Za-z0-9+/]+={0,2}$"))
+                throw new IOException("接入文件只能包含公有 DER CA 证书，不能包含私钥或其他材料。");
+            byte[] raw;
+            try { raw = Convert.FromBase64String(caCertificate); }
+            catch (FormatException error) { throw new IOException("CA 证书的 Base64 格式错误。", error); }
+            if (Convert.ToBase64String(raw) != caCertificate || Product.Hash(raw) != caSha256) throw new IOException("CA 证书指纹与接入文件不符。");
+            // Inspect the container before construction: importing a PFX with the default
+            // X509Certificate2 constructor can create a private-key file in the user profile.
+            if (X509Certificate2.GetCertContentType(raw) != X509ContentType.Cert)
+                throw new IOException("接入文件只接受单个公有 DER 证书；拒绝 PFX、PKCS#7、证书库及私钥容器。");
+            DateTimeOffset created = Time(createdAt), expiry = Time(expiresAt), now = DateTimeOffset.UtcNow;
+            if (created > now.AddMinutes(10) || expiry <= created || expiry > created.AddDays(367)) throw new IOException("接入文件的创建时间或一年有效期不合理。");
+            using (var certificate = new X509Certificate2(raw))
+            {
+                if (!Product.Equal(certificate.RawData, raw) || certificate.HasPrivateKey ||
+                    !Product.Equal(certificate.SubjectName.RawData, certificate.IssuerName.RawData) ||
+                    certificate.SignatureAlgorithm.Value != "1.2.840.113549.1.1.11")
+                    throw new IOException("CA 必须是单个 SHA-256/RSA 自签名公有证书。");
+                var constraints = certificate.Extensions.OfType<X509BasicConstraintsExtension>().SingleOrDefault();
+                var usage = certificate.Extensions.OfType<X509KeyUsageExtension>().SingleOrDefault();
+                if (constraints == null || !constraints.Critical || !constraints.CertificateAuthority || !constraints.HasPathLengthConstraint ||
+                    constraints.PathLengthConstraint != 0 || usage == null || !usage.Critical ||
+                    usage.KeyUsages != (X509KeyUsageFlags.KeyCertSign | X509KeyUsageFlags.CrlSign))
+                    throw new IOException("CA 证书的基本约束或签名用途不符合接入协议。");
+                using (RSA rsa = certificate.GetRSAPublicKey())
+                {
+                    if (rsa == null || rsa.KeySize < 2048 || rsa.KeySize > 4096 || !Der.VerifyCertificate(raw, rsa))
+                        throw new IOException("CA 自签名或 RSA 密钥长度校验失败。");
+                }
+                if (certificate.NotBefore.ToUniversalTime() > now.UtcDateTime.AddMinutes(5) ||
+                    created.UtcDateTime < certificate.NotBefore.ToUniversalTime().AddMinutes(-5) ||
+                    expiry.UtcDateTime > certificate.NotAfter.ToUniversalTime() ||
+                    certificate.NotAfter.ToUniversalTime() > certificate.NotBefore.ToUniversalTime().AddDays(1830))
+                    throw new IOException("CA 证书有效期或接入有效期不匹配。");
+            }
+            if (!allowExpired) RequireCurrent();
+        }
+        internal void RequireCurrent()
+        {
+            if (Time(expiresAt) <= DateTimeOffset.UtcNow)
+                throw new IOException("接入证书已到期。请先同步或导出员工草稿，再由负责人停用并重新配置、重新发包；本工具不保存 CA 私钥，不能自动续期。");
+        }
+        internal string Fingerprint()
+        {
+            return String.Join(" ", Enumerable.Range(0, 8).Select(i => caSha256.Substring(i * 8, 8)));
+        }
+    }
+
+    internal static class Arguments
+    {
+        internal static Dictionary<string, string> Parse(string[] args, params string[] switches)
+        {
+            var flags = new HashSet<string>(switches, StringComparer.Ordinal);
+            var result = new Dictionary<string, string>(StringComparer.Ordinal);
+            for (int i = 0; i < args.Length; i++)
+            {
+                string key = args[i];
+                if (!key.StartsWith("--", StringComparison.Ordinal) || result.ContainsKey(key)) throw new IOException("命令参数重复或不正确。");
+                string value = "true";
+                if (!flags.Contains(key))
+                {
+                    if (++i >= args.Length || args[i].StartsWith("--", StringComparison.Ordinal)) throw new IOException("命令参数缺少值：" + key);
+                    value = args[i];
+                }
+                result.Add(key, value);
+            }
+            return result;
+        }
+        internal static void Only(Dictionary<string, string> values, params string[] keys)
+        {
+            foreach (string key in values.Keys) if (!keys.Contains(key, StringComparer.Ordinal)) throw new IOException("不接受命令参数：" + key);
+        }
+        internal static string Need(Dictionary<string, string> values, string key)
+        {
+            string value;
+            if (!values.TryGetValue(key, out value)) throw new IOException("缺少命令参数：" + key);
+            return value;
+        }
+        internal static int Number(Dictionary<string, string> values, string key)
+        {
+            string text = Need(values, key); int value;
+            if (!Regex.IsMatch(text, @"^(0|[1-9][0-9]*)$") || !Int32.TryParse(text, NumberStyles.None, CultureInfo.InvariantCulture, out value))
+                throw new IOException("参数必须是规范整数：" + key);
+            return value;
+        }
+        internal static string Quote(string text)
+        {
+            var result = new StringBuilder("\""); int slashes = 0;
+            foreach (char c in text)
+            {
+                if (c == '\\') { slashes++; continue; }
+                result.Append('\\', c == '"' ? slashes * 2 + 1 : slashes); result.Append(c); slashes = 0;
+            }
+            return result.Append('\\', slashes * 2).Append('"').ToString();
+        }
+        internal static void Streams()
+        {
+            Console.SetOut(new StreamWriter(Console.OpenStandardOutput(), Product.Utf8) { AutoFlush = true });
+            Console.SetError(new StreamWriter(Console.OpenStandardError(), Product.Utf8) { AutoFlush = true });
+        }
+    }
+}

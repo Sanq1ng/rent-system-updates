@@ -1,0 +1,34 @@
+"use strict";
+
+const fs = require("node:fs");
+const path = require("node:path");
+const { fail, regularFile, assertDirectory } = require("./files.cjs");
+const { resolveUpdateConfig } = require("./transport.cjs");
+
+const sourceFile = configFile => `${path.resolve(configFile)}.updates.json`;
+
+function readUpdateSource(configFile) {
+  const file = sourceFile(configFile);
+  try { regularFile(file, 65536); }
+  catch (error) {
+    if (error.code === "ENOENT") return null;
+    throw error;
+  }
+  assertDirectory(path.dirname(file));
+  const bytes = fs.readFileSync(file);
+  let value;
+  try { value = JSON.parse(bytes.toString("utf8")); }
+  catch (error) {
+    if (!(error instanceof SyntaxError)) throw error;
+    fail("UPDATE_CONFIG", "更新来源配置损坏，请保留原文件交维护人员处理。");
+  }
+  if (!value || value.format !== "industrial-rent-update-source" || value.formatVersion !== 1 ||
+      Object.keys(value).sort().join(",") !== "format,formatVersion,updates" ||
+      !value.updates || typeof value.updates !== "object" || Array.isArray(value.updates) ||
+      Object.keys(value.updates).sort().join(",") !== "allowPrivateNetwork,feedUrl,trustedKeys") {
+    fail("UPDATE_CONFIG", "更新来源配置的格式或字段不完整，不会退回使用其他来源。");
+  }
+  return { file, bytes, updates: resolveUpdateConfig(value.updates) };
+}
+
+module.exports = { sourceFile, readUpdateSource };

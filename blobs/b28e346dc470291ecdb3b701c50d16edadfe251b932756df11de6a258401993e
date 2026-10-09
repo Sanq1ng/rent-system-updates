@@ -1,0 +1,178 @@
+using System;
+using System.Collections.Generic;
+using System.Diagnostics;
+using System.IO;
+using System.Text;
+using System.Text.RegularExpressions;
+using System.Threading.Tasks;
+
+namespace RentCentre.Desktop
+{
+    internal sealed partial class Manager
+    {
+        private bool updating, rollbackAttempted;
+        private string startupUpdateJob, selectedVersion;
+        private OwnedJob updateProcessJob;
+
+        private string ActivePackageFile()
+        {
+            string storage = FullUpdateLaunch.Storage(applicationDirectory, options);
+            string pointer = Path.Combine(storage, "update-state", "active.json");
+            if (!File.Exists(pointer)) return Path.Combine(applicationDirectory, "package.json");
+            if (new FileInfo(pointer).Length > 1024) throw new InvalidDataException("当前程序指针异常过大，未打开账本。");
+            var record = json.Deserialize<Dictionary<string, object>>(File.ReadAllText(pointer, Encoding.UTF8));
+            if (record == null || !record.ContainsKey("formatVersion") || Convert.ToInt32(record["formatVersion"]) != 1 ||
+                !Regex.IsMatch(Value(record, "releaseId"), "^[a-f0-9]{64}$"))
+                throw new InvalidDataException("当前程序指针损坏，请保留程序与更新记录，未打开账本。");
+            return Path.Combine(storage, "releases", Value(record, "releaseId"), "package.json");
+        }
+
+        private bool ReceiveUpdate(HostRun run, Dictionary<string, object> message, string type)
+        {
+            if (type != "update-restart" && type != "update-recovery" && type != "update-trial-ready") return false;
+            if (pendingLan)
+            {
+                pendingLan = configuringLan = resumeAfterLan = false;
+                AddActivity("已收到程序更新交接，局域网配置尚未进行；先完成更新再配置网络。");
+            }
+            Guid parsed;
+            string jobId = Value(message, "jobId");
+            if (!message.ContainsKey("pid") || Convert.ToInt32(message["pid"]) != run.Process.Id ||
+                !Guid.TryParse(jobId, out parsed) || parsed.ToString("D") != jobId) throw new InvalidDataException();
+            if (type == "update-trial-ready")
+            {
+                if (run.UpdateJobId != jobId || Value(message, "version") != selectedVersion || run.ExpectedStop)
+                    throw new InvalidDataException();
+                SetState(HostState.Starting, "程序版本与账套已完成试运行校验，正在确认开放业务。原备份和旧程序仍保留。");
+                run.SendUpdate("update-commit", jobId);
+                return true;
+            }
+            if (type == "update-restart" && !run.Ready) throw new InvalidDataException();
+            run.UpdateJobId = startupUpdateJob = jobId;
+            run.UpdateRestart = type == "update-restart";
+            run.UpdateRecovery = type == "update-recovery";
+            run.ExpectedStop = true;
+            run.StopBegan = DateTime.UtcNow;
+            rollbackAttempted = false;
+            restartAfterStop = false;
+            ClearToken();
+            SetState(HostState.Stopping, run.UpdateRecovery
+                ? "检测到未完成更新，将校验保留的旧程序后恢复。不会用旧备份覆盖账本。"
+                : "管理员已确认更新，正在安全停止自有主机；随后自动校验并启动新程序。");
+            AddActivity(run.UpdateRecovery ? "正在恢复未完成的程序更新。" : "收到已备份的在线更新交接请求。");
+            if (run.UpdateRestart) run.SendUpdate("update-stop", jobId);
+            return true;
+        }
+
+        private void CompleteUpdateStart(HostRun run)
+        {
+            if (run.UpdateJobId == null) return;
+            AddActivity(rollbackAttempted ? "更新前程序已恢复运行，账本未被备份覆盖。" : "新程序已确认就绪，无需重新安装或注册。");
+            run.UpdateJobId = null;
+            startupUpdateJob = null;
+            rollbackAttempted = false;
+        }
+
+        private bool ContinueUpdateAfterExit(HostRun run, int code)
+        {
+            if (run.UpdateJobId == null || exitAfterStop) return false;
+            if (run.UpdateRecovery && code == 0 && !run.ReportedError)
+                CoordinateUpdate("recover", run.UpdateJobId);
+            else if (run.UpdateRestart && code == 0 && !run.ReportedError)
+                CoordinateUpdate("activate", run.UpdateJobId);
+            else if (!rollbackAttempted)
+                CoordinateUpdate("rollback", run.UpdateJobId);
+            else
+            {
+                SetState(HostState.Error, "保留程序未能安全启动，已停止自动尝试。请保留账本、备份及 update-state 记录，由维护人员排查。");
+                AddActivity("恢复未完成；未覆盖账本，也未启动未验证的程序。");
+            }
+            return true;
+        }
+
+        private async void CoordinateUpdate(string action, string jobId)
+        {
+            if (updating || current != null || IsDisposed) return;
+            updating = true;
+            if (action != "activate") rollbackAttempted = true;
+            SetState(HostState.Starting, action == "activate"
+                ? "正在校验完整备份和暂存程序，随后自动启动。请勿断电或移走程序目录。"
+                : "正在校验更新前程序并恢复启动；不会恢复、覆盖或清空当前账本。");
+            Process process = null;
+            OwnedJob owned = null;
+            Dictionary<string, object> result = null;
+            string failure = null;
+            try
+            {
+                owned = new OwnedJob();
+                updateProcessJob = owned;
+                var info = new ProcessStartInfo {
+                    FileName = Path.Combine(applicationDirectory, "runtime", "node.exe"),
+                    Arguments = "--disable-warning=ExperimentalWarning " +
+                        LaunchOptions.Quote(Path.Combine(applicationDirectory, "updates", "supervisor.cjs")) + " " + action +
+                        " --job " + LaunchOptions.Quote(jobId) + " --pipe" +
+                        (options.ConfigFile == null ? "" : " --config " + LaunchOptions.Quote(options.ConfigFile)),
+                    WorkingDirectory = applicationDirectory, UseShellExecute = false, CreateNoWindow = true,
+                    RedirectStandardInput = true, RedirectStandardOutput = true, RedirectStandardError = true,
+                    StandardOutputEncoding = new UTF8Encoding(false), StandardErrorEncoding = new UTF8Encoding(false)
+                };
+                info.EnvironmentVariables.Remove("NODE_OPTIONS");
+                info.EnvironmentVariables.Remove("NODE_PATH");
+                process = new Process { StartInfo = info };
+                if (!process.Start()) throw new IOException("未能启动随包更新校验组件。");
+                owned.Assign(process);
+                Task<string> output = process.StandardOutput.ReadToEndAsync();
+                Task<string> errors = process.StandardError.ReadToEndAsync();
+                process.StandardInput.WriteLine("{\"command\":\"apply\",\"protocol\":2}");
+                process.StandardInput.Flush();
+                Process captured = process;
+                await Task.Run(delegate { captured.WaitForExit(); });
+                string text = await output;
+                string errorText = await errors;
+                if (process.ExitCode != 0) throw new IOException(String.IsNullOrWhiteSpace(errorText) ? "更新校验组件未成功结束。" : errorText);
+                if (text.Length > 16384) throw new InvalidDataException("更新交接结果异常过大。");
+                result = json.Deserialize<Dictionary<string, object>>(text);
+                if (result == null || Value(result, "jobId") != jobId || !result.ContainsKey("rollback") || !(result["rollback"] is bool))
+                    throw new InvalidDataException("更新交接结果不属于当前任务。");
+            }
+            catch (Exception error)
+            {
+                result = null;
+                failure = Clean(error.Message, 550);
+            }
+            finally
+            {
+                if (owned != null) owned.Dispose();
+                if (updateProcessJob == owned) updateProcessJob = null;
+                if (process != null) process.Dispose();
+                updating = false;
+            }
+            if (IsDisposed || Disposing) return;
+            if (result != null)
+            {
+                if (result.ContainsKey("fullProgram") && Equals(result["fullProgram"], true))
+                {
+                    try { await LaunchFullUpdate(result); }
+                    catch (Exception error) {
+                        SetState(HostState.Error, "整程序交接未完成，账本和备份保留。\n" + Clean(error.Message, 500));
+                        AddActivity(Clean(error.Message, 500));
+                    }
+                    return;
+                }
+                startupUpdateJob = jobId;
+                rollbackAttempted = (bool)result["rollback"];
+                StartHost();
+            }
+            else if (action == "activate" && !rollbackAttempted)
+            {
+                AddActivity("激活未完成，正在尝试保留程序：" + failure);
+                CoordinateUpdate("rollback", jobId);
+            }
+            else
+            {
+                SetState(HostState.Error, "更新恢复未完成，未覆盖账本。请保留程序和备份，查看维护日志。\n" + failure);
+                AddActivity(failure);
+            }
+        }
+    }
+}

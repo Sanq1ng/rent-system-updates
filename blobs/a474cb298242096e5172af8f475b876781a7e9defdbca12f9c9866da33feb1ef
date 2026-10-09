@@ -1,0 +1,271 @@
+using System;
+using System.Collections;
+using System.Collections.Generic;
+using System.IO;
+using System.Linq;
+using System.Management;
+using System.Net;
+using System.Net.NetworkInformation;
+using System.Net.Sockets;
+using System.Runtime.InteropServices;
+
+namespace RentLan
+{
+    internal sealed class OfficeIdentity
+    {
+        public string adapterId, connectionId, networkId;
+        public int category;
+        internal void Validate()
+        {
+            foreach (string value in new[] { adapterId, connectionId, networkId })
+            {
+                Guid id;
+                if (!Guid.TryParseExact(value, "D", out id) || id == Guid.Empty || id.ToString("D") != value)
+                    throw new IOException("Windows 办公连接标识不是规范 GUID。");
+            }
+            if (category < 0 || category > 2) throw new IOException("办公室连接的安全类别无效。");
+        }
+        internal string Tag { get { Validate(); return adapterId + "\n" + connectionId + "\n" + networkId + "\n" + category; } }
+        internal bool Same(OfficeIdentity other)
+        {
+            return other != null && adapterId == other.adapterId && connectionId == other.connectionId && networkId == other.networkId;
+        }
+    }
+    internal sealed class OfficeCandidate
+    {
+        internal InterfaceChoice choice;
+        internal uint index;
+        internal string adapterId;
+    }
+    internal sealed class OfficeSelection
+    {
+        internal InterfaceChoice choice;
+        internal OfficeIdentity identity;
+        internal string name;
+    }
+    [ComImport, Guid("DCB00002-570F-4A9B-8D69-199FDBA5723B"), InterfaceType(ComInterfaceType.InterfaceIsDual)]
+    internal interface IOfficeNetwork
+    {
+        [return: MarshalAs(UnmanagedType.BStr)] string GetName();
+        void SetName([MarshalAs(UnmanagedType.BStr)] string name);
+        [return: MarshalAs(UnmanagedType.BStr)] string GetDescription();
+        void SetDescription([MarshalAs(UnmanagedType.BStr)] string description);
+        Guid GetNetworkId();
+        int GetDomainType();
+        [return: MarshalAs(UnmanagedType.Interface)] object GetNetworkConnections();
+        void GetTimeCreatedAndConnected(out uint createdLow, out uint createdHigh, out uint connectedLow, out uint connectedHigh);
+        [return: MarshalAs(UnmanagedType.VariantBool)] bool IsConnectedToInternet();
+        [return: MarshalAs(UnmanagedType.VariantBool)] bool IsConnected();
+        int GetConnectivity();
+        int GetCategory();
+        void SetCategory(int category);
+    }
+    internal static class OfficeNetwork
+    {
+        [StructLayout(LayoutKind.Explicit, Size = 28)]
+        private struct Sockaddr
+        {
+            [FieldOffset(0)] internal ushort family;
+            [FieldOffset(4)] internal uint address;
+        }
+        [DllImport("iphlpapi.dll", ExactSpelling = true)]
+        private static extern uint GetBestRoute2(IntPtr luid, uint index, IntPtr source, ref Sockaddr destination,
+            uint options, IntPtr row, out Sockaddr bestSource);
+
+        private static string PreferredSource(uint index)
+        {
+            var destination = new Sockaddr { family = 2, address = BitConverter.ToUInt32(IPAddress.Parse("1.1.1.1").GetAddressBytes(), 0) };
+            IntPtr row = Marshal.AllocHGlobal(256);
+            try
+            {
+                Sockaddr source;
+                // This queries the Windows routing table only; it does not contact the destination.
+                uint code = GetBestRoute2(IntPtr.Zero, index, IntPtr.Zero, ref destination, 0, row, out source);
+                if (code == 1168 || code == 1231) return null;
+                if (code != 0) throw new IOException("Windows 无法确认当前办公连接，请连接办公室网络后重试。");
+                return source.family == 2 ? new IPAddress(BitConverter.GetBytes(source.address)).ToString() : null;
+            }
+            finally { Marshal.FreeHGlobal(row); }
+        }
+
+        internal static OfficeCandidate Choose(OfficeCandidate[] candidates, string preferred, Func<uint, string> perInterface)
+        {
+            if (candidates.Length == 0) throw new IOException("没有检测到已连接的真实办公网络。请接上办公室网线或 Wi-Fi 后重试；不会开放虚拟网卡或公共访问。");
+            OfficeCandidate[] best = candidates.Where(item => item.choice.address == preferred).ToArray();
+            if (best.Length == 1) return best[0];
+            if (candidates.Length == 1) return candidates[0];
+            uint[] indexes = candidates.Select(item => item.index).Distinct().ToArray();
+            if (indexes.Length == 1)
+            {
+                string local = perInterface(indexes[0]);
+                best = candidates.Where(item => item.choice.address == local).ToArray();
+                if (best.Length == 1) return best[0];
+            }
+            throw new IOException("这台电脑同时连接了多个无法安全区分的网络。软件没有猜选；请由维护人员确认办公连接，业务人员无需填写网络参数。");
+        }
+
+        internal static OfficeSelection Detect(LanStatus status)
+        {
+            var hardware = new Dictionary<Guid, uint>();
+            try
+            {
+                using (var query = new ManagementObjectSearcher(@"root\StandardCimv2",
+                    "SELECT InterfaceGuid, InterfaceIndex, HardwareInterface, Virtual FROM MSFT_NetAdapter"))
+                {
+                    query.Options.Timeout = TimeSpan.FromSeconds(15);
+                    using (ManagementObjectCollection entries = query.Get())
+                        foreach (ManagementObject item in entries)
+                        using (item)
+                        {
+                            Guid id;
+                            if (item["HardwareInterface"] is bool && (bool)item["HardwareInterface"] &&
+                                item["Virtual"] is bool && !(bool)item["Virtual"] &&
+                                Guid.TryParse(Convert.ToString(item["InterfaceGuid"]), out id))
+                                hardware.Add(id, Convert.ToUInt32(item["InterfaceIndex"]));
+                        }
+                }
+            }
+            catch (ManagementException error) { throw new IOException("Windows 未提供可核实的办公连接信息，请联系维护人员。没有修改任何网络设置。", error); }
+            catch (UnauthorizedAccessException error) { throw new IOException("公司策略不允许识别办公连接，请联系维护人员。没有修改任何网络设置。", error); }
+            var candidates = new List<OfficeCandidate>();
+            foreach (NetworkInterface adapter in NetworkInterface.GetAllNetworkInterfaces())
+            {
+                Guid id; uint index;
+                if (adapter.OperationalStatus != OperationalStatus.Up ||
+                    !Guid.TryParse(adapter.Id, out id) || !hardware.TryGetValue(id, out index) ||
+                    (adapter.NetworkInterfaceType != NetworkInterfaceType.Ethernet && adapter.NetworkInterfaceType != NetworkInterfaceType.Wireless80211))
+                    continue;
+                foreach (UnicastIPAddressInformation address in adapter.GetIPProperties().UnicastAddresses)
+                {
+                    if (address.Address.AddressFamily != AddressFamily.InterNetwork) continue;
+                    InterfaceChoice[] matches = status.interfaces.Where(item => item.address == address.Address.ToString() &&
+                        item.prefixLength == WindowsNetworkGate.Prefix(address.IPv4Mask.GetAddressBytes())).ToArray();
+                    if (matches.Length == 1) candidates.Add(new OfficeCandidate { choice = matches[0], adapterId = id.ToString("D"), index = index });
+                }
+            }
+            OfficeCandidate selected = Choose(candidates.ToArray(), candidates.Count == 0 ? null : PreferredSource(0), PreferredSource);
+            var plan = new FirewallPlan { address = selected.choice.address, prefixLength = selected.choice.prefixLength };
+            string name;
+            OfficeIdentity identity = Read(plan, out name);
+            if (identity.adapterId != selected.adapterId) throw new IOException("办公室连接在识别时发生变化，请刷新后重试。");
+            return new OfficeSelection { choice = selected.choice, identity = identity, name = name };
+        }
+
+        internal static OfficeIdentity Read(FirewallPlan plan, out string name)
+        {
+            string foundName = null;
+            OfficeIdentity result = Visit(plan, (network, identity, count) => {
+                foundName = network.GetName();
+                if (String.IsNullOrWhiteSpace(foundName) || foundName.Length > 256 || foundName.Any(Char.IsControl))
+                    foundName = "当前办公室连接";
+            });
+            name = foundName;
+            return result;
+        }
+
+        internal static void RequireSame(FirewallPlan plan, OfficeIdentity current)
+        {
+            if (plan.officeNetwork == null || !plan.officeNetwork.Same(current) ||
+                (current.category != plan.officeNetwork.category && !(plan.officeNetwork.category == 0 && current.category == 1)))
+                throw new IOException("办公室连接已变化，或安全策略已调整。软件没有更改其他网络，请重新确认当前办公室连接。");
+        }
+
+        internal static bool NeedsPrivate(FirewallPlan plan)
+        {
+            if (plan.officeNetwork == null) return false;
+            string name;
+            OfficeIdentity current = Read(plan, out name);
+            RequireSame(plan, current);
+            return current.category == 0;
+        }
+
+        internal static void SetConfirmedPrivate(FirewallPlan plan)
+        {
+            if (plan.officeNetwork == null || plan.officeNetwork.category != 0)
+                throw new IOException("没有对这条办公室连接的明确授权，未改变网络安全类别。");
+            Visit(plan, (network, identity, count) => {
+                ApplyConfirmedPrivate(plan, identity, count, network.SetCategory, network.GetCategory);
+            });
+            string name;
+            OfficeIdentity current = Read(plan, out name);
+            RequireSame(plan, current);
+            if (current.category != 1) throw new IOException("办公室连接更改后未能确认，不能认为已经配置完成。");
+        }
+
+        internal static void ApplyConfirmedPrivate(FirewallPlan plan, OfficeIdentity current, int count, Action<int> set, Func<int> get)
+        {
+            if (plan.officeNetwork == null || plan.officeNetwork.category != 0)
+                throw new IOException("没有对这条办公室连接的明确授权，未改变网络安全类别。");
+            RequireSame(plan, current);
+            if (current.category == 1) return;
+            if (count != 1) throw new IOException("这个网络同时关联多个连接，不能自动修改；请让维护人员处理。");
+            set(1);
+            if (get() != 1) throw new IOException("Windows 或公司策略未允许办公室连接，请联系维护人员。未放行公用网络。");
+        }
+
+        private static OfficeIdentity Visit(FirewallPlan plan, Action<IOfficeNetwork, OfficeIdentity, int> action)
+        {
+            var adapters = NetworkInterface.GetAllNetworkInterfaces().Where(adapter => adapter.OperationalStatus == OperationalStatus.Up &&
+                adapter.GetIPProperties().UnicastAddresses.Any(ip => ip.Address.AddressFamily == AddressFamily.InterNetwork &&
+                    ip.Address.ToString() == plan.address && WindowsNetworkGate.Prefix(ip.IPv4Mask.GetAddressBytes()) == plan.prefixLength)).ToArray();
+            Guid adapterId;
+            if (adapters.Length != 1 || !Guid.TryParse(adapters[0].Id, out adapterId))
+                throw new IOException("办公连接已经变化或不可用，请刷新后重试。");
+            object manager = Activator.CreateInstance(Type.GetTypeFromCLSID(new Guid("DCB00C01-570F-4A9B-8D69-199FDBA5723B"), true));
+            OfficeIdentity result = null;
+            object target = null;
+            int targetCount = 0;
+            try
+            {
+                dynamic nlm = manager;
+                object networks = nlm.GetNetworks(1);
+                try
+                {
+                    foreach (object value in (IEnumerable)networks)
+                    {
+                        bool retain = false;
+                        try
+                        {
+                        var network = (IOfficeNetwork)value;
+                        object connections = network.GetNetworkConnections();
+                        OfficeIdentity match = null; int count = 0;
+                        try
+                        {
+                            foreach (object item in (IEnumerable)connections)
+                            try
+                            {
+                                var connection = (INetworkConnection)item;
+                                if (!connection.IsConnected()) continue;
+                                count++;
+                                if (connection.GetAdapterId() == adapterId)
+                                {
+                                    if (match != null) throw new IOException("不能唯一确认办公室连接，未修改设置。");
+                                    match = new OfficeIdentity { adapterId = adapterId.ToString("D"),
+                                        connectionId = connection.GetConnectionId().ToString("D"),
+                                        networkId = network.GetNetworkId().ToString("D"), category = network.GetCategory() };
+                                }
+                            }
+                            finally { Marshal.FinalReleaseComObject(item); }
+                        }
+                        finally { Marshal.FinalReleaseComObject(connections); }
+                        if (match == null) continue;
+                        if (result != null) throw new IOException("不能唯一确认办公室网络，未修改设置。");
+                        match.Validate(); result = match;
+                        target = value; targetCount = count; retain = true;
+                        }
+                        finally { if (!retain) Marshal.FinalReleaseComObject(value); }
+                    }
+                    if (target != null) action((IOfficeNetwork)target, result, targetCount);
+                }
+                finally { Marshal.FinalReleaseComObject(networks); }
+            }
+            finally
+            {
+                if (target != null) Marshal.FinalReleaseComObject(target);
+                Marshal.FinalReleaseComObject(manager);
+            }
+            if (result == null) throw new IOException("Windows 尚未识别当前办公网络，请稍后重试。");
+            return result;
+        }
+    }
+}

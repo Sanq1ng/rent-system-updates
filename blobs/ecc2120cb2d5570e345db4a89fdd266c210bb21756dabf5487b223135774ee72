@@ -1,0 +1,289 @@
+(function (root, factory) {
+  'use strict';
+
+  if (typeof module === 'object' && module !== null && module.exports) {
+    module.exports = factory();
+  } else {
+    root.RentDomain = factory();
+  }
+})(typeof window !== 'undefined' ? window : globalThis, function () {
+  'use strict';
+
+  const MAX_MONEY_CENTS = 1_000_000_000_000;
+  const MAX_PERIODS = 240;
+  const CYCLES = [1, 3, 6, 12];
+
+  class MoneyValidationError extends Error {
+    constructor(message) {
+      super(message);
+      this.name = 'MoneyValidationError';
+    }
+  }
+
+  function parseMoney(value) {
+    if (typeof value !== 'string' && typeof value !== 'number') {
+      throw new MoneyValidationError('金额必须填写为数字或数字字符串。');
+    }
+    if (typeof value === 'number' && !Number.isFinite(value)) {
+      throw new MoneyValidationError('金额必须是有限数字，不能为 NaN 或无穷大。');
+    }
+
+    const text = String(value).trim();
+    if (text === '') {
+      throw new MoneyValidationError('请填写金额，零金额请明确填写 0。');
+    }
+    if (text.startsWith('-')) {
+      throw new MoneyValidationError('金额不能为负数。');
+    }
+    const match = /^(\d+)(?:\.(\d{1,2}))?$/.exec(text);
+    if (!match) {
+      throw new MoneyValidationError('金额须为非负十进制数，最多两位小数，不支持千位分隔符或科学计数法。');
+    }
+
+    // 拼接整数分的数字，而不是将浮点元金额乘以 100。
+    const cents = Number(match[1] + (match[2] || '').padEnd(2, '0'));
+    if (!Number.isSafeInteger(cents)) {
+      throw new MoneyValidationError('金额超出可安全计算的整数范围。');
+    }
+    if (cents > MAX_MONEY_CENTS) {
+      throw new MoneyValidationError('金额不得超过 10000000000 元。');
+    }
+    return cents;
+  }
+
+  function daysInMonth(year, month) {
+    if (month === 2) {
+      return year % 4 === 0 && (year % 100 !== 0 || year % 400 === 0) ? 29 : 28;
+    }
+    return [4, 6, 9, 11].includes(month) ? 30 : 31;
+  }
+
+  function dateParts(value) {
+    const [year, month, day] = value.split('-').map(Number);
+    return { year, month, day };
+  }
+
+  function isISODate(value) {
+    if (typeof value !== 'string' || value.length !== 10 || !/^\d{4}-\d{2}-\d{2}$/.test(value)) {
+      return false;
+    }
+    const { year, month, day } = dateParts(value);
+    return year >= 1900 && year <= 2100
+      && month >= 1 && month <= 12
+      && day >= 1 && day <= daysInMonth(year, month);
+  }
+
+  function formatDate(year, month, day) {
+    return `${String(year).padStart(4, '0')}-${String(month).padStart(2, '0')}-${String(day).padStart(2, '0')}`;
+  }
+
+  function shiftMonth(year, month, delta) {
+    const index = year * 12 + month - 1 + delta;
+    return { year: Math.floor(index / 12), month: index % 12 + 1 };
+  }
+
+  function dayBefore(value) {
+    const { year, month, day } = dateParts(value);
+    if (day > 1) {
+      return formatDate(year, month, day - 1);
+    }
+    const previous = shiftMonth(year, month, -1);
+    return formatDate(previous.year, previous.month, daysInMonth(previous.year, previous.month));
+  }
+
+  function isRecord(value) {
+    return value !== null && typeof value === 'object'
+      && Object.prototype.toString.call(value) === '[object Object]';
+  }
+
+  function readMoney(value, errors, label) {
+    try {
+      return parseMoney(value);
+    } catch (error) {
+      if (!(error instanceof MoneyValidationError)) {
+        throw error;
+      }
+      errors.push(`${label}：${error.message}`);
+      return null;
+    }
+  }
+
+  function applyOverride(row, override) {
+    if (!isRecord(override)) {
+      row.issues.push('人工核定项无效，请同时填写金额、有效到期日和核定原因。');
+      row.rentCents = null;
+      row.dueDate = null;
+      return;
+    }
+
+    const errors = [];
+    const cents = readMoney(override.amount, errors, '人工核定金额');
+    if (!isISODate(override.dueDate)) {
+      errors.push('人工核定到期日缺失或无效，须为 1900—2100 年内真实有效的 YYYY-MM-DD 日期。');
+    }
+    const reason = typeof override.reason === 'string' ? override.reason.trim() : '';
+    if (!reason) {
+      errors.push('人工核定必须填写非空的核定原因。');
+    }
+    row.reason = reason;
+
+    // 人工核定必须整体有效，不能用部分填写的核定项替代合同规则。
+    if (errors.length > 0) {
+      row.issues.push(...errors);
+      row.rentCents = null;
+      row.dueDate = null;
+      return;
+    }
+    row.rentCents = cents;
+    row.dueDate = override.dueDate;
+    row.issues = [];
+    row.manual = true;
+    row.flags.push('人工核定');
+  }
+
+  function generateSchedule(config) {
+    const errors = [];
+    if (!isRecord(config)) {
+      return { rows: [], errors: ['请提供有效的租赁计划参数对象。'] };
+    }
+
+    const validStart = isISODate(config.startDate);
+    const validEnd = isISODate(config.endDate);
+    if (!validStart) {
+      errors.push('租赁开始日期缺失或无效，须为 1900—2100 年内真实有效的 YYYY-MM-DD 日期。');
+    }
+    if (!validEnd) {
+      errors.push('租赁结束日期缺失或无效，须为 1900—2100 年内真实有效的 YYYY-MM-DD 日期。');
+    }
+    if (validStart && validEnd && config.endDate < config.startDate) {
+      errors.push('租赁结束日期不得早于开始日期。');
+    }
+    if (!CYCLES.includes(config.cycleMonths)) {
+      errors.push('付款周期仅支持 1、3、6 或 12 个月。');
+    }
+    if (config.anchor !== 'anniversary' && config.anchor !== 'calendar') {
+      errors.push('请选择按起租日滚动或按自然周期对齐。');
+    }
+    if (config.amountBasis !== 'month' && config.amountBasis !== 'period') {
+      errors.push('请选择按月金额或按期金额作为租金基准。');
+    }
+    if (!Number.isInteger(config.advanceMonths) || config.advanceMonths < 0 || config.advanceMonths > 12) {
+      errors.push('提前缴付月数必须为 0 至 12 的整数。');
+    }
+    if (!Number.isInteger(config.dueDay) || config.dueDay < 1 || config.dueDay > 31) {
+      errors.push('约定到期日必须为 1 至 31 的整数。');
+    }
+    const amountCents = readMoney(config.amount, errors, '租金金额');
+    const freeRent = config.freeRent;
+    if (freeRent !== undefined && freeRent !== null) {
+      if (!isRecord(freeRent)) {
+        errors.push('免租区间必须同时提供开始日期和结束日期，无免租请留空。');
+      } else {
+        const validFreeStart = isISODate(freeRent.startDate);
+        const validFreeEnd = isISODate(freeRent.endDate);
+        if (!validFreeStart) {
+          errors.push('免租开始日期缺失或无效，须为 1900—2100 年内真实有效的 YYYY-MM-DD 日期。');
+        }
+        if (!validFreeEnd) {
+          errors.push('免租结束日期缺失或无效，须为 1900—2100 年内真实有效的 YYYY-MM-DD 日期。');
+        }
+        if (validFreeStart && validFreeEnd && freeRent.endDate < freeRent.startDate) {
+          errors.push('免租结束日期不得早于免租开始日期。');
+        }
+      }
+    }
+    const overrides = config.overrides === undefined ? {} : config.overrides;
+    if (!isRecord(overrides)) {
+      errors.push('人工核定须为按租期起始日期索引的对象，无核定项请使用空对象。');
+    }
+    if (errors.length > 0) {
+      return { rows: [], errors };
+    }
+
+    const original = dateParts(config.startDate);
+    const calendar = config.anchor === 'calendar';
+    const anchorMonth = calendar
+      ? Math.floor((original.month - 1) / config.cycleMonths) * config.cycleMonths + 1
+      : original.month;
+    const anchorDay = calendar ? 1 : original.day;
+    const fullRentCents = config.amountBasis === 'month'
+      ? amountCents * config.cycleMonths : amountCents;
+
+    function boundary(index) {
+      // 每个边界均从原始锚点计算，二月短月不得导致三月起租日漂移。
+      const target = shiftMonth(original.year, anchorMonth, index * config.cycleMonths);
+      const day = Math.min(anchorDay, daysInMonth(target.year, target.month));
+      return { date: formatDate(target.year, target.month, day), clamped: day !== anchorDay };
+    }
+
+    const rows = [];
+    let current = boundary(0);
+    for (let index = 0; current.date <= config.endDate; index += 1) {
+      if (rows.length === MAX_PERIODS) {
+        return { rows: [], errors: [`预览最多支持 ${MAX_PERIODS} 期，请缩短租赁期限或增加付款周期。`] };
+      }
+      const next = boundary(index + 1);
+      const fullEnd = dayBefore(next.date);
+      const periodStart = current.date < config.startDate ? config.startDate : current.date;
+      const periodEnd = fullEnd > config.endDate ? config.endDate : fullEnd;
+      const partial = periodStart !== current.date || periodEnd !== fullEnd;
+      const row = {
+        id: periodStart,
+        periodStart,
+        periodEnd,
+        dueDate: null,
+        rentCents: fullRentCents,
+        issues: [],
+        manual: false,
+        reason: '',
+        flags: []
+      };
+
+      if (partial) {
+        row.flags.push('不满整期');
+      }
+      const overlapsFree = freeRent != null
+        && freeRent.startDate <= periodEnd && freeRent.endDate >= periodStart;
+      const fullyFree = overlapsFree
+        && freeRent.startDate <= periodStart && freeRent.endDate >= periodEnd;
+      if (fullyFree) {
+        row.rentCents = 0;
+        row.flags.push('免租');
+      } else {
+        if (partial) {
+          row.rentCents = null;
+          row.issues.push('本期不满整期，不自动折算租金；请人工核定金额并填写原因。');
+        }
+        if (overlapsFree) {
+          row.rentCents = null;
+          row.flags.push('部分免租');
+          row.issues.push('本期仅部分日期免租，不自动分摊租金；请人工核定金额并填写原因。');
+        }
+      }
+      if (current.clamped || next.clamped) {
+        row.rentCents = null;
+        row.flags.push('月末边界');
+        row.issues.push(`原起租日为 ${anchorDay} 日，本期使用月末暂定边界；请人工确认周期边界、金额和到期日并填写原因。`);
+      }
+
+      const actual = dateParts(periodStart);
+      const dueMonth = shiftMonth(actual.year, actual.month, -config.advanceMonths);
+      if (dueMonth.year < 1900 || dueMonth.year > 2100) {
+        row.issues.push('计算所得到期日超出支持的年份范围（1900—2100），请人工指定有效到期日。');
+      } else if (config.dueDay > daysInMonth(dueMonth.year, dueMonth.month)) {
+        row.issues.push(`${dueMonth.year} 年 ${dueMonth.month} 月不存在 ${config.dueDay} 日，请人工指定有效到期日，不会自动改为月末。`);
+      } else {
+        row.dueDate = formatDate(dueMonth.year, dueMonth.month, config.dueDay);
+      }
+
+      if (Object.prototype.hasOwnProperty.call(overrides, row.id)) {
+        applyOverride(row, overrides[row.id]);
+      }
+      rows.push(row);
+      current = next;
+    }
+    return { rows, errors: [] };
+  }
+
+  return Object.freeze({ MoneyValidationError, parseMoney, isISODate, generateSchedule });
+});

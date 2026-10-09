@@ -1,0 +1,48 @@
+﻿param(
+    [string]$TaskName = 'IndustrialRentCentre',
+    [switch]$Remove
+)
+
+$ErrorActionPreference = 'Stop'
+$identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+$principal = [Security.Principal.WindowsPrincipal]::new($identity)
+if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+    throw '请由部署负责人以管理员身份执行。本脚本不会自动提权。'
+}
+
+$nodePath = Join-Path $PSScriptRoot 'runtime\node.exe'
+$hostPath = Join-Path $PSScriptRoot 'host.cjs'
+if (-not (Test-Path -LiteralPath $nodePath -PathType Leaf) -or -not (Test-Path -LiteralPath $hostPath -PathType Leaf)) {
+    throw '程序包不完整，未创建开机任务。'
+}
+
+$existing = @(Get-ScheduledTask | Where-Object { $_.TaskName -eq $TaskName -and $_.TaskPath -eq '\' })
+if ($Remove) {
+    if ($existing.Count -ne 1 -or $existing[0].Actions[0].Execute -ne $nodePath) {
+        throw '没有找到属于当前程序目录的唯一任务，不会删除其他任务。'
+    }
+    Unregister-ScheduledTask -TaskName $TaskName -TaskPath '\' -Confirm
+    return
+}
+if ($existing.Count -gt 0) {
+    throw '存在同名任务。请先确认其所属程序，不会覆盖已有开机配置。'
+}
+
+Write-Host '请指定运行租赁中心服务的 Windows 账号。账号需能读写业务数据和备份目录。'
+Write-Host '这是 Windows 服务运行身份，与软件里的经办、财务账号不同。'
+$credential = Get-Credential -Message '运行租赁中心服务的 Windows 账号（密码不写入程序配置）'
+if ($null -eq $credential) {
+    throw '未提供运行身份，未创建开机任务。'
+}
+
+$action = New-ScheduledTaskAction -Execute $nodePath -Argument "`"$hostPath`" --no-browser" -WorkingDirectory $PSScriptRoot
+$trigger = New-ScheduledTaskTrigger -AtStartup
+$settings = New-ScheduledTaskSettingsSet -StartWhenAvailable -AllowStartIfOnBatteries `
+    -DontStopIfGoingOnBatteries -ExecutionTimeLimit ([TimeSpan]::Zero) `
+    -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1) -MultipleInstances IgnoreNew
+
+Register-ScheduledTask -TaskName $TaskName -TaskPath '\' -Action $action -Trigger $trigger `
+    -Settings $settings -User $credential.UserName -Password ($credential.GetNetworkCredential().Password) `
+    -RunLevel Limited -Description '园区租赁中心服务；只运行后台，不自动打开桌面浏览器。' | Out-Null
+Write-Host '已创建开机任务。请关闭手动运行的主机窗口，再在任务计划程序中启动并查看运行结果。'
+Write-Host '本脚本没有改动防火墙、路由器、睡眠设置或全局脚本执行策略。'

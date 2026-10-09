@@ -1,0 +1,237 @@
+"use strict";
+
+const { INVITATION_COLUMNS, INVITATION_SCHEMA, LEGACY_INVITATION_COLUMNS, LEGACY_INVITATION_SCHEMA } = require("./invitation-schema.cjs");
+const { applyEmployeeParkPolicy } = require("./employee-park-policy.cjs");
+const { DESKTOP_SCHEMA, DESKTOP_COLUMNS, upgradeOwnerDefaults } = require("./desktop-schema.cjs");
+const SCHEMA_VERSION = 7;
+
+const BASE_COLUMNS = {
+  meta: "key:TEXT,value:TEXT",
+  users: "id:TEXT,username:TEXT,json:TEXT,salt:TEXT,password_hash:TEXT",
+  sessions: "token_hash:TEXT,user_id:TEXT,csrf:TEXT,expires_at:INTEGER",
+  settings: "id:INTEGER,json:TEXT",
+  contracts: "id:TEXT,version:INTEGER,status:TEXT,json:TEXT",
+  invoices: "id:TEXT,contract_id:TEXT,row_id:TEXT,version:INTEGER,status:TEXT,json:TEXT",
+  payments: "id:TEXT,invoice_id:TEXT,version:INTEGER,status:TEXT,json:TEXT",
+  refunds: "id:TEXT,invoice_id:TEXT,json:TEXT",
+  applications: "id:TEXT,creator:TEXT,version:INTEGER,status:TEXT,json:TEXT",
+  operations: "actor:TEXT,id:TEXT,digest:TEXT,result:TEXT",
+  attachments: "id:TEXT,upload_id:TEXT,owner:TEXT,name:TEXT,size:INTEGER,mime:TEXT,sha256:TEXT",
+  audit: "id:TEXT,action:TEXT,actor:TEXT,at:TEXT,json:TEXT",
+  notifications: "id:TEXT,type:TEXT,date:TEXT,invoice_id:TEXT,month:TEXT",
+  notification_reads: "id:TEXT,user_id:TEXT",
+};
+
+const BASE_TABLE_SQL = [
+  "CREATE TABLE meta(key TEXT PRIMARY KEY, value TEXT NOT NULL)",
+  "CREATE TABLE users(id TEXT PRIMARY KEY, username TEXT NOT NULL UNIQUE COLLATE NOCASE, json TEXT NOT NULL, salt TEXT NOT NULL, password_hash TEXT NOT NULL)",
+  "CREATE TABLE sessions(token_hash TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id), csrf TEXT NOT NULL, expires_at INTEGER NOT NULL)",
+  "CREATE TABLE settings(id INTEGER PRIMARY KEY CHECK(id=1), json TEXT NOT NULL)",
+  "CREATE TABLE contracts(id TEXT PRIMARY KEY, version INTEGER NOT NULL, status TEXT NOT NULL, json TEXT NOT NULL)",
+  "CREATE TABLE invoices(id TEXT PRIMARY KEY, contract_id TEXT NOT NULL REFERENCES contracts(id), row_id TEXT NOT NULL, version INTEGER NOT NULL, status TEXT NOT NULL, json TEXT NOT NULL)",
+  "CREATE TABLE payments(id TEXT PRIMARY KEY, invoice_id TEXT NOT NULL REFERENCES invoices(id), version INTEGER NOT NULL, status TEXT NOT NULL, json TEXT NOT NULL)",
+  "CREATE TABLE refunds(id TEXT PRIMARY KEY, invoice_id TEXT NOT NULL REFERENCES invoices(id), json TEXT NOT NULL)",
+  "CREATE TABLE applications(id TEXT PRIMARY KEY, creator TEXT NOT NULL REFERENCES users(id), version INTEGER NOT NULL, status TEXT NOT NULL, json TEXT NOT NULL)",
+  "CREATE TABLE operations(actor TEXT NOT NULL REFERENCES users(id), id TEXT NOT NULL, digest TEXT NOT NULL, result TEXT NOT NULL, PRIMARY KEY(actor,id))",
+  "CREATE TABLE attachments(id TEXT PRIMARY KEY, upload_id TEXT NOT NULL, owner TEXT NOT NULL REFERENCES users(id), name TEXT NOT NULL, size INTEGER NOT NULL, mime TEXT NOT NULL, sha256 TEXT NOT NULL, UNIQUE(owner,upload_id))",
+  "CREATE TABLE audit(id TEXT PRIMARY KEY, action TEXT NOT NULL, actor TEXT NOT NULL, at TEXT NOT NULL, json TEXT NOT NULL)",
+  "CREATE TABLE notifications(id TEXT PRIMARY KEY, type TEXT NOT NULL, date TEXT NOT NULL, invoice_id TEXT, month TEXT)",
+  "CREATE TABLE notification_reads(id TEXT NOT NULL REFERENCES notifications(id), user_id TEXT NOT NULL REFERENCES users(id), PRIMARY KEY(id,user_id))",
+];
+
+const BASE_INDEX_SQL = [
+  "CREATE INDEX sessions_user ON sessions(user_id)",
+  "CREATE INDEX invoices_contract ON invoices(contract_id, row_id)",
+];
+
+const PUSH_SCHEMA = `
+  CREATE TABLE push_devices(
+    id TEXT PRIMARY KEY,
+    user_id TEXT NOT NULL REFERENCES users(id),
+    installation_id TEXT NOT NULL,
+    channel TEXT NOT NULL CHECK(channel IN ('jpush','webpush')),
+    registration_hash TEXT NOT NULL,
+    registration_json TEXT,
+    label TEXT NOT NULL,
+    status TEXT NOT NULL CHECK(status IN ('active','revoked')),
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL,
+    last_accepted_at INTEGER,
+    last_received_at INTEGER,
+    last_opened_at INTEGER,
+    revoked_at INTEGER
+  );
+  CREATE UNIQUE INDEX push_devices_registration ON push_devices(channel,registration_hash) WHERE status='active';
+  CREATE UNIQUE INDEX push_devices_installation ON push_devices(user_id,installation_id,channel) WHERE status='active';
+  CREATE INDEX push_devices_user ON push_devices(user_id,status);
+  CREATE TABLE push_enrollments(
+    id TEXT PRIMARY KEY,
+    user_id TEXT NOT NULL REFERENCES users(id),
+    request_id TEXT NOT NULL,
+    request_hash TEXT NOT NULL,
+    installation_id TEXT NOT NULL,
+    channel TEXT NOT NULL CHECK(channel IN ('jpush','webpush')),
+    registration_hash TEXT NOT NULL,
+    registration_json TEXT,
+    label TEXT NOT NULL,
+    proof_hash TEXT,
+    status TEXT NOT NULL CHECK(status IN ('sending','pending','confirmed','expired','failed','revoked')),
+    proof_attempts INTEGER NOT NULL DEFAULT 0,
+    device_id TEXT REFERENCES push_devices(id),
+    error_code TEXT,
+    created_at INTEGER NOT NULL,
+    expires_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL,
+    UNIQUE(user_id,request_id)
+  );
+  CREATE INDEX push_enrollments_user ON push_enrollments(user_id,created_at);
+  CREATE INDEX push_enrollments_registration ON push_enrollments(channel,registration_hash,created_at);
+  CREATE TABLE push_deliveries(
+    id TEXT PRIMARY KEY,
+    device_id TEXT NOT NULL REFERENCES push_devices(id),
+    user_id TEXT NOT NULL REFERENCES users(id),
+    kind TEXT NOT NULL CHECK(kind IN ('reminder','test')),
+    dedupe_key TEXT NOT NULL,
+    notification_id TEXT,
+    status TEXT NOT NULL CHECK(status IN ('pending','retry','sending','provider-accepted','received','opened','expired','failed','revoked')),
+    attempts INTEGER NOT NULL DEFAULT 0,
+    receipt_hash TEXT,
+    next_attempt_at INTEGER NOT NULL,
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL,
+    expires_at INTEGER NOT NULL,
+    accepted_at INTEGER,
+    received_at INTEGER,
+    opened_at INTEGER,
+    error_code TEXT,
+    UNIQUE(device_id,dedupe_key)
+  );
+  CREATE INDEX push_deliveries_queue ON push_deliveries(status,next_attempt_at);
+  CREATE INDEX push_deliveries_user ON push_deliveries(user_id,created_at);
+  CREATE UNIQUE INDEX push_deliveries_test_request ON push_deliveries(user_id,dedupe_key) WHERE kind='test';
+  CREATE TABLE push_attempts(
+    id TEXT PRIMARY KEY,
+    delivery_id TEXT NOT NULL REFERENCES push_deliveries(id) ON DELETE CASCADE,
+    attempt INTEGER NOT NULL,
+    started_at INTEGER NOT NULL,
+    finished_at INTEGER,
+    outcome TEXT NOT NULL CHECK(outcome IN ('sending','provider-accepted','retry','failed','revoked')),
+    provider_status INTEGER,
+    receipt_hash TEXT,
+    error_code TEXT,
+    UNIQUE(delivery_id,attempt)
+  );
+`;
+
+const PUSH_COLUMNS = {
+  push_devices: "id:TEXT,user_id:TEXT,installation_id:TEXT,channel:TEXT,registration_hash:TEXT,registration_json:TEXT,label:TEXT,status:TEXT,created_at:INTEGER,updated_at:INTEGER,last_accepted_at:INTEGER,last_received_at:INTEGER,last_opened_at:INTEGER,revoked_at:INTEGER",
+  push_enrollments: "id:TEXT,user_id:TEXT,request_id:TEXT,request_hash:TEXT,installation_id:TEXT,channel:TEXT,registration_hash:TEXT,registration_json:TEXT,label:TEXT,proof_hash:TEXT,status:TEXT,proof_attempts:INTEGER,device_id:TEXT,error_code:TEXT,created_at:INTEGER,expires_at:INTEGER,updated_at:INTEGER",
+  push_deliveries: "id:TEXT,device_id:TEXT,user_id:TEXT,kind:TEXT,dedupe_key:TEXT,notification_id:TEXT,status:TEXT,attempts:INTEGER,receipt_hash:TEXT,next_attempt_at:INTEGER,created_at:INTEGER,updated_at:INTEGER,expires_at:INTEGER,accepted_at:INTEGER,received_at:INTEGER,opened_at:INTEGER,error_code:TEXT",
+  push_attempts: "id:TEXT,delivery_id:TEXT,attempt:INTEGER,started_at:INTEGER,finished_at:INTEGER,outcome:TEXT,provider_status:INTEGER,receipt_hash:TEXT,error_code:TEXT",
+};
+
+function assertSupportedSchema(db, version) {
+  if (!Number.isInteger(version) || version < 0 || version > SCHEMA_VERSION) {
+    throw new Error("业务数据库版本高于当前程序版本或格式不受支持，不能以此程序打开。");
+  }
+  const objects = db.prepare("SELECT name,type FROM sqlite_master WHERE name NOT LIKE 'sqlite_%' AND type IN ('table','view','trigger')").all();
+  if (version === 0) {
+    if (objects.length) throw new Error("数据目录中的 rent.sqlite 不是本系统账本，不会向未知数据库写入新表。");
+    return;
+  }
+  const expected = { ...BASE_COLUMNS, ...(version >= 4 ? PUSH_COLUMNS : {}),
+    ...(version === 5 ? LEGACY_INVITATION_COLUMNS : version >= 6 ? INVITATION_COLUMNS : {}),
+    ...(version >= 7 ? DESKTOP_COLUMNS : {}) };
+  if (objects.some(row => row.type !== "table") ||
+      objects.map(row => row.name).sort().join(",") !== Object.keys(expected).sort().join(",")) {
+    throw new Error("业务数据库表结构与声明的格式不符，不会自动修改未知账本。");
+  }
+  for (const [table, columns] of Object.entries(expected)) {
+    const actual = db.prepare(`PRAGMA table_info(${table})`).all().map(row => `${row.name}:${row.type.toUpperCase()}`).join(",");
+    if (actual !== columns) throw new Error("业务数据库字段与声明的格式不符，不会自动修改未知账本。");
+  }
+  const expectedDefinitions = [...BASE_TABLE_SQL, ...BASE_INDEX_SQL];
+  if (version >= 4) expectedDefinitions.push(...PUSH_SCHEMA.split(";").map(value => value.trim()).filter(Boolean));
+  if (version >= 5) expectedDefinitions.push(...(version === 5 ? LEGACY_INVITATION_SCHEMA : INVITATION_SCHEMA)
+    .split(";").map(value => value.trim()).filter(Boolean));
+  if (version >= 7) expectedDefinitions.push(...DESKTOP_SCHEMA.split(";").map(value => value.trim()).filter(Boolean));
+  const expectedIndexes = expectedDefinitions.filter(sql => /^CREATE (?:UNIQUE )?INDEX/.test(sql))
+    .map(sql => /^CREATE (?:UNIQUE )?INDEX\s+(\w+)/.exec(sql)[1]).sort();
+  const indexes = db.prepare("SELECT name FROM sqlite_master WHERE type='index' AND name NOT LIKE 'sqlite_%'")
+    .all().map(row => row.name).sort();
+  if (indexes.join(",") !== expectedIndexes.join(",")) {
+    throw new Error("业务数据库索引与声明的格式不符，不会自动修改未知账本。");
+  }
+  const normalize = sql => sql.split(/('(?:[^']|'')*')/).map(part =>
+    part.startsWith("'") ? part : part.replace(/\s+/g, "").replace(/;$/, "").toUpperCase()).join("");
+  for (const sql of expectedDefinitions) {
+    const name = /^CREATE (?:UNIQUE )?(?:TABLE|INDEX)\s+(\w+)/.exec(sql)[1];
+    const actual = db.prepare("SELECT sql FROM sqlite_master WHERE name=?").get(name)?.sql;
+    if (!actual || normalize(actual) !== normalize(sql)) {
+      throw new Error("业务数据库约束或索引与声明的格式不符，不会自动修改未知账本。");
+    }
+  }
+  const identity = db.prepare("SELECT value FROM meta WHERE key='server_id'").get()?.value;
+  if (typeof identity !== "string" || !/^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i.test(identity)) {
+    throw new Error("旧账本缺少有效账套标识，不能升级。");
+  }
+  if (db.prepare("PRAGMA foreign_key_check").all().length) throw new Error("业务数据库关联记录不完整，不能升级。");
+}
+
+function migrateSchema(db, at = Date.now(), expectedDataVersion, beforeCommit) {
+  if (db.isTransaction) throw new Error("格式升级必须使用独立事务，不能提交调用方的事务。");
+  db.exec("BEGIN IMMEDIATE");
+  try {
+    if (expectedDataVersion !== undefined &&
+        db.prepare("PRAGMA data_version").get().data_version !== expectedDataVersion) {
+      throw new Error("账本在升级前备份后发生变化，不能升级未经备份的状态。");
+    }
+    const version = db.prepare("PRAGMA user_version").get().user_version;
+    assertSupportedSchema(db, version);
+    if (version === 0) throw new Error("空数据库不能当作已有正式账本升级。");
+    if (version === SCHEMA_VERSION) {
+      db.exec("COMMIT");
+      return { fromSchemaVersion: version, schemaVersion: version, migrated: false,
+        employeeParkPolicy: { employees: 0, sessions: 0, invitations: 0 } };
+    }
+    const originalIdentity = db.prepare("SELECT value FROM meta WHERE key='server_id'").get().value;
+    const originalUsers = db.prepare("SELECT COUNT(*) AS n FROM users").get().n;
+    const originalInvitations = version >= 5 ? db.prepare("SELECT COUNT(*) AS n FROM account_invitations").get().n : 0;
+    const integrity = db.prepare("PRAGMA integrity_check").all();
+    if (integrity.length !== 1 || integrity[0].integrity_check !== "ok") {
+      throw new Error("业务数据库完整性检查未通过，不能升级。");
+    }
+    if (version < 4) db.exec(PUSH_SCHEMA);
+    if (version === 5) {
+      db.exec(`ALTER TABLE account_invitations RENAME TO legacy_account_invitations;
+        DROP INDEX account_invitations_creator; DROP INDEX account_invitations_expiry;`);
+    }
+    if (version < 6) db.exec(INVITATION_SCHEMA);
+    if (version === 5) {
+      const columns = LEGACY_INVITATION_COLUMNS.account_invitations.split(",").map(column => column.split(":")[0]).join(",");
+      db.exec(`INSERT INTO account_invitations(${columns},all_parks)
+        SELECT ${columns},0 FROM legacy_account_invitations;
+        DROP TABLE legacy_account_invitations;`);
+    }
+    const employeeParkPolicy = version < 6
+      ? applyEmployeeParkPolicy(db, { source: "schema-upgrade", fromSchemaVersion: version, at })
+      : { employees: 0, sessions: 0, invitations: 0 };
+    db.exec(DESKTOP_SCHEMA);
+    const owners = upgradeOwnerDefaults(db, at);
+    db.exec(`PRAGMA user_version=${SCHEMA_VERSION}`);
+    assertSupportedSchema(db, SCHEMA_VERSION);
+    if (db.prepare("SELECT value FROM meta WHERE key='server_id'").get().value !== originalIdentity ||
+        db.prepare("SELECT COUNT(*) AS n FROM users").get().n !== originalUsers ||
+        db.prepare("SELECT COUNT(*) AS n FROM account_invitations").get().n !== originalInvitations) {
+      throw new Error("格式升级改变了账套身份或账号、邀请数量，事务已拒绝提交。");
+    }
+    if (beforeCommit) beforeCommit();
+    db.exec("COMMIT");
+    return { fromSchemaVersion: version, schemaVersion: SCHEMA_VERSION, migrated: true, employeeParkPolicy, owners };
+  } catch (error) {
+    if (db.isTransaction) db.exec("ROLLBACK");
+    throw error;
+  }
+}
+
+module.exports = { SCHEMA_VERSION, PUSH_SCHEMA, assertSupportedSchema, migrateSchema };

@@ -1,0 +1,70 @@
+[CmdletBinding()]
+param([switch]$Restore)
+$ErrorActionPreference = 'Stop'
+$root = Split-Path -Parent $PSScriptRoot
+$dependency = Get-Content -LiteralPath (Join-Path $PSScriptRoot 'dependencies.json') -Raw | ConvertFrom-Json
+$cache = Join-Path $root ('.build-deps\webview2-' + $dependency.webView2.version)
+$package = Join-Path $cache 'Microsoft.Web.WebView2.nupkg'
+if (-not (Test-Path -LiteralPath $package -PathType Leaf)) {
+    if (-not $Restore) { throw 'Missing pinned WebView2 SDK. Run client-windows\build.ps1 -Restore.' }
+    $null = New-Item -ItemType Directory -Force -Path $cache
+    Invoke-WebRequest -Uri $dependency.webView2.url -OutFile $package -UseBasicParsing
+}
+if ((Get-FileHash -LiteralPath $package -Algorithm SHA256).Hash.ToLowerInvariant() -cne $dependency.webView2.sha256) {
+    throw 'WebView2 SDK package SHA-256 mismatch.'
+}
+Add-Type -AssemblyName System.IO.Compression.FileSystem
+$sdk = Join-Path $cache 'sdk'
+if (-not (Test-Path -LiteralPath $sdk)) { [IO.Compression.ZipFile]::ExtractToDirectory($package, $sdk) }
+$copies = [ordered]@{
+    'lib\net462\Microsoft.Web.WebView2.Core.dll' = 'Microsoft.Web.WebView2.Core.dll'
+    'lib\net462\Microsoft.Web.WebView2.WinForms.dll' = 'Microsoft.Web.WebView2.WinForms.dll'
+    'runtimes\win-x64\native\WebView2Loader.dll' = 'WebView2Loader.dll'
+    'LICENSE.txt' = 'WEBVIEW2-LICENSE.txt'
+}
+$archive = [IO.Compression.ZipFile]::OpenRead($package)
+try {
+    foreach ($source in $copies.Keys) {
+        $entry = $archive.GetEntry($source.Replace('\', '/'))
+        if ($null -eq $entry) { throw ('Missing SDK entry: ' + $source) }
+        $stream = $entry.Open(); $sha = [Security.Cryptography.SHA256]::Create()
+        try { $expected = [BitConverter]::ToString($sha.ComputeHash($stream)).Replace('-', '').ToLowerInvariant() }
+        finally { $sha.Dispose(); $stream.Dispose() }
+        $from = Join-Path $sdk $source
+        if ((Get-FileHash -LiteralPath $from -Algorithm SHA256).Hash.ToLowerInvariant() -cne $expected) { throw 'Extracted SDK differs from pinned package.' }
+        Copy-Item -LiteralPath $from -Destination (Join-Path $PSScriptRoot $copies[$source]) -Force
+    }
+}
+finally { $archive.Dispose() }
+$framework = Join-Path $env:WINDIR 'Microsoft.NET\Framework64\v4.0.30319'
+$compiler = Join-Path $framework 'csc.exe'
+$metadata = Join-Path ${env:ProgramFiles(x86)} 'Windows Kits\10\UnionMetadata\10.0.22621.0\Windows.winmd'
+if (-not (Test-Path -LiteralPath $metadata)) { throw 'Windows SDK 10.0.22621.0 metadata is required on the developer machine.' }
+$executable = Join-Path $PSScriptRoot ([char]0x56ed + [string][char]0x533a + [char]0x79df + [char]0x8d41 + '.exe')
+$own = @('ClientWindow.cs', 'ClientUpdates.cs', 'ClientState.cs', 'Pairing.cs', 'NoticeService.cs', 'WindowsNotices.cs', 'RuntimeSetup.cs', 'Program.cs')
+$shared = @('Protocol.cs', 'Safety.cs', 'Certificates.cs', 'TrustClient.cs')
+$arguments = @('/nologo', '/utf8output', '/target:winexe', '/platform:x64', '/optimize+', '/codepage:65001',
+    ('/out:' + $executable), ('/win32manifest:' + (Join-Path $PSScriptRoot 'app.manifest')),
+    '/reference:System.dll', '/reference:System.Core.dll', '/reference:System.Drawing.dll',
+    '/reference:System.Windows.Forms.dll', '/reference:System.Web.Extensions.dll', '/reference:System.Security.dll',
+    ('/reference:' + (Join-Path $PSScriptRoot 'Microsoft.Web.WebView2.Core.dll')),
+    ('/reference:' + (Join-Path $PSScriptRoot 'Microsoft.Web.WebView2.WinForms.dll')),
+    ('/reference:' + (Join-Path $framework 'System.Runtime.WindowsRuntime.dll')),
+    ('/reference:' + (Join-Path $env:WINDIR 'Microsoft.NET\assembly\GAC_MSIL\System.Runtime\v4.0_4.0.0.0__b03f5f7f11d50a3a\System.Runtime.dll')),
+    ('/reference:' + (Join-Path $framework 'System.Runtime.InteropServices.WindowsRuntime.dll')),
+    ('/reference:' + $metadata))
+$arguments += $own | ForEach-Object { Join-Path $PSScriptRoot $_ }
+$arguments += $shared | ForEach-Object { Join-Path $root ('lan-windows\' + $_) }
+& $compiler @arguments
+if ($LASTEXITCODE -ne 0) { throw 'Windows client compilation failed. Do not package an older binary.' }
+Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'Client.exe.config') -Destination ($executable + '.config') -Force
+$inputs = @($own) + @('dependencies.json', 'app.manifest', 'Client.exe.config', 'build.ps1', 'artifact.cjs')
+$inputs += $shared | ForEach-Object { '..\lan-windows\' + $_ }
+$sources = [ordered]@{}; $files = [ordered]@{}
+foreach ($file in $inputs) { $sources[$file] = (Get-FileHash -LiteralPath (Join-Path $PSScriptRoot $file) -Algorithm SHA256).Hash.ToLowerInvariant() }
+foreach ($file in @([IO.Path]::GetFileName($executable), ([IO.Path]::GetFileName($executable) + '.config')) + @($copies.Values)) {
+    $files[$file] = (Get-FileHash -LiteralPath (Join-Path $PSScriptRoot $file) -Algorithm SHA256).Hash.ToLowerInvariant()
+}
+$record = [ordered]@{ format = 'industrial-rent-windows-client'; formatVersion = 1; protocolVersion = 1; sources = $sources; files = $files }
+[IO.File]::WriteAllText((Join-Path $PSScriptRoot 'build.json'), ($record | ConvertTo-Json -Depth 5) + "`r`n", (New-Object Text.UTF8Encoding($false)))
+Write-Output 'Windows client compiled and recorded.'

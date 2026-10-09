@@ -1,0 +1,82 @@
+(function (root, factory) {
+  "use strict";
+  if (typeof module === "object" && module.exports) module.exports = factory(require("./push-client.js"));
+  else {
+    root.RentPushWorker = factory(root.RentPush);
+    root.RentPushWorker.attach(root);
+  }
+})(typeof self === "object" ? self : globalThis, function (Push) {
+  "use strict";
+
+  function isApplicationWindow(client, origin) {
+    const url = new URL(client.url);
+    return url.origin === origin && ["/", "/index.html"].includes(url.pathname);
+  }
+
+  function attach(scope) {
+    async function windows() {
+      return (await scope.clients.matchAll({ type: "window", includeUncontrolled: true }))
+        .filter(client => isApplicationWindow(client, scope.location.origin));
+    }
+    async function notify(message) {
+      for (const client of await windows()) client.postMessage(message);
+    }
+    async function receipt(payload, stage) {
+      try {
+        await Push.postReceipt(payload, stage);
+        await notify({ type: "RENT_PUSH_RECEIPT_CONFIRMED", stage });
+      } catch {
+        // 回执失败不能冒充设备送达；通知已经展示，仍保留站内未读，不重复弹窗。
+        scope.console.warn("RENT_PUSH_RECEIPT_PENDING");
+        await notify({ type: "RENT_PUSH_RECEIPT_PENDING", stage });
+      }
+    }
+    async function incoming(event) {
+      let payload;
+      try {
+        const text = event.data?.text();
+        if (!text || text.length > 8192) throw new Error("PUSH_SIZE");
+        payload = Push.validatePayload(JSON.parse(text));
+      } catch {
+        scope.console.warn("RENT_PUSH_PAYLOAD_REJECTED");
+        await scope.registration.showNotification("园区租赁", {
+          body: "收到一条无法核验的设备消息，请登录本系统查看通知状态。",
+          icon: "/icons/icon-192.png", tag: "rent-push-invalid",
+          data: { kind: "rent-local-reminder", url: Push.OPEN_PATH },
+        });
+        await notify({ type: "RENT_PUSH_PAYLOAD_REJECTED" });
+        return;
+      }
+      const display = Push.notificationFor(payload);
+      await scope.registration.showNotification(display.title, {
+        ...display.options, icon: "/icons/icon-192.png",
+      });
+      if (payload.kind === "rent-push-enrollment") await notify({ type: "rent-push", payload });
+      else await receipt(payload, "received");
+    }
+    async function open(event) {
+      event.notification.close();
+      let payload = null;
+      const data = event.notification.data;
+      if (data?.kind !== "rent-local-reminder") {
+        try { payload = Push.validatePayload(data); }
+        catch { scope.console.warn("RENT_PUSH_CLICK_PAYLOAD_REJECTED"); }
+      }
+      const available = await windows();
+      const current = available.find(client => client.focused) || available[0];
+      if (current) {
+        if (payload?.kind === "rent-push-enrollment") current.postMessage({ type: "rent-push", payload });
+        current.postMessage({ type: "RENT_OPEN_NOTIFICATIONS" });
+        // 不用 navigate() 重载已有窗口，避免覆盖正在填写的合同或收款表单。
+        await current.focus();
+      } else {
+        await scope.clients.openWindow(scope.location.origin + Push.OPEN_PATH);
+      }
+      if (payload && payload.kind !== "rent-push-enrollment") await receipt(payload, "opened");
+    }
+    scope.addEventListener("push", event => event.waitUntil(incoming(event)));
+    scope.addEventListener("notificationclick", event => event.waitUntil(open(event)));
+  }
+
+  return Object.freeze({ attach, isApplicationWindow });
+});

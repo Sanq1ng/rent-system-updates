@@ -1,0 +1,93 @@
+"use strict";
+
+const { PushError, requirePush, uuid } = require("./push-validation.cjs");
+
+const UUID_PATH = "[0-9a-fA-F-]{36}";
+const CONFIRM = new RegExp(`^/api/push/enrollments/(${UUID_PATH})/confirm$`);
+const DEVICE = new RegExp(`^/api/push/devices/(${UUID_PATH})$`);
+
+function isPushApiRoute(method, route) {
+  if (typeof route !== "string") return false;
+  return method === "GET" && ["/api/push/status", "/api/push/devices"].includes(route) ||
+    method === "POST" && (["/api/push/enrollments", "/api/push/test", "/api/push/receipts"].includes(route) || CONFIRM.test(route)) ||
+    method === "DELETE" && DEVICE.test(route);
+}
+
+async function readPushBody(req) {
+  const length = req.headers["content-length"];
+  requirePush(length === undefined || /^\d{1,8}$/.test(length) && Number(length) <= 8192,
+    "设备通知请求超过大小上限。", 413, "PUSH_TOO_LARGE");
+  requirePush(typeof req.headers["content-type"] === "string" &&
+    /^application\/json(?:\s*;\s*charset=utf-8)?$/i.test(req.headers["content-type"]),
+  "设备通知请求须使用 JSON。", 415, "PUSH_CONTENT_TYPE");
+  let size = 0;
+  const chunks = [];
+  for await (const chunk of req) {
+    size += chunk.length;
+    requirePush(size <= 8192, "设备通知请求超过大小上限。", 413, "PUSH_TOO_LARGE");
+    chunks.push(chunk);
+  }
+  try { return JSON.parse(Buffer.concat(chunks).toString("utf8")); }
+  catch { throw new PushError(400, "PUSH_VALIDATION", "设备通知请求须为有效 JSON。"); }
+}
+
+function createPushHttpAdapter(push, publicOrigin) {
+  async function respond(send, res, operation) {
+    try {
+      const response = await operation();
+      send(res, response.status, response.body);
+    } catch (error) {
+      if (!(error instanceof PushError)) throw error;
+      send(res, error.status, { error: { code: error.code, message: error.message, details: [] } });
+    }
+    return true;
+  }
+
+  // Mount after Host/Origin and maintenance admission, but before session lookup.
+  async function receipt({ req, res, route, writeAdmission, send }) {
+    if (req.method !== "POST" || route !== "/api/push/receipts") return false;
+    return respond(send, res, async () => {
+      requirePush(req.headers.origin === publicOrigin, "请求来源不匹配。", 403, "ORIGIN");
+      writeAdmission();
+      const body = await readPushBody(req);
+      writeAdmission();
+      return { status: 200, body: push.receipt(body) };
+    });
+  }
+
+  // Keep session, CSRF and version fences; native push RPCs must not create workspace participants.
+  async function authenticated({ req, res, route, user, reauthenticate, send }) {
+    const confirmation = CONFIRM.exec(route);
+    const device = DEVICE.exec(route);
+    const matches = isPushApiRoute(req.method, route) && route !== "/api/push/receipts" ||
+      req.method === "GET" && route === "/api/admin/push";
+    if (!matches) return false;
+    return respond(send, res, async () => {
+      if (req.method !== "GET") requirePush(req.headers.origin === publicOrigin, "请求来源不匹配。", 403, "ORIGIN");
+      const body = req.method === "POST" ? await readPushBody(req) : null;
+      const current = reauthenticate();
+      requirePush(current?.id === user.id, "账号已变更，请重新登录。", 401, "UNAUTHORIZED");
+      if (req.method === "GET") {
+        if (route === "/api/push/status") return { status: 200, body: push.status(current.id) };
+        if (route === "/api/push/devices") return { status: 200, body: { devices: push.devices(current.id) } };
+        return { status: 200, body: push.adminSummary(current.id) };
+      }
+      if (req.method === "DELETE") return { status: 200, body: push.revoke(current.id, device[1]) };
+      if (confirmation) return { status: 200, body: { device: push.confirm(current.id, confirmation[1], body) } };
+      if (route === "/api/push/test") return { status: 202, body: push.queueTest(current.id, body) };
+      const enrollment = await push.enroll(current.id, body);
+      reauthenticate();
+      return { status: 202, body: enrollment };
+    });
+  }
+
+  function logout(userId, req) {
+    const installationId = req.headers["x-rent-installation-id"];
+    if (installationId !== undefined) uuid(installationId);
+    return push.revokeUser(userId, installationId ?? null);
+  }
+
+  return { receipt, authenticated, logout };
+}
+
+module.exports = { createPushHttpAdapter, readPushBody, isPushApiRoute };

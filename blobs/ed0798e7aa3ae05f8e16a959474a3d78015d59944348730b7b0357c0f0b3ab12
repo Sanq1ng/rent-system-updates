@@ -1,0 +1,96 @@
+(function (root, factory) {
+  "use strict";
+  if (typeof module === "object" && module.exports) module.exports = factory(require("./ui.js"));
+  else root.RentUpdatePanel = factory(root.RentUI);
+})(globalThis, function (UI) {
+  "use strict";
+
+  const { html, button, note } = UI;
+  const phases = Object.freeze({
+    unavailable: "尚不可用", idle: "等待检查", queued: "更新操作已受理", checking: "正在检查",
+    available: "发现新版本", staging: "正在下载并核对更新", downloading: "正在下载",
+    staged: "更新已准备好", preparing: "等待工作页面保存",
+    "awaiting-clients": "等待工作页面保存", "backing-up": "正在备份账目和原件",
+    installing: "正在安装", restarting: "正在重启主机", "restart-pending": "正在交接并重启主机",
+    activating: "正在启用新版", trial: "正在确认新版可用", "rolling-back": "正在恢复上一程序版本",
+    "rollback-trial": "正在确认原程序可用", cancelling: "正在取消，请等待已开始的备份完成",
+    "full-apply-pending": "正在交接完整软件", "full-applying": "正在更新 Windows 程序",
+    committed: "更新完成", completed: "本次操作已完成", complete: "更新完成", succeeded: "更新完成",
+    failed: "更新未完成", cancelled: "更新已取消", "rolled-back": "已回到上一程序版本",
+    "recovery-required": "需要维护人员处理",
+  });
+  const unavailableReasons = Object.freeze({
+    UPDATE_UNSUPERVISED: "当前启动方式不能自动重启更新，请通过新版图形主机窗口启动服务。",
+    UPDATE_NOT_READY: "主机尚未准备好更新，请稍后重试。",
+    UPDATE_STATE_UNWRITABLE: "更新记录无法保存，已停止后续更新；请联系维护人员检查磁盘与目录权限。",
+  });
+
+  function render(status) {
+    if (!status) return '<p class="hint">正在取得程序更新状态。</p>';
+    const release = status.availableRelease;
+    const staged = status.stagedRelease;
+    const job = status.job;
+    const gate = status.maintenance;
+    const working = job && job.canCancel || ["queued", "checking", "staging", "downloading", "preparing",
+      "awaiting-clients", "backing-up", "installing", "restarting", "restart-pending", "activating",
+      "trial", "rolling-back", "rollback-trial", "full-apply-pending", "full-applying", "cancelling"].includes(status.phase);
+    const error = typeof job?.error === "string" ? job.error : job?.error?.message;
+    const unavailable = status.unavailableReason && status.unavailableReason !== "UPDATE_NOT_CONFIGURED"
+      ? unavailableReasons[status.unavailableReason] || status.unavailableReason : "";
+    const phase = status.phase === "completed"
+      ? job?.action === "check" ? release ? "发现新版本" : "当前已是最新发布版本"
+        : job?.action === "stage" ? "更新已下载，可以安排重启" : phases.completed
+      : phases[status.phase] || "更新状态待确认";
+    return `<h3>程序更新</h3><p>当前版本 <strong>v${html(status.currentVersion)}</strong> · ${html(phase)}</p>
+      ${!status.configured ? note("尚未配置更新发布地址，请由维护人员完成一次设置。不会上传账目。", "neutral") :
+        status.autoDownload ? "<p>新版会自动下载。准备好后，由负责人确认更新。</p>" : ""}
+      ${unavailable ? note(unavailable, "warning") : ""}
+      ${release ? `<p>可用版本：<strong>v${html(release.version)}</strong></p>
+        ${release.notes ? `<p class="update-description">${html(release.notes)}</p>` : ""}` : ""}
+      ${staged ? `<p>已准备好的更新：v${html(staged.version)}</p>` : ""}
+      ${job?.message ? `<p>${html(job.message)}</p>` : ""}
+      ${error ? note(`更新未完成：${error}`, "danger") : ""}
+      ${gate?.phase === "preparing" ? `<p>已保存并暂停 ${Number(gate.readyCount)} / ${Number(gate.pageCount)} 个最近在线页面。</p>
+        ${(gate.blockers || []).map(item => `<p class="hint">${html(item.name)}：${html(item.reason)}</p>`).join("")}` : ""}
+      <div class="button-row">
+        ${button("检查更新", "update-check", !status.configured || working ? "disabled" : "")}
+        ${release && !staged ? button(status.autoDownload ? "现在下载" : "下载更新", "update-stage", `data-release="${html(release.id)}" ${!status.configured || working ? "disabled" : ""}`) : ""}
+        ${staged ? button("确认更新", "update-install", `data-staged="${html(staged.id)}" data-version="${html(status.currentVersion)}" ${!status.configured || !status.installSupported || working ? "disabled" : ""}`, "primary") : ""}
+        ${job?.canCancel ? button("取消本次更新", "update-cancel", `data-job="${html(job.id)}"`) : ""}
+      </div>
+      <details class="update-details"><summary>更新怎样保护已有工作</summary>
+        <p>程序与业务数据分开存放；更新前备份账目和原件，只切换经过核对的程序。不会重新注册、清空账号或用旧备份自动覆盖新账。</p>
+        <p>最近在线页面先保存草稿并暂停。未完成的弹窗、未同步工作或保存失败会阻止更新；不强制刷新正在填写的页面。关闭或断网的电脑不在在线确认范围内，其草稿仍留在原浏览器。</p>
+        <p>新版完整程序包可更新 Windows 组件和同系列运行组件，并先在私有副本验证已声明的数据库升级。账本格式升级后不会自动降级旧程序，也不会拿旧备份覆盖新账。首次接入新版更新底座仍须使用专门维护入口。</p>
+        <p>发布地址及信任公钥由维护人员在主机配置，业务页面不能指定任意下载网址。同盘备份不能防范整块硬盘损坏，仍需另行落实外部备份。</p>
+      </details>`;
+  }
+
+  function notice(state, { isAdmin = false, job = null, canRefresh = true } = {}) {
+    const gate = state.maintenance;
+    const active = gate && gate.phase !== "idle";
+    if (!active && !state.availableVersion && !state.waitingForHost && !state.shellUpdateAvailable) return "";
+    let title, detail;
+    if (active) {
+      title = gate.phase === "preparing" ? "主机正在准备更新" : gate.phase === "expired" ? "更新准备尚未完成" : "主机正在更新或重启";
+      detail = state.blocker || (state.paused
+        ? "这页工作已保存并暂停，内容仍在原处；请等待更新完成或取消。"
+        : "请完成当前弹窗或同步工作；系统不会强制丢弃输入。");
+    } else if (state.waitingForHost) {
+      title = "正在等待主机恢复";
+      detail = "已保存的草稿和请求仍保留，请勿重复录入或清理浏览器数据。";
+    } else if (state.availableVersion) {
+      title = `主机已有 v${state.availableVersion} 版本`;
+      detail = "当前页面不会自动刷新。完成弹窗后点击保存并刷新，已加密的草稿和排队请求会保留。";
+    } else {
+      title = "网页资源已准备好更新";
+      detail = "点击保存并刷新，完成这台电脑的网页更新；不会清除账号、加密草稿或排队请求。";
+    }
+    return `<div><strong>${html(title)}</strong><p>${html(detail)}</p></div><div class="button-row">
+      ${!active && (state.availableVersion || state.shellUpdateAvailable) ? button("保存并刷新页面", "update-reload", canRefresh ? "" : "disabled", "small primary") : ""}
+      ${isAdmin && job?.canCancel ? button("取消本次更新", "update-cancel", `data-job="${html(job.id)}"`, "small") : ""}
+      </div>`;
+  }
+
+  return Object.freeze({ render, notice });
+});

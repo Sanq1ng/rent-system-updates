@@ -1,0 +1,342 @@
+using System;
+using System.Collections.Generic;
+using System.ComponentModel;
+using System.Globalization;
+using System.IO;
+using System.Linq;
+using System.Runtime.InteropServices;
+using System.Security.AccessControl;
+using System.Security.Cryptography;
+using System.Security.Principal;
+using System.Text;
+using System.Text.RegularExpressions;
+using Microsoft.Win32.SafeHandles;
+
+namespace RentLan
+{
+    internal static class Product
+    {
+        internal const string HostExe = "局域网配置.exe";
+        internal const string ClientExe = "员工电脑接入.exe";
+        internal static readonly UTF8Encoding Utf8 = new UTF8Encoding(false, true);
+        internal static string Sid { get { return WindowsIdentity.GetCurrent().User.Value; } }
+        internal static string Hash(byte[] value)
+        {
+            using (var algorithm = SHA256.Create())
+                return String.Concat(algorithm.ComputeHash(value).Select(b => b.ToString("x2", CultureInfo.InvariantCulture)));
+        }
+        internal static bool Equal(byte[] a, byte[] b)
+        {
+            if (a == null || b == null || a.Length != b.Length) return false;
+            int different = 0;
+            for (int i = 0; i < a.Length; i++) different |= a[i] ^ b[i];
+            return different == 0;
+        }
+        internal static string Uuid(string value)
+        {
+            Guid id;
+            if (value == null || !Regex.IsMatch(value, @"^[a-f0-9]{8}-[a-f0-9]{4}-[1-5][a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$") ||
+                !Guid.TryParseExact(value, "D", out id) || id == Guid.Empty)
+                throw new IOException("账套或操作标识必须是规范的小写 UUID。");
+            return value;
+        }
+        internal static string Sha256(string value)
+        {
+            if (value == null || !Regex.IsMatch(value, @"^[a-f0-9]{64}$")) throw new IOException("SHA-256 指纹格式不正确。");
+            return value;
+        }
+    }
+
+    internal static class NativeFiles
+    {
+        internal const uint Reparse = 0x400, Directory = 0x10;
+        [StructLayout(LayoutKind.Sequential)]
+        private struct Information
+        {
+            internal uint attributes;
+            internal System.Runtime.InteropServices.ComTypes.FILETIME creation, access, write;
+            internal uint volume, sizeHigh, sizeLow, links, indexHigh, indexLow;
+        }
+        [StructLayout(LayoutKind.Sequential)]
+        private struct SecurityAttributes
+        {
+            internal int length;
+            internal IntPtr descriptor;
+            internal int inherit;
+        }
+        [StructLayout(LayoutKind.Sequential)]
+        private struct Disposition { [MarshalAs(UnmanagedType.Bool)] internal bool delete; }
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        private static extern SafeFileHandle CreateFileW(string path, uint access, uint share, IntPtr security, uint disposition, uint flags, IntPtr template);
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern bool GetFileInformationByHandle(SafeFileHandle handle, out Information information);
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        private static extern uint GetFinalPathNameByHandleW(SafeFileHandle handle, StringBuilder value, uint length, uint flags);
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        private static extern uint GetFileAttributesW(string path);
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        private static extern bool CreateDirectoryW(string path, ref SecurityAttributes security);
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern bool SetFileInformationByHandle(SafeFileHandle handle, int kind, ref Disposition information, uint size);
+
+        private static IOException Failure(string operation, string path)
+        {
+            return new IOException(operation + "：" + path + "（" + new Win32Exception(Marshal.GetLastWin32Error()).Message + "）");
+        }
+        internal static bool Exists(string path)
+        {
+            uint value = GetFileAttributesW(path);
+            if (value != UInt32.MaxValue) return true;
+            int code = Marshal.GetLastWin32Error();
+            if (code == 2 || code == 3) return false;
+            throw Failure("无法检查文件", path);
+        }
+        internal static SafeFileHandle Open(string path, bool directory, bool remove, bool replaceableRead = false)
+        {
+            var handle = CreateFileW(path, (directory ? 0x80u : 0x80000000u) | (remove ? 0x10000u : 0),
+                directory ? 3u : replaceableRead ? 5u : 1u, IntPtr.Zero, 3, 0x00200000u | (directory ? 0x02000000u : 0), IntPtr.Zero);
+            if (handle.IsInvalid) { handle.Dispose(); throw Failure("无法安全打开", path); }
+            try
+            {
+                Information info;
+                if (!GetFileInformationByHandle(handle, out info)) throw Failure("无法核对文件身份", path);
+                if ((info.attributes & Reparse) != 0 || ((info.attributes & Directory) != 0) != directory || (!directory && info.links != 1))
+                    throw new IOException("不接受符号链接、重解析点、硬链接或特殊文件：" + path);
+                var final = new StringBuilder(1024);
+                uint count = GetFinalPathNameByHandleW(handle, final, (uint)final.Capacity, 0);
+                if (count == 0 || count >= final.Capacity) throw Failure("无法核对真实路径", path);
+                string actual = final.ToString();
+                if (actual.StartsWith(@"\\?\", StringComparison.Ordinal)) actual = actual.Substring(4);
+                if (!String.Equals(path.TrimEnd('\\'), actual.TrimEnd('\\'), StringComparison.OrdinalIgnoreCase))
+                    throw new IOException("不接受映射盘、路径别名或重定向路径：" + path);
+                return handle;
+            }
+            catch { handle.Dispose(); throw; }
+        }
+        internal static void NewPrivateDirectory(string path)
+        {
+            var security = new DirectorySecurity();
+            var owner = new SecurityIdentifier(Product.Sid);
+            security.SetOwner(owner);
+            security.SetAccessRuleProtection(true, false);
+            foreach (var sid in new[] { owner, new SecurityIdentifier(WellKnownSidType.LocalSystemSid, null) })
+                security.AddAccessRule(new FileSystemAccessRule(sid, FileSystemRights.FullControl,
+                    InheritanceFlags.ContainerInherit | InheritanceFlags.ObjectInherit, PropagationFlags.None, AccessControlType.Allow));
+            var pin = GCHandle.Alloc(security.GetSecurityDescriptorBinaryForm(), GCHandleType.Pinned);
+            try
+            {
+                var attributes = new SecurityAttributes {
+                    length = Marshal.SizeOf(typeof(SecurityAttributes)), descriptor = pin.AddrOfPinnedObject(), inherit = 0
+                };
+                if (!CreateDirectoryW(path, ref attributes)) throw Failure("目标文件夹必须尚不存在，不能覆盖", path);
+            }
+            finally { pin.Free(); }
+        }
+        internal static void AssertPrivateDirectory(string path)
+        {
+            var acl = System.IO.Directory.GetAccessControl(path);
+            if (!acl.AreAccessRulesProtected || !acl.GetOwner(typeof(SecurityIdentifier)).Value.Equals(Product.Sid, StringComparison.Ordinal))
+                throw new IOException("工具记录文件夹的所有者或隔离权限已改变，拒绝写入：" + path);
+            string system = new SecurityIdentifier(WellKnownSidType.LocalSystemSid, null).Value;
+            foreach (FileSystemAccessRule rule in acl.GetAccessRules(true, true, typeof(SecurityIdentifier)))
+                if (rule.AccessControlType == AccessControlType.Allow && rule.IdentityReference.Value != Product.Sid && rule.IdentityReference.Value != system)
+                    throw new IOException("工具记录文件夹向其他用户开放了权限，拒绝写入：" + path);
+        }
+        internal static void Delete(SafeFileHandle handle, string path)
+        {
+            var information = new Disposition { delete = true };
+            if (!SetFileInformationByHandle(handle, 4, ref information, (uint)Marshal.SizeOf(typeof(Disposition))))
+                throw Failure("无法删除已核实归属的文件", path);
+        }
+    }
+
+    internal static class Paths
+    {
+        private static readonly Regex Reserved = new Regex(@"^(CON|PRN|AUX|NUL|CLOCK\$|CONIN\$|CONOUT\$|COM[1-9¹²³]|LPT[1-9¹²³])(?:\.|$)", RegexOptions.IgnoreCase);
+        internal static void Component(string part)
+        {
+            if (String.IsNullOrEmpty(part) || part.Length > 120 || part == "." || part == ".." ||
+                part.EndsWith(" ", StringComparison.Ordinal) || part.EndsWith(".", StringComparison.Ordinal) ||
+                part.IndexOfAny(new[] { '<', '>', ':', '"', '/', '\\', '|', '?', '*' }) >= 0 ||
+                part.Any(c => Char.IsControl(c) || Char.GetUnicodeCategory(c) == UnicodeCategory.Format) ||
+                !part.IsNormalized(NormalizationForm.FormC) || Reserved.IsMatch(part))
+                throw new IOException("路径含有上级目录、非法字符或 Windows 保留名称。");
+        }
+        internal static string Absolute(string value, bool driveRoot)
+        {
+            if (String.IsNullOrEmpty(value) || value.Length > 240 || !Regex.IsMatch(value, @"^[A-Za-z]:\\") || value.IndexOf('/') >= 0)
+                throw new IOException("只接受本机磁盘上不超过 240 字符的规范绝对路径；不能使用 UNC、设备路径或相对路径。");
+            if (value.Length == 3) { if (!driveRoot) throw new IOException("不能使用磁盘根目录。"); }
+            else foreach (string component in value.Substring(3).Split('\\')) Component(component);
+            string full = Path.GetFullPath(value);
+            if (!String.Equals(full, value, StringComparison.OrdinalIgnoreCase)) throw new IOException("不接受路径别名或上级目录。");
+            return full;
+        }
+        internal static bool Inside(string parent, string path)
+        {
+            return String.Equals(parent.TrimEnd('\\'), path.TrimEnd('\\'), StringComparison.OrdinalIgnoreCase) ||
+                path.StartsWith(parent.TrimEnd('\\') + "\\", StringComparison.OrdinalIgnoreCase);
+        }
+        internal static void FixedDisk(string path)
+        {
+            var drive = new DriveInfo(Path.GetPathRoot(path));
+            if (!drive.IsReady || drive.DriveType != DriveType.Fixed ||
+                (drive.DriveFormat != "NTFS" && drive.DriveFormat != "ReFS"))
+                throw new IOException("请选择本机 NTFS/ReFS 固定磁盘，不接受网络盘、可移动盘或无权限保护的磁盘。");
+        }
+        internal static void NotSystem(string path)
+        {
+            foreach (string root in new[] { Environment.GetFolderPath(Environment.SpecialFolder.Windows),
+                Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles),
+                Environment.GetFolderPath(Environment.SpecialFolder.ProgramFilesX86), Environment.GetEnvironmentVariable("ProgramW6432") })
+                if (!String.IsNullOrEmpty(root) && Inside(root, path)) throw new IOException("不能把接入材料或工具记录写入系统程序目录。");
+        }
+        internal static byte[] Read(string path, int maximum, bool replaceableRead = false)
+        {
+            using (var file = new CheckedFile(path, false, replaceableRead))
+            {
+                if (file.Stream.Length > maximum) throw new IOException("文件超过允许大小：" + path);
+                using (var bytes = new MemoryStream())
+                {
+                    file.Stream.CopyTo(bytes);
+                    if (bytes.Length > maximum) throw new IOException("文件在读取时超过允许大小。");
+                    return bytes.ToArray();
+                }
+            }
+        }
+        internal static void WriteNew(string path, byte[] bytes)
+        {
+            Absolute(path, false);
+            using (var pins = new DirectoryPins(Path.GetDirectoryName(path)))
+            using (var file = new FileStream(path, FileMode.CreateNew, FileAccess.Write, FileShare.None))
+            {
+                file.Write(bytes, 0, bytes.Length);
+                file.Flush(true);
+            }
+        }
+        internal static void DeleteExact(string path, byte[] bytes)
+        {
+            using (var file = new CheckedFile(path, true))
+            {
+                if (file.Stream.Length != bytes.Length) throw new IOException("归属文件内容已变化，未删除：" + path);
+                using (var copy = new MemoryStream())
+                {
+                    file.Stream.CopyTo(copy);
+                    if (!Product.Equal(bytes, copy.ToArray())) throw new IOException("归属文件内容已变化，未删除：" + path);
+                }
+                NativeFiles.Delete(file.Stream.SafeFileHandle, path);
+            }
+        }
+    }
+
+    internal sealed class DirectoryPins : IDisposable
+    {
+        private readonly List<SafeFileHandle> handles = new List<SafeFileHandle>();
+        internal readonly string Path;
+        internal DirectoryPins(string path)
+        {
+            Path = Paths.Absolute(path, true);
+            Paths.FixedDisk(path);
+            string current = System.IO.Path.GetPathRoot(path);
+            try
+            {
+                handles.Add(NativeFiles.Open(current, true, false));
+                foreach (string part in path.Substring(current.Length).Split(new[] { '\\' }, StringSplitOptions.RemoveEmptyEntries))
+                {
+                    current = System.IO.Path.Combine(current, part);
+                    handles.Add(NativeFiles.Open(current, true, false));
+                }
+            }
+            catch { Dispose(); throw; }
+        }
+        public void Dispose()
+        {
+            for (int i = handles.Count - 1; i >= 0; i--) handles[i].Dispose();
+            handles.Clear();
+        }
+    }
+
+    internal sealed class CheckedFile : IDisposable
+    {
+        private readonly DirectoryPins parent;
+        internal readonly FileStream Stream;
+        internal CheckedFile(string path, bool remove, bool replaceableRead = false)
+        {
+            Paths.Absolute(path, false);
+            parent = new DirectoryPins(Path.GetDirectoryName(path));
+            SafeFileHandle handle = null;
+            try { handle = NativeFiles.Open(path, false, remove, replaceableRead); Stream = new FileStream(handle, FileAccess.Read); }
+            catch { if (handle != null) handle.Dispose(); parent.Dispose(); throw; }
+        }
+        public void Dispose() { if (Stream != null) Stream.Dispose(); parent.Dispose(); }
+    }
+
+    internal sealed class PrivateDirectory : IDisposable
+    {
+        private readonly DirectoryPins parent;
+        private readonly DirectoryPins self;
+        internal readonly string Path;
+        internal PrivateDirectory(string path)
+        {
+            Path = Paths.Absolute(path, false);
+            Paths.NotSystem(path);
+            parent = new DirectoryPins(System.IO.Path.GetDirectoryName(path));
+            try { NativeFiles.NewPrivateDirectory(path); self = new DirectoryPins(path); }
+            catch { parent.Dispose(); throw; }
+        }
+        internal void Write(string name, byte[] bytes) { Paths.Component(name); Paths.WriteNew(System.IO.Path.Combine(Path, name), bytes); }
+        internal void Text(string name, string text) { Write(name, Product.Utf8.GetBytes(text)); }
+        public void Dispose() { if (self != null) self.Dispose(); parent.Dispose(); }
+    }
+
+    internal sealed class RecordFile : IDisposable
+    {
+        private readonly DirectoryPins pins;
+        private readonly FileStream lease;
+        internal readonly string Directory;
+        internal readonly string File;
+        private byte[] previous;
+        internal RecordFile(string directory, string file)
+        {
+            Directory = Paths.Absolute(directory, false);
+            Paths.Component(file);
+            Paths.NotSystem(directory);
+            using (var parent = new DirectoryPins(Path.GetDirectoryName(directory)))
+                if (!NativeFiles.Exists(directory)) NativeFiles.NewPrivateDirectory(directory);
+            pins = new DirectoryPins(directory);
+            try
+            {
+                NativeFiles.AssertPrivateDirectory(directory);
+                string lockFile = Path.Combine(directory, "操作锁");
+                if (NativeFiles.Exists(lockFile)) Paths.Read(lockFile, 0);
+                lease = new FileStream(lockFile, FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.None);
+                File = Path.Combine(directory, file);
+                previous = NativeFiles.Exists(File) ? Paths.Read(File, 65536) : null;
+            }
+            catch { if (lease != null) lease.Dispose(); pins.Dispose(); throw; }
+        }
+        internal string Read() { return previous == null ? null : Product.Utf8.GetString(previous); }
+        internal void Save(object value)
+        {
+            byte[] bytes = Product.Utf8.GetBytes(Json.Encode(value) + "\r\n");
+            if (bytes.Length > 65536) throw new IOException("工具记录超过大小限制。");
+            NativeFiles.AssertPrivateDirectory(Directory);
+            if (previous == null && NativeFiles.Exists(File)) throw new IOException("工具记录被其他操作创建，未覆盖。");
+            if (previous != null && !Product.Equal(previous, Paths.Read(File, 65536))) throw new IOException("工具记录在操作期间被修改，未覆盖。");
+            string staging = Path.Combine(Directory, ".写入-" + Guid.NewGuid().ToString("D"));
+            Paths.WriteNew(staging, bytes);
+            // Replacement only ever targets this private, locked journal, never configuration or business files.
+            try
+            {
+                if (previous == null) System.IO.File.Move(staging, File);
+                else System.IO.File.Replace(staging, File, null);
+                previous = bytes;
+            }
+            catch (Exception error)
+            {
+                throw new IOException("工具记录未能原子保存；已保留待核对文件 " + staging + "。不要据此认为系统操作已回退：" + error.Message, error);
+            }
+        }
+        public void Dispose() { if (lease != null) lease.Dispose(); pins.Dispose(); }
+    }
+}

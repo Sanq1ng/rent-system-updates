@@ -1,0 +1,74 @@
+"use strict";
+
+const fs = require("node:fs");
+const path = require("node:path");
+const crypto = require("node:crypto");
+
+function inside(parent, child) {
+  const relative = path.relative(path.resolve(parent), path.resolve(child));
+  return relative === "" || relative !== ".." && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative);
+}
+function invalid(message) {
+  const error = new Error(message);
+  error.code = "PUSH_CREDENTIALS";
+  throw error;
+}
+function record(value) { return value && typeof value === "object" && !Array.isArray(value); }
+function only(value, keys) { return record(value) && Object.keys(value).every(key => keys.includes(key)); }
+
+function loadPushCredentials(config) {
+  if (!config.pushCredentialsFile) return config.push || {};
+  if (config.push !== undefined) invalid("不能同时使用内嵌推送配置和外部凭据文件。");
+  const file = config.pushCredentialsFile;
+  if (typeof file !== "string" || !path.isAbsolute(file)) invalid("推送凭据路径必须为明确的绝对路径。");
+  let bytes;
+  try {
+    const stat = fs.lstatSync(file), resolved = fs.realpathSync(file);
+    if (!stat.isFile() || stat.isSymbolicLink() || stat.nlink !== 1 || stat.size > 16384) invalid("推送凭据不是允许的普通文件。");
+    if (inside(path.resolve(__dirname, ".."), resolved) || config.updateDir && inside(config.updateDir, resolved)) {
+      invalid("推送凭据不能存放在业务程序或更新目录内。");
+    }
+    if (process.platform !== "win32" && ((stat.mode & 0o027) !== 0 || ![0, process.getuid()].includes(stat.uid))) {
+      invalid("推送凭据文件权限过宽，请限制到运行身份或 root。");
+    }
+    bytes = fs.readFileSync(file);
+  } catch (error) {
+    if (["ENOENT", "EACCES", "EPERM", "EINVAL", "EISDIR"].includes(error.code)) invalid("推送凭据无法读取，请核对文件及权限。");
+    throw error;
+  }
+  if (bytes.length > 16384) invalid("推送凭据文件超过大小上限。");
+  if (config.pushCredentialsHash &&
+      crypto.createHash("sha256").update(bytes).digest("hex") !== config.pushCredentialsHash) {
+    invalid("推送凭据在配置读取后发生变化，请停止维护操作并重新启动主机核对。");
+  }
+  let value;
+  try { value = JSON.parse(bytes.toString("utf8")); }
+  catch (error) {
+    if (error instanceof SyntaxError) invalid("推送凭据文件不是有效的 JSON；为保护密钥，不显示原始解析内容。");
+    throw error;
+  }
+  if (!only(value, ["formatVersion", "jpush", "webpush"]) || value.formatVersion !== 1 ||
+      !Object.hasOwn(value, "jpush") && !Object.hasOwn(value, "webpush")) invalid("推送凭据格式不受支持或未提供任何通道。");
+  if (Object.hasOwn(value, "jpush")) {
+    const entry = value.jpush;
+    if (!only(entry, ["appKey", "masterSecret", "production", "vendorChannelsConfigured"]) ||
+        typeof entry.appKey !== "string" || !/^[a-f0-9]{24}$/i.test(entry.appKey) ||
+        typeof entry.masterSecret !== "string" || !/^[a-f0-9]{24}$/i.test(entry.masterSecret) ||
+        typeof entry.production !== "boolean" ||
+        entry.vendorChannelsConfigured !== undefined && typeof entry.vendorChannelsConfigured !== "boolean") {
+      invalid("安卓推送凭据不完整或格式无效；请核对公开 AppKey、服务器密钥及运行模式。");
+    }
+  }
+  if (Object.hasOwn(value, "webpush")) {
+    const entry = value.webpush;
+    if (!only(entry, ["publicKey", "privateKey", "subject"]) ||
+        typeof entry.publicKey !== "string" || !/^[A-Za-z0-9_-]{87}$/.test(entry.publicKey) ||
+        typeof entry.privateKey !== "string" || !/^[A-Za-z0-9_-]{43}$/.test(entry.privateKey) ||
+        typeof entry.subject !== "string" || !entry.subject || entry.subject.length > 254) {
+      invalid("浏览器推送凭据不完整或格式无效，请核对密钥对及维护联系地址。");
+    }
+  }
+  return { ...(value.jpush ? { jpush: value.jpush } : {}), ...(value.webpush ? { webpush: value.webpush } : {}) };
+}
+
+module.exports = { loadPushCredentials };

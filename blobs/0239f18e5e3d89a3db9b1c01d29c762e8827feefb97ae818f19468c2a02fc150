@@ -1,0 +1,57 @@
+"use strict";
+
+const fs = require("node:fs");
+const path = require("node:path");
+const crypto = require("node:crypto");
+
+const EXECUTABLE = "园区租赁主机.exe";
+const HELPER = "应用程序更新.exe";
+const SOURCE_FILES = ["HostManager.cs", "Updates.cs", "WholeUpdate.cs", "ApplyUpdate.cs", "Lan.cs", "AccountSetup.cs", "Native.cs", "Theme.cs", "app.manifest", "artifact.cjs", "build.ps1", "host.ico",
+  "..\\host.cjs", "..\\config.cjs", "..\\deployment\\layout.cjs", "..\\deployment\\employee-package.cjs", "..\\shared\\lan-policy.cjs",
+  "..\\lan-windows\\Protocol.cs", "..\\lan-windows\\Safety.cs", "..\\lan-windows\\Certificates.cs",
+  ...["files", "transport", "source-config", "releases", "state", "engine", "supervisor", "publish", "bundle-layout", "full-apply", "desktop-agent"].map(name => `..\\updates\\${name}.cjs`)];
+const PACKAGE_FILES = [...SOURCE_FILES.filter(file => !file.startsWith("..")), EXECUTABLE, HELPER, "build.json"];
+
+function sha256(file) {
+  return crypto.createHash("sha256").update(fs.readFileSync(file)).digest("hex");
+}
+
+function verifyDesktopArtifact(programDirectory = path.resolve(__dirname, "..")) {
+  const directory = path.join(programDirectory, "desktop");
+  const advice = "图形主机入口缺失、损坏或与源码不同。请维护人员在开发机运行 Windows PowerShell -NoProfile -ExecutionPolicy Bypass -File .\\desktop\\build.ps1（仅本次进程），再重新打包；部署电脑无需编译器。";
+  try {
+    const metadata = path.join(directory, "build.json");
+    if (fs.statSync(metadata).size > 32768) throw new Error("构建记录过大");
+    const build = JSON.parse(fs.readFileSync(metadata, "utf8"));
+    if (build.format !== "industrial-rent-desktop" || build.formatVersion !== 1 ||
+        build.protocolVersion !== 2 || build.executable !== EXECUTABLE ||
+        !build.sourceSha256 || JSON.stringify(Object.keys(build.sourceSha256).sort()) !== JSON.stringify([...SOURCE_FILES].sort())) {
+      throw new Error("构建记录格式不符");
+    }
+    for (const file of SOURCE_FILES) {
+      const source = path.join(directory, file);
+      if (!fs.lstatSync(source).isFile() || sha256(source) !== build.sourceSha256[file]) throw new Error(`源码校验失败：${file}`);
+    }
+    const executable = path.join(directory, EXECUTABLE);
+    if (!fs.lstatSync(executable).isFile() || sha256(executable) !== build.executableSha256) throw new Error("图形程序校验失败");
+    if (!fs.lstatSync(path.join(directory, HELPER)).isFile() || sha256(path.join(directory, HELPER)) !== build.helperSha256) throw new Error("整程序更新助手校验失败");
+    const pe = fs.readFileSync(executable);
+    const offset = pe.readUInt32LE(0x3c);
+    if (pe.readUInt16LE(0) !== 0x5a4d || pe.readUInt32LE(offset) !== 0x4550 ||
+        pe.readUInt16LE(offset + 4) !== 0x8664 || pe.readUInt16LE(offset + 24 + 68) !== 2) {
+      throw new Error("图形程序不是 Windows x64 GUI 可执行文件");
+    }
+    return { executable, executableSha256: build.executableSha256, protocolVersion: build.protocolVersion, sourceSha256: build.sourceSha256 };
+  } catch (error) {
+    throw new Error(`${advice}\n原因：${error.message}`, { cause: error });
+  }
+}
+
+if (require.main === module) {
+  try {
+    const verified = verifyDesktopArtifact();
+    console.log(JSON.stringify({ verified: true, executableSha256: verified.executableSha256, protocolVersion: verified.protocolVersion }));
+  } catch (error) { console.error(error.message); process.exitCode = 1; }
+}
+
+module.exports = { EXECUTABLE, SOURCE_FILES, PACKAGE_FILES, verifyDesktopArtifact };

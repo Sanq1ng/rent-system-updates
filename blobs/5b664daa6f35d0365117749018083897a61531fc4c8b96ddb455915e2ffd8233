@@ -1,0 +1,102 @@
+"use strict";
+
+const net = require("node:net");
+
+function lanError(message) {
+  const error = new Error(message);
+  error.code = "LAN_CONFIG";
+  throw error;
+}
+
+function ipv4Number(value) {
+  if (typeof value !== "string" || net.isIP(value) !== 4) return null;
+  return value.split(".").reduce((result, part) => result * 256 + Number(part), 0);
+}
+
+function privateIPv4(value) {
+  const number = ipv4Number(value);
+  return number !== null && ((number >= 0x0a000000 && number <= 0x0affffff) ||
+    (number >= 0xac100000 && number <= 0xac1fffff) || (number >= 0xc0a80000 && number <= 0xc0a8ffff));
+}
+
+function privatePrefix(address) {
+  const number = ipv4Number(address);
+  if (number >= 0x0a000000 && number <= 0x0affffff) return 8;
+  if (number >= 0xac100000 && number <= 0xac1fffff) return 12;
+  return 16;
+}
+
+function subnetOf(address, prefixLength) {
+  const number = ipv4Number(address);
+  if (!privateIPv4(address) || !Number.isInteger(prefixLength) || prefixLength < 8 || prefixLength > 30) {
+    lanError("局域网需要真实的私有 IPv4 地址及 /8—/30 子网，不能使用公网、回环或整个互联网。");
+  }
+  const block = 2 ** (32 - prefixLength);
+  const first = Math.floor(number / block) * block;
+  const last = first + block - 1;
+  const format = value => [24, 16, 8, 0].map(shift => Math.floor(value / 2 ** shift) % 256).join(".");
+  if (!privateIPv4(format(first)) || !privateIPv4(format(last)) || number === first || number === last) {
+    lanError("所选网段须完全属于同一个私有地址段；不能使用网络地址或广播地址。");
+  }
+  return `${format(first)}/${prefixLength}`;
+}
+
+function peerAllowed(remoteAddress, lan) {
+  if (!lan) return true;
+  const address = typeof remoteAddress === "string" && remoteAddress.startsWith("::ffff:")
+    ? remoteAddress.slice(7) : remoteAddress;
+  const number = ipv4Number(address);
+  if (number === null || !privateIPv4(address)) return false;
+  const [network, prefix] = lan.subnet.split("/");
+  const first = ipv4Number(network), block = 2 ** (32 - Number(prefix));
+  return number > first && number < first + block - 1;
+}
+
+function lanOrigin(address, port) {
+  if (!privateIPv4(address) || !Number.isInteger(port) || port < 1 || port > 65535) {
+    lanError("局域网访问地址和端口无效。");
+  }
+  return `https://${address}${port === 443 ? "" : `:${port}`}`;
+}
+
+function networkChoices(interfaces) {
+  const result = [];
+  for (const [name, entries] of Object.entries(interfaces)) {
+    for (const entry of entries || []) {
+      if (entry.internal || !privateIPv4(entry.address) || !["IPv4", 4].includes(entry.family)) continue;
+      const mask = ipv4Number(entry.netmask);
+      if (mask === null) continue;
+      const bits = mask.toString(2).padStart(32, "0");
+      if (!/^1{8,30}0{2,24}$/.test(bits)) continue;
+      const prefixLength = bits.indexOf("0");
+      if (prefixLength < privatePrefix(entry.address)) continue;
+      const block = 2 ** (32 - prefixLength), number = ipv4Number(entry.address);
+      if (number % block === 0 || number % block === block - 1) continue;
+      const subnet = subnetOf(entry.address, prefixLength);
+      if (!result.some(item => item.address === entry.address && item.prefixLength === prefixLength)) {
+        result.push({ name, address: entry.address, prefixLength, subnet });
+      }
+    }
+  }
+  return result;
+}
+
+function validateLan(value, settings, interfaces) {
+  if (value === undefined || value === null) return undefined;
+  if (!value || typeof value !== "object" || Array.isArray(value) || value.formatVersion !== 1 ||
+      Object.keys(value).sort().join(",") !== "address,caSha256,formatVersion,prefixLength,serverId,subnet" ||
+      !/^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/i.test(value.serverId || "") ||
+      !/^[a-f0-9]{64}$/.test(value.caSha256 || "")) lanError("局域网配置记录损坏，不会猜测网络或另建账套。");
+  const subnet = subnetOf(value.address, value.prefixLength);
+  if (subnet !== value.subnet || settings.host !== value.address || settings.reverseProxy ||
+      !settings.tls || settings.publicOrigin !== lanOrigin(value.address, settings.port)) {
+    lanError("局域网来源、监听地址、证书和受限网段必须配套，不能改成明文或全部地址监听。");
+  }
+  if (interfaces && !networkChoices(interfaces).some(entry =>
+    entry.address === value.address && entry.prefixLength === value.prefixLength)) {
+    lanError("主机的局域网地址或子网已经变化。请在局域网向导中核对并重新配置；不会自动改网址或清除草稿。");
+  }
+  return { ...value };
+}
+
+module.exports = { lanError, ipv4Number, privateIPv4, subnetOf, peerAllowed, lanOrigin, networkChoices, validateLan };

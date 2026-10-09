@@ -1,0 +1,441 @@
+"use strict";
+
+const fs = require("node:fs");
+const path = require("node:path");
+const crypto = require("node:crypto");
+const {
+  COMPATIBILITY, MAX_MANIFEST_BYTES, fail, digest, hashFile, syncDirectory, writeJSON, sameOrInside,
+  compareVersions, verifyEnvelope,
+} = require("./files.cjs");
+const { resolveUpdateConfig, createTransport } = require("./transport.cjs");
+const { resolveRelease, verifySlot, snapshotRelease, stageRelease } = require("./releases.cjs");
+const { TERMINAL, HANDOFF, loadState, saveState, acquireUpdateLease, configFingerprint, describeError } = require("./state.cjs");
+
+function waitForResponse(promise, signal) {
+  return new Promise((resolve, reject) => {
+    function aborted() { cleanup(); reject(signal.reason); }
+    function cleanup() { signal.removeEventListener("abort", aborted); }
+    signal.addEventListener("abort", aborted, { once: true });
+    Promise.resolve(promise).then(value => { cleanup(); resolve(value); }, error => { cleanup(); reject(error); });
+    if (signal.aborted) aborted();
+  });
+}
+
+function createUpdateController({
+  programDirectory, config, supervisor = null, updateJob = null, download = null,
+  log = message => console.error(message), onFatal = null, maintenanceMilliseconds = 120_000,
+  autoDownload = false, autoStartDelayMilliseconds = 30_000, autoIntervalMilliseconds = 4 * 60 * 60_000,
+}) {
+  const program = path.resolve(programDirectory);
+  const storage = config.updateDir || program;
+  const settings = resolveUpdateConfig(config.updates);
+  const configured = Boolean(settings.feedUrl && Object.keys(settings.trustedKeys).length);
+  let active = resolveRelease(program, storage);
+  let state = loadState(storage);
+  let application;
+  let releaseLease;
+  let running = null;
+  let aborter;
+  let disposed = false;
+  let closing = false;
+  let fatalError = null;
+  let automaticTimer = null;
+  const automaticAuthority = Symbol("automatic-update-download");
+  let expectedStartupSchema = COMPATIBILITY.schema;
+  const transport = download || (configured ? createTransport(settings) : null);
+  let startupHandoff, recoveryJob, bootMaintenance;
+  function readBootState() {
+    startupHandoff = Boolean(state.job && HANDOFF.has(state.job.phase));
+    recoveryJob = startupHandoff && updateJob !== state.job.id ? state.job.id : null;
+    bootMaintenance = startupHandoff ? {
+      id: state.job.windowId, windowId: state.job.windowId, phase: "installing",
+      targetVersion: active.version, expiresAt: Date.now() + maintenanceMilliseconds,
+    } : null;
+  }
+  readBootState();
+
+  function own() {
+    if (!releaseLease) {
+      releaseLease = acquireUpdateLease(storage);
+      state = loadState(storage);
+    }
+  }
+  function patchJob(values) {
+    const next = { ...state, job: { ...state.job, ...values, updatedAt: new Date().toISOString() } };
+    saveState(storage, next);
+    state = next;
+  }
+  function supported() {
+    return Boolean(supervisor && typeof supervisor.requestRestart === "function" && application &&
+      ["quiesceForUpdate", "finishUpdateMaintenance", "getUpdateGateStatus", "getUpdateIdentity"]
+        .every(name => typeof application[name] === "function"));
+  }
+  function unavailable() {
+    if (fatalError) return "UPDATE_STATE_UNWRITABLE";
+    if (!configured) return "UPDATE_NOT_CONFIGURED";
+    if (!supervisor) return "UPDATE_UNSUPERVISED";
+    if (!supported()) return "UPDATE_NOT_READY";
+    return null;
+  }
+  function status() {
+    const offered = state.available;
+    const job = state.job;
+    return {
+      currentVersion: active.version, configured, autoDownload: configured && autoDownload, installSupported: supported(), unavailableReason: unavailable(),
+      phase: fatalError ? "failed" : job?.phase || "idle",
+      availableRelease: offered ? {
+        id: offered.releaseId, releaseId: offered.releaseId, version: offered.manifest.version, sequence: offered.manifest.sequence,
+        fileCount: offered.manifest.files.length, bytes: offered.manifest.files.reduce((sum, file) => sum + file.bytes, 0),
+      } : null,
+      stagedRelease: state.staged ? { id: state.staged.releaseId, version: state.staged.manifest.version } : null,
+      job: job ? {
+        id: job.id, action: job.action, phase: job.phase, targetVersion: job.targetVersion || null,
+        stagedId: job.stagedId || null, windowId: job.windowId || null,
+        canCancel: !TERMINAL.has(job.phase) && !HANDOFF.has(job.phase) && job.phase !== "cancelling",
+        error: fatalError || job.error || null, createdAt: job.createdAt, updatedAt: job.updatedAt,
+      } : null,
+    };
+  }
+  function clientRelease() {
+    if (!configured || !state.installedEnvelope || application?.getUpdateGateStatus().phase !== "idle") return null;
+    const installed = verifyEnvelope(state.installedEnvelope, settings.trustedKeys);
+    if (installed.manifest.version !== active.version || installed.manifest.packageKind !== "windows-program") return null;
+    return { feedUrl: settings.feedUrl, allowPrivateNetwork: settings.allowPrivateNetwork, envelope: state.installedEnvelope };
+  }
+  function authorize(context) {
+    if (typeof context?.authorize !== "function") fail("UPDATE_REQUEST", "更新请求缺少实时权限核对。", 400);
+    let actor;
+    try { actor = context.authorize(); }
+    catch (error) {
+      if (error.status === 401 || error.status === 403) {
+        fail("UPDATE_AUTHORIZATION", "更新发起人的登录状态或管理员权限已变化，本次更新不再继续。", 403);
+      }
+      throw error;
+    }
+    if (actor !== context.actorId) fail("UPDATE_AUTHORIZATION", "更新发起人已变化，本次更新不再继续。", 403);
+  }
+  function requestRecord(action, input, context) {
+    if (!context || typeof context.actorId !== "string" || !context.actorId || context.actorId.length > 160 ||
+        !/^[a-f0-9-]{36}$/i.test(input?.requestId || "")) fail("UPDATE_REQUEST", "更新操作缺少有效身份或稳定请求编号。", 400);
+    authorize(context);
+    const key = digest(Buffer.from(`${context.actorId}\0${action}\0${input.requestId}`));
+    const payload = digest(Buffer.from(JSON.stringify(Object.keys(input).sort().map(key => [key, input[key]]))));
+    const old = state.requests[key];
+    if (old && old.payload !== payload) fail("UPDATE_REQUEST_CONFLICT", "此请求编号已用于不同的更新操作。");
+    return { key, payload, old };
+  }
+  function requireConfigured() {
+    if (!configured) fail("UPDATE_NOT_CONFIGURED", "尚未配置可信更新源；未联网，也未进入维护。");
+    if (disposed || closing || fatalError) fail("UPDATE_STOPPING", "主机正在停止或更新记录不可写，不能接受更新。");
+  }
+  function recordedRequests(record, accepted) {
+    if (Object.keys(state.requests).length >= 2000) fail("UPDATE_HISTORY_FULL", "更新请求记录已达上限，请维护人员归档；不会丢弃旧幂等记录。");
+    return { ...state.requests, [record.key]: { payload: record.payload, accepted } };
+  }
+  function verifyOffered(offered, install = false) {
+    const checked = verifyEnvelope(offered.envelope, settings.trustedKeys);
+    if (checked.releaseId !== offered.releaseId || checked.manifest.sequence < Math.max(state.highestSequence, state.highestSeenSequence || 0) ||
+        (checked.manifest.sequence === state.highestSequence && compareVersions(checked.manifest.version, active.version) > 0) ||
+        compareVersions(checked.manifest.version, active.version) <= 0) {
+      fail("UPDATE_DOWNGRADE", "发布序号或版本已过期；不会降级或安装相同版本。");
+    }
+    if (install && (checked.manifest.packageKind === "windows-program"
+      ? !checked.manifest.migrateFrom.includes(application.getUpdateIdentity().schemaVersion)
+      : application.getUpdateIdentity().schemaVersion !== COMPATIBILITY.schema)) {
+      fail("UPDATE_COMPATIBILITY", "当前账本格式不支持此次在线更新。");
+    }
+    return checked;
+  }
+  async function finishCancelledWindow(job) {
+    if (job.windowId && application && application.getUpdateGateStatus().id === job.windowId) {
+      await application.finishUpdateMaintenance({ windowId: job.windowId, outcome: "cancelled" });
+    }
+  }
+  function enqueue(action, input, context, operation, extras = {}) {
+    requireConfigured();
+    own();
+    const record = requestRecord(action, input, context);
+    if (record.old) return record.old.accepted;
+    if (running || (state.job && !TERMINAL.has(state.job.phase))) fail("UPDATE_BUSY", "已有更新任务，请等待完成或取消。");
+    const job = {
+      id: crypto.randomUUID(), action, phase: "queued", actorId: context.actorId,
+      createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(), error: null, ...extras,
+    };
+    const accepted = { jobId: job.id, ...(job.windowId ? { windowId: job.windowId } : {}) };
+    const automatic = context.background === automaticAuthority;
+    if (automatic && !["check", "stage"].includes(action)) fail("UPDATE_AUTHORIZATION", "后台只能下载，不能代替负责人确认安装。");
+    let history = state.job ? [...(state.history || []), structuredClone(state.job)] : state.history || [];
+    const recentAutomatic = new Set(history.filter(item => item.actorId === "$automatic-download").slice(-50).map(item => item.id));
+    history = history.filter(item => item.actorId !== "$automatic-download" || recentAutomatic.has(item.id));
+    if (history.length > 2000) fail("UPDATE_HISTORY_FULL", "更新历史需要维护人员归档，未开始新的更新。");
+    const next = {
+      ...state, requests: automatic ? state.requests : recordedRequests(record, accepted), job, history,
+    };
+    saveState(storage, next);
+    state = next;
+    aborter = new AbortController();
+    const signal = aborter.signal;
+    running = new Promise(resolve => setImmediate(resolve)).then(async () => {
+      if (action === "install") await waitForResponse(context.responseSettled, signal);
+      signal.throwIfAborted();
+      authorize(context);
+      await operation(signal);
+    }).catch(async error => {
+      if (disposed) { log(`更新任务在主机退出后中断：${error.message}`); return; }
+      if (HANDOFF.has(state.job.phase)) {
+        patchJob({ error: describeError(error) });
+        log(`更新交接未完成：${error.message}`);
+        return;
+      }
+      try { await finishCancelledWindow(job); }
+      catch (resumeError) {
+        log(`更新维护状态未能解除：${resumeError.message}`);
+        patchJob({ phase: "failed", error: { code: "UPDATE_RESUME_FAILED", message: "未能解除维护，请在主机窗口安全重启；本机工作及备份保留。" } });
+        return;
+      }
+      patchJob({ phase: signal.aborted ? "cancelled" : "failed", error: describeError(error) });
+      log(`更新任务未完成：${error.message}`);
+    }).catch(error => {
+      closing = true;
+      fatalError = { code: "UPDATE_STATE_UNWRITABLE", message: "更新记录无法持久保存，已禁止后续更新并请求安全停机；请保留账本和备份，检查磁盘或权限。" };
+      log(`更新记录无法持久保存：${error.message}`);
+      if (onFatal) onFatal(error);
+    }).finally(() => { running = null; aborter = null; });
+    return accepted;
+  }
+  async function check(input, context) {
+    return enqueue("check", input, context, async signal => {
+      patchJob({ phase: "checking" });
+      const bytes = await transport(settings.feedUrl, { maxBytes: MAX_MANIFEST_BYTES * 2, signal });
+      if (!Buffer.isBuffer(bytes) || bytes.length > MAX_MANIFEST_BYTES * 2) fail("UPDATE_SIZE", "更新清单超过大小限制。");
+      let envelope;
+      try { envelope = JSON.parse(bytes.toString("utf8")); }
+      catch { fail("UPDATE_MANIFEST", "更新源未返回有效清单。"); }
+      const offered = verifyEnvelope(envelope, settings.trustedKeys);
+      if (offered.manifest.sequence < Math.max(state.highestSequence, state.highestSeenSequence || 0) ||
+          (offered.manifest.sequence === state.highestSeenSequence && state.highestSeenReleaseId !== offered.releaseId) ||
+          (offered.manifest.sequence === state.highestSequence && compareVersions(offered.manifest.version, active.version) > 0) ||
+          compareVersions(offered.manifest.version, active.version) < 0) {
+        fail("UPDATE_DOWNGRADE", "更新源返回了过期版本或发布序号。");
+      }
+      signal.throwIfAborted();
+      state.highestSeenSequence = offered.manifest.sequence;
+      state.highestSeenReleaseId = offered.releaseId;
+      state.available = compareVersions(offered.manifest.version, active.version) > 0 ? offered : null;
+      patchJob({ phase: "completed", targetVersion: offered.manifest.version });
+    });
+  }
+  async function stage(input, context) {
+    requireConfigured();
+    own();
+    const old = requestRecord("stage", input, context).old;
+    if (old) return old.accepted;
+    if (!state.available || state.available.releaseId !== input.releaseId) fail("UPDATE_RELEASE", "请先检查并选择当前可信发布版本。");
+    const offered = verifyOffered(state.available);
+    return enqueue("stage", input, context, async signal => {
+      patchJob({ phase: "staging" });
+      await stageRelease(storage, offered, settings.feedUrl, transport, signal,
+        offered.manifest.packageKind === "windows-program" ? program : null);
+      signal.throwIfAborted();
+      state.staged = offered;
+      patchJob({ phase: "completed", stagedId: offered.releaseId });
+    }, { targetVersion: offered.manifest.version });
+  }
+  async function install(input, context) {
+    requireConfigured();
+    own();
+    const old = requestRecord("install", input, context).old;
+    if (old) return old.accepted;
+    if (!supported()) fail("UPDATE_UNSUPERVISED", "此启动方式不能可靠在线重启；请使用图形主机或 Linux 托管服务入口。");
+    if (!context.responseSettled || typeof context.responseSettled.then !== "function") {
+      fail("UPDATE_REQUEST", "安装请求缺少响应完成屏障。", 400);
+    }
+    if (input.expectedVersion !== active.version || !state.staged || state.staged.releaseId !== input.stagedId) {
+      fail("UPDATE_RELEASE", "当前版本或已暂存程序已变化，请重新确认。");
+    }
+    const offered = verifyOffered(state.staged, true);
+    if (offered.manifest.packageKind === "windows-program")
+      require("./full-apply.cjs").assertApplyPaths(program, storage, offered.manifest.files);
+    for (const protectedPath of [config.dataDir, config.backupDir, config.tls?.keyFile, config.tls?.certFile].filter(Boolean)) {
+      if (["releases", "update-state"].some(name => sameOrInside(path.join(storage, name), protectedPath) ||
+          sameOrInside(protectedPath, path.join(storage, name)))) {
+        fail("UPDATE_PATH", "数据、备份或证书与更新目录重叠；不会进入维护。");
+      }
+    }
+    const windowId = crypto.randomUUID();
+    return enqueue("install", input, context, async signal => {
+      await verifySlot(storage, offered.releaseId);
+      const bundle = offered.manifest.packageKind === "windows-program";
+      let previous = active.releaseId ? await verifySlot(storage, active.releaseId) : null;
+      if (!previous || bundle && previous.manifest.packageKind !== "windows-program") {
+        if (bundle && active.root !== program) fail("UPDATE_COMPATIBILITY", "当前仍是旧的网页独立更新版本，请先用整程序维护入口接入新版更新底座。");
+        previous = await snapshotRelease(storage, active.root, bundle);
+      }
+      signal.throwIfAborted();
+      authorize(context);
+      patchJob({
+        phase: "awaiting-clients", previousReleaseId: previous.releaseId, candidateReleaseId: offered.releaseId,
+        fingerprint: configFingerprint(config), identity: application.getUpdateIdentity(),
+        deadline: Date.now() + maintenanceMilliseconds, ...(bundle ? { fullProgram: true } : {}),
+      });
+      const deadlineAbort = AbortSignal.timeout(maintenanceMilliseconds);
+      const preparing = AbortSignal.any([signal, deadlineAbort]);
+      await application.quiesceForUpdate({
+        windowId, targetVersion: offered.manifest.version, deadline: state.job.deadline, signal: preparing,
+      });
+      preparing.throwIfAborted();
+      authorize(context);
+      patchJob({ phase: "backing-up" });
+      const { createBackup, verifyBackup } = require(path.join(active.root, "server", "backup.cjs"));
+      const backup = await createBackup(application.store.db, config);
+      const verified = await verifyBackup(backup.path);
+      for (const directory of [path.join(backup.path, "attachments"), backup.path, path.dirname(backup.path)]) syncDirectory(directory);
+      const contextFile = path.join(backup.path, "update-context.json");
+      writeJSON(contextFile, {
+        formatVersion: 1, jobId: state.job.id, fromVersion: active.version, toVersion: offered.manifest.version,
+        configuration: config, identity: state.job.identity,
+        note: "Configuration snapshot only; certificate files remain in their existing locations. No browser workspaces are included.",
+      });
+      if (bundle) {
+        const candidate = await verifySlot(storage, offered.releaseId);
+        await require("./full-apply.cjs").preflightBundle(config, candidate, state.job.identity, previous.root);
+      }
+      signal.throwIfAborted();
+      authorize(context);
+      patchJob({
+        phase: "restart-pending",
+        backup: { path: backup.path, createdAt: verified.createdAt, manifestHash: await hashFile(path.join(backup.path, "manifest.json")), contextHash: await hashFile(contextFile) },
+      });
+      await supervisor.requestRestart({ jobId: state.job.id, windowId });
+    }, { windowId, targetVersion: offered.manifest.version, stagedId: offered.releaseId });
+  }
+  async function cancel(input, context) {
+    requireConfigured();
+    own();
+    const record = requestRecord("cancel", input, context);
+    if (record.old) return record.old.accepted;
+    if (!state.job || state.job.id !== input.jobId || !status().job.canCancel || !aborter) {
+      fail("UPDATE_CANNOT_CANCEL", "该任务已结束或已进入主机交接，不能取消。");
+    }
+    const accepted = { jobId: state.job.id };
+    const next = {
+      ...state, requests: recordedRequests(record, accepted),
+      job: { ...state.job, phase: "cancelling", updatedAt: new Date().toISOString() },
+    };
+    saveState(storage, next);
+    state = next;
+    aborter.abort();
+    return accepted;
+  }
+  async function prepareStartup() {
+    state = loadState(storage);
+    if (configured || state.job) own();
+    active = resolveRelease(program, storage);
+    readBootState();
+    if (!startupHandoff && state.activeReleaseId && active.releaseId !== state.activeReleaseId) {
+      fail("UPDATE_STATE", "当前程序指针与最后确认的版本不一致，已停止启动以防止错误降级。");
+    }
+    if (active.releaseId) {
+      const selected = await verifySlot(storage, active.releaseId);
+      expectedStartupSchema = selected.manifest.compatibility.schema;
+    }
+    if (startupHandoff) {
+      if (state.job.fingerprint !== configFingerprint(config)) fail("UPDATE_CONFIG_CHANGED", "更新期间配置已变化；不会打开不同的数据目录。");
+      if (recoveryJob) return;
+      if (!["trial", "rollback-trial"].includes(state.job.phase) || !supervisor ||
+          !fs.existsSync(path.join(config.dataDir, "rent.sqlite"))) {
+        fail("UPDATE_RECOVERY_REQUIRED", "更新交接尚未完成，须由托管主机恢复；不会新建账本。");
+      }
+      const { DatabaseSync } = require("node:sqlite");
+      const database = new DatabaseSync(path.toNamespacedPath(path.join(config.dataDir, "rent.sqlite")), { readOnly: true });
+      try {
+        if (database.prepare("PRAGMA user_version").get().user_version !== expectedStartupSchema ||
+            state.job.fullProgram && !state.job.nativeApplied) {
+          fail("UPDATE_COMPATIBILITY", "试运行只允许主机兼容的既有格式账本；不会自动升级或新建账本。");
+        }
+      } finally { database.close(); }
+    } else if (state.job && !TERMINAL.has(state.job.phase)) {
+      patchJob({ phase: "failed", error: { code: "UPDATE_INTERRUPTED", message: "上次更新在交接前中断，原程序继续运行；请重新发起更新。" } });
+    }
+  }
+  function bindApplication(value) {
+    application = value;
+    if (startupHandoff && !recoveryJob) {
+      if (!supported()) fail("UPDATE_COMPATIBILITY", "候选程序缺少安全维护接口。");
+      const identity = application.getUpdateIdentity();
+      if (identity.serverId !== state.job.identity?.serverId || identity.schemaVersion !== expectedStartupSchema ||
+          identity.applicationVersion !== active.version || !state.job.fullProgram && state.job.identity.schemaVersion !== identity.schemaVersion) {
+        fail("UPDATE_IDENTITY", "候选程序的账套、数据库格式或版本不符；未解除维护。");
+      }
+    }
+    scheduleAutomatic(autoStartDelayMilliseconds);
+  }
+  async function commitStartup(jobId) {
+    if (!startupHandoff || recoveryJob || jobId !== state.job.id || !["trial", "rollback-trial"].includes(state.job.phase)) {
+      fail("UPDATE_STATE", "更新启动确认不属于当前试运行。");
+    }
+    const rolledBack = state.job.phase === "rollback-trial";
+    if (!rolledBack) {
+      state.highestSequence = Math.max(state.highestSequence, state.staged.manifest.sequence);
+      state.installedEnvelope = state.staged.envelope;
+    }
+    state.available = null;
+    state.staged = null;
+    state.activeReleaseId = active.releaseId;
+    patchJob({ phase: rolledBack ? "rolled-back" : "committed" });
+    await application.finishUpdateMaintenance({ windowId: state.job.windowId, outcome: rolledBack ? "rolled-back" : "committed" });
+    if (state.job.fullProgram) {
+      const file = require("./full-apply.cjs").receiptFile(storage);
+      if (fs.existsSync(file)) {
+        const receipt = require("./files.cjs").readJSON(file);
+        if (receipt.jobId !== jobId || receipt.sourceId !== active.releaseId ||
+            !state.job.nativeApplied || !["copying", "trial"].includes(receipt.phase))
+          fail("UPDATE_STATE", "整程序交接收据不符，未删除其他记录。");
+        fs.unlinkSync(file);
+      }
+    }
+  }
+  function scheduleAutomatic(delay) {
+    if (!autoDownload || !configured || disposed || closing || automaticTimer) return;
+    automaticTimer = setTimeout(async () => {
+      automaticTimer = null;
+      const context = { actorId: "$automatic-download", authorize: () => "$automatic-download", background: automaticAuthority };
+      try {
+        if (!running && (!state.job || TERMINAL.has(state.job.phase))) {
+          await check({ requestId: crypto.randomUUID() }, context);
+          if (running) await running;
+          if (state.job?.phase === "completed" && state.available && state.staged?.releaseId !== state.available.releaseId) {
+            await stage({ requestId: crypto.randomUUID(), releaseId: state.available.releaseId }, context);
+            if (running) await running;
+          }
+        }
+      } catch (error) { log(`自动下载更新未完成：${error.code || error.message}`); }
+      finally { scheduleAutomatic(autoIntervalMilliseconds); }
+    }, delay);
+    automaticTimer.unref();
+  }
+  async function beforeStop() {
+    closing = true;
+    clearTimeout(automaticTimer); automaticTimer = null;
+    if (aborter && !HANDOFF.has(state.job?.phase)) aborter.abort();
+    if (running) await running;
+  }
+  function dispose() {
+    disposed = true;
+    clearTimeout(automaticTimer); automaticTimer = null;
+    if (aborter && !HANDOFF.has(state.job?.phase)) aborter.abort();
+    if (releaseLease) { const release = releaseLease; releaseLease = null; release(); }
+  }
+
+  return {
+    api: { status, check, stage, install, cancel, clientRelease },
+    get bootMaintenance() { return bootMaintenance; },
+    get recoveryJob() { return recoveryJob; },
+    get active() { return active; },
+    prepareStartup, bindApplication, commitStartup, beforeStop, dispose,
+    get startupJobId() { return startupHandoff ? state.job.id : null; },
+    async settled() { if (running) await running; },
+  };
+}
+
+module.exports = { createUpdateController };

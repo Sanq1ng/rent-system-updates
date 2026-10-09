@@ -1,0 +1,408 @@
+"use strict";
+
+const fs = require("node:fs");
+const path = require("node:path");
+const crypto = require("node:crypto");
+const { spawn } = require("node:child_process");
+const { DatabaseSync } = require("node:sqlite");
+const { resolveConfig, assertRuntime } = require(path.join(__dirname, "config.cjs"));
+const { installLogging } = require(path.join(__dirname, "logging.cjs"));
+const { createUpdateController } = require(path.join(__dirname, "updates", "engine.cjs"));
+const { resolveRelease } = require(path.join(__dirname, "updates", "releases.cjs"));
+const { assertDirectory, regularFile } = require(path.join(__dirname, "updates", "files.cjs"));
+
+function acquireLock(dataDir) {
+  fs.mkdirSync(dataDir, { recursive: true, mode: 0o700 });
+  if (process.platform === "linux") {
+    assertDirectory(dataDir);
+    for (const name of ["host.lock", "host-lease.sqlite"]) {
+      const entry = path.join(dataDir, name);
+      if (fs.lstatSync(entry, { throwIfNoEntry: false })) regularFile(entry);
+    }
+  }
+  const file = path.join(dataDir, "host.lock");
+  const lease = new DatabaseSync(path.toNamespacedPath(path.join(dataDir, "host-lease.sqlite")));
+  try {
+    // 独立 SQLite 锁由操作系统在崩溃后释放，避免 PID 复用或删除残留文件造成双主机。
+    lease.exec("PRAGMA busy_timeout=0; PRAGMA journal_mode=DELETE; CREATE TABLE IF NOT EXISTS lease (id INTEGER PRIMARY KEY); BEGIN EXCLUSIVE");
+  } catch (error) {
+    lease.close();
+    if (error.errcode === 5 || error.errcode === 6) {
+      const busy = new Error("此数据目录正被主机或维护工具使用，请勿同时操作两份账本。", { cause: error });
+      busy.code = "HOST_IN_USE";
+      throw busy;
+    }
+    throw error;
+  }
+  const nonce = crypto.randomUUID();
+  try {
+    const descriptor = fs.openSync(file, "w", 0o600);
+    try {
+      fs.writeFileSync(descriptor, JSON.stringify({ pid: process.pid, nonce, startedAt: new Date().toISOString() }));
+      fs.fsyncSync(descriptor);
+    } finally { fs.closeSync(descriptor); }
+  } catch (error) {
+    lease.exec("ROLLBACK");
+    lease.close();
+    throw error;
+  }
+  return function release() {
+    try {
+      if (fs.existsSync(file)) {
+        const lock = JSON.parse(fs.readFileSync(file, "utf8"));
+        if (lock.nonce !== nonce) throw new Error("主机锁已变更，不能删除其他进程的锁。");
+        fs.unlinkSync(file);
+      }
+    } finally {
+      lease.exec("ROLLBACK");
+      lease.close();
+    }
+  };
+}
+
+const DESKTOP_PROTOCOL = 2;
+const DESKTOP_PREFIX = "@rent-desktop ";
+
+function desktopError(error) {
+  const code = typeof error.code === "string" ? error.code : "HOST_ERROR";
+  const explanations = {
+    EADDRINUSE: "业务端口已被其他程序占用。本窗口没有接管该程序；请确认原主机状态，或请维护人员调整配置中的端口。",
+    EACCES: `没有权限访问所需的端口或文件。请检查当前${process.platform === "win32" ? " Windows " : "服务"}账号对业务数据、备份及证书目录的权限。`,
+    EPERM: `${process.platform === "win32" ? "Windows" : "系统"} 拒绝了文件或进程操作。请检查目录权限及安全软件提示，不要删除正在使用的账本。`,
+    HOST_IN_USE: "数据目录正被其他主机或维护工具使用。本窗口未接管，也不会停止它。请在原窗口或任务计划程序中管理。",
+  };
+  return {
+    code,
+    message: (explanations[code] || String(error.message || "主机操作未完成。"))
+      .replace(/[\u0000-\u001f\u007f]/g, " ").slice(0, 600),
+  };
+}
+
+// Only the parent holding these anonymous pipes may start/control this child.
+// EOF also covers supervisor failure before a Windows job or systemd stop can run.
+function createDesktopChannel() {
+  let buffer = "";
+  let outputClosed = false;
+  let disposed = false;
+  let started = false;
+  let stopRequested = false;
+  let stopHandler;
+  let statusHandler;
+  let updateHandler;
+  let accountHandler;
+  let resolveStart;
+  const start = new Promise(resolve => { resolveStart = resolve; });
+  function send(type, payload = {}) {
+    if (!outputClosed) process.stdout.write(`${DESKTOP_PREFIX}${JSON.stringify({ protocol: DESKTOP_PROTOCOL, type, ...payload })}\n`);
+  }
+  function requestStop() {
+    if (stopRequested) return;
+    stopRequested = true;
+    clearTimeout(handshakeTimer);
+    resolveStart(false);
+    if (stopHandler) stopHandler();
+  }
+  function invalid() {
+    process.exitCode = 1;
+    send("error", { code: "DESKTOP_PROTOCOL", message: "管理窗口与主机的私有通信中断或版本不一致，主机将安全停止。请使用完整的同一版程序包。" });
+    requestStop();
+  }
+  const handshakeTimer = setTimeout(invalid, 15_000);
+  handshakeTimer.unref();
+  function receive(chunk) {
+    if (disposed || stopRequested) return;
+    buffer += chunk;
+    if (buffer.length > 4096) { buffer = ""; invalid(); return; }
+    let newline;
+    while ((newline = buffer.indexOf("\n")) !== -1 && !stopRequested) {
+      const line = buffer.slice(0, newline);
+      buffer = buffer.slice(newline + 1);
+      let message;
+      try { message = JSON.parse(line); } catch { invalid(); return; }
+      if (!message || Array.isArray(message) || typeof message !== "object") { invalid(); return; }
+      if (message.command === "start" && !started && message.protocol === DESKTOP_PROTOCOL) {
+        started = true;
+        clearTimeout(handshakeTimer);
+        resolveStart(true);
+      } else if (message.command === "stop") requestStop();
+      else if (message.command === "account-setup" && started && message.protocol === DESKTOP_PROTOCOL &&
+          Object.keys(message).sort().join(",") === "accountingStartDate,command,password,protocol,requestId,username" &&
+          typeof message.requestId === "string" && /^[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/.test(message.requestId)) {
+        if (!accountHandler) { invalid(); return; }
+        accountHandler(message);
+      }
+      else if (message.command === "status" && started) {
+        if (statusHandler) statusHandler();
+      } else if (["update-stop", "update-commit"].includes(message.command) && started &&
+          typeof message.jobId === "string" && /^[a-f0-9-]{36}$/.test(message.jobId)) {
+        if (!updateHandler || !updateHandler(message.command, message.jobId)) { invalid(); return; }
+      } else { invalid(); return; }
+    }
+  }
+  process.stdin.setEncoding("utf8");
+  process.stdin.on("data", receive);
+  process.stdin.once("end", requestStop);
+  process.stdin.once("error", requestStop);
+  process.stdout.on("error", () => { outputClosed = true; requestStop(); });
+  process.stdin.resume();
+  send("hello");
+  return {
+    start, send,
+    get stopRequested() { return stopRequested; },
+    onStop(handler) { stopHandler = handler; if (stopRequested) handler(); },
+    onStatus(handler) { statusHandler = handler; },
+    onUpdate(handler) { updateHandler = handler; },
+    onAccount(handler) { accountHandler = handler; },
+    dispose() {
+      disposed = true;
+      clearTimeout(handshakeTimer);
+      process.stdin.removeListener("data", receive);
+      process.stdin.pause();
+      process.stdin.destroy();
+    },
+  };
+}
+
+function parseArguments(args) {
+  let configFile;
+  let updateJob;
+  for (let index = 0; index < args.length; index++) {
+    if (args[index] === "--config" && configFile === undefined && args[index + 1] && !args[index + 1].startsWith("--")) {
+      configFile = args[++index];
+    } else if (args[index] === "--update-job" && updateJob === undefined && /^[a-f0-9-]{36}$/.test(args[index + 1] || "")) {
+      updateJob = args[++index];
+    } else if (!["--check", "--no-browser", "--desktop", "--service-worker"].includes(args[index])) {
+      throw new Error(`未知或不完整的启动参数：${args[index]}。可用 --check、--no-browser、--config 配置文件；--desktop / --service-worker 仅供托管主机使用。`);
+    }
+  }
+  if (args.includes("--desktop") && args.includes("--check")) throw new Error("--desktop 不能与 --check 一起使用；诊断检查请直接调用 --check。");
+  if (args.includes("--service-worker") &&
+      (process.platform !== "linux" || args.includes("--desktop") || args.includes("--check"))) {
+    throw new Error("--service-worker 仅供 Linux 托管服务使用，不能与 --desktop 或 --check 合用。");
+  }
+  if (updateJob && !args.includes("--desktop") && !args.includes("--service-worker")) throw new Error("--update-job 仅供托管主机的私有更新交接使用。");
+  return { configFile, updateJob, check: args.includes("--check"), noBrowser: args.includes("--no-browser") };
+}
+
+async function main() {
+  const args = process.argv.slice(2);
+  const desktop = args.includes("--desktop") || args.includes("--service-worker") ? createDesktopChannel() : null;
+  let release;
+  let restoreLogging;
+  let application;
+  let engine;
+  let pendingRestart;
+  let pendingCommit;
+  let stopping;
+  let stopRequested = false;
+  let initialized = false;
+  let accountSetupTask;
+  function removeSignals() {
+    process.removeListener("SIGINT", requestStop);
+    process.removeListener("SIGTERM", requestStop);
+  }
+  function cleanup() {
+    try { if (release) { const unlock = release; release = null; unlock(); } }
+    finally {
+      if (engine) engine.dispose();
+      if (restoreLogging) { const restore = restoreLogging; restoreLogging = null; restore(); }
+      removeSignals();
+      if (desktop) desktop.dispose();
+    }
+  }
+  function requestStop() {
+    stopRequested = true;
+    if (pendingRestart) {
+      const pending = pendingRestart;
+      pendingRestart = null;
+      pending.reject(new Error("主机停止请求中断了更新确认；保留交接记录以供下次恢复。"));
+    }
+    if (pendingCommit) {
+      const pending = pendingCommit;
+      pendingCommit = null;
+      pending.reject(new Error("主机在试运行确认前请求停止，未开放业务写入。"));
+    }
+    if (application) void stop();
+  }
+  function stop() {
+    if (stopping) return stopping;
+    stopping = (async () => {
+      if (desktop) desktop.send("stopping");
+      try {
+        if (accountSetupTask) await accountSetupTask;
+        if (engine) await engine.beforeStop();
+        await application.close();
+        cleanup();
+        if (desktop) desktop.send("stopped");
+      } catch (error) {
+        // Keep the lease until process exit if close/backup failed; never advertise a clean stop.
+        process.exitCode = 1;
+        console.error(`关闭服务失败：${error.message}`);
+        if (desktop) { desktop.send("error", desktopError(error)); desktop.dispose(); }
+        removeSignals();
+        setTimeout(() => process.exit(1), 100).unref();
+      }
+    })();
+    return stopping;
+  }
+  try {
+    const options = parseArguments(args);
+    assertRuntime();
+    if (process.platform === "linux" && process.getuid() === 0 && !options.check) {
+      throw new Error("Linux 业务进程不能以 root 运行，请使用专用非特权服务账号；--check 诊断仍可使用。");
+    }
+    if (desktop && (process.stdin.isTTY || process.stdout.isTTY)) throw new Error("图形主机模式需要管理窗口的私有管道，不能在交互终端中单独运行。");
+    if (desktop) {
+      desktop.onStop(requestStop);
+      if (!await desktop.start || desktop.stopRequested) { cleanup(); return; }
+    }
+    const config = resolveConfig(options.configFile);
+    if (options.check) {
+      const active = resolveRelease(__dirname, config.updateDir);
+      for (const file of ["server\\index.cjs", "public\\index.html", "public\\app.js", "public\\business.js", "public\\offline.js"]) {
+        if (!fs.existsSync(path.join(active.root, ...file.split("\\")))) throw new Error(`程序文件缺失：${file}`);
+      }
+      console.log(JSON.stringify({ runtime: process.version, ...config, tls: config.tls ? "configured" : null }, null, 2));
+      return;
+    }
+    process.once("SIGINT", requestStop);
+    process.once("SIGTERM", requestStop);
+    if (desktop) {
+      desktop.send("starting", { url: config.publicOrigin, dataDir: config.dataDir, backupDir: config.backupDir, pid: process.pid });
+      desktop.onStatus(() => {
+        if (application && !initialized && !stopping) initialized = Boolean(application.store.db.prepare("SELECT id FROM users LIMIT 1").get());
+        desktop.send("status", { state: stopping || stopRequested ? "stopping" : application ? "running" : "starting", initialized });
+      });
+      desktop.onAccount(message => {
+        const requestId = message.requestId;
+        if (!application || stopping || stopRequested || accountSetupTask) {
+          desktop.send("account-setup-result", { requestId, ok: false, message: "主机尚未就绪、正在停止或正在处理账号，请稍后重试。" });
+          message.password = null;
+          return;
+        }
+        accountSetupTask = Promise.resolve().then(() => {
+          if (typeof application.initializeAdministrator !== "function") throw new Error("当前业务组件不支持窗口内创建账号，请维护人员使用完整的同一版程序。");
+          return application.initializeAdministrator({
+            username: message.username, displayName: message.username, password: message.password,
+            accountingStartDate: message.accountingStartDate,
+          });
+        }).then(() => {
+          initialized = true;
+          desktop.send("account-setup-result", { requestId, ok: true });
+        }, error => {
+          desktop.send("account-setup-result", { requestId, ok: false, message: desktopError(error).message });
+        }).finally(() => { message.password = null; accountSetupTask = null; });
+      });
+    }
+    release = acquireLock(config.dataDir);
+    restoreLogging = installLogging(config.dataDir);
+    engine = createUpdateController({
+      programDirectory: __dirname, config, updateJob: options.updateJob, autoDownload: true,
+      onFatal() { process.exitCode = 1; requestStop(); },
+      supervisor: desktop ? {
+        requestRestart({ jobId }) {
+          return new Promise((resolve, reject) => {
+            const timer = setTimeout(() => {
+              pendingRestart = null;
+              reject(new Error("托管主机未确认更新交接；账本保持维护状态，请由维护人员安全重启。"));
+            }, 15_000);
+            pendingRestart = {
+              jobId, resolve() { clearTimeout(timer); resolve(); },
+              reject(error) { clearTimeout(timer); reject(error); },
+            };
+            desktop.send("update-restart", { jobId, pid: process.pid });
+          });
+        },
+      } : null,
+    });
+    if (desktop) desktop.onUpdate((command, jobId) => {
+      if (command === "update-stop" && pendingRestart?.jobId === jobId) {
+        const pending = pendingRestart;
+        pendingRestart = null;
+        pending.resolve();
+        requestStop();
+        return true;
+      }
+      if (command === "update-commit" && pendingCommit?.jobId === jobId) {
+        const pending = pendingCommit;
+        pendingCommit = null;
+        pending.resolve();
+        return true;
+      }
+      return false;
+    });
+    await engine.prepareStartup();
+    if (engine.recoveryJob) {
+      if (!desktop) throw new Error("程序更新交接中断；请使用托管主机恢复，不能用未托管 Node 启动。");
+      desktop.send("update-recovery", { jobId: engine.recoveryJob, pid: process.pid });
+      cleanup();
+      return;
+    }
+    if (stopRequested || desktop?.stopRequested) { cleanup(); return; }
+    const { startServer } = require(path.join(engine.active.root, "server", "index.cjs"));
+    const { createInvitationPackageBuilder, connectionFor } = require(path.join(__dirname, "deployment", "employee-package.cjs"));
+    application = await startServer(config, { updates: engine.api, bootMaintenance: engine.bootMaintenance,
+      invitationPackageBuilder: createInvitationPackageBuilder(config),
+      pairingConnection: config.lan ? connectionFor(config, config.lan.serverId) : undefined });
+    engine.bindApplication(application);
+    if (stopRequested || desktop?.stopRequested) { await stop(); return; }
+    if (engine.bootMaintenance) {
+      await new Promise((resolve, reject) => {
+        const timer = setTimeout(() => { pendingCommit = null; reject(new Error("更新试运行未收到托管主机确认，未开放业务写入。")); }, 15_000);
+        pendingCommit = {
+          jobId: engine.startupJobId, resolve() { clearTimeout(timer); resolve(); },
+          reject(error) { clearTimeout(timer); reject(error); },
+        };
+        desktop.send("update-trial-ready", { jobId: engine.startupJobId, pid: process.pid, version: engine.active.version });
+      });
+      if (stopRequested || desktop?.stopRequested) { await stop(); return; }
+      await engine.commitStartup(engine.startupJobId);
+    }
+    if (stopRequested || desktop?.stopRequested) { await stop(); return; }
+    initialized = Boolean(application.store.db.prepare("SELECT id FROM users LIMIT 1").get());
+    if (desktop) {
+      desktop.send("ready", {
+        url: application.url, dataDir: config.dataDir, backupDir: config.backupDir,
+        pid: process.pid, initialized, setupToken: application.setupToken,
+      });
+    } else {
+      console.log(`园区租赁 ${engine.active.version} · 中心主机\n访问地址：${application.url}\n业务数据：${config.dataDir}\n备份目录：${config.backupDir}`);
+      if (application.setupToken) console.log(`首次初始化口令（仅交给管理员，不要发到群里）：${application.setupToken}`);
+      console.log("请保持本窗口运行。主机关机或窗口关闭时不能同步；下次启动会恢复并补生成有效提醒。");
+    }
+    if (config.backupDir.startsWith(`${config.dataDir}${path.sep}`)) {
+      const message = "当前备份与账本在同一数据目录，不能防止该硬盘损坏。请另设独立备份位置，或定期复制完整备份到其他受控设备。";
+      console.warn(message);
+      if (desktop) desktop.send("notice", { message });
+    }
+    if (!desktop && !options.noBrowser && process.platform === "win32") {
+      const executable = path.join(process.env.SystemRoot || "C:\\Windows", "explorer.exe");
+      const browser = spawn(executable, [application.url], { stdio: "ignore", windowsHide: true });
+      browser.once("error", error => console.error(`不能自动打开浏览器：${error.message}。请手动访问 ${application.url}`));
+      browser.once("exit", code => {
+        if (code) console.error(`浏览器入口退出（${code}）；如果未出现页面，请手动访问 ${application.url}`);
+      });
+    }
+  } catch (error) {
+    if (desktop) {
+      const summary = desktopError(error);
+      desktop.send("error", summary);
+      if (restoreLogging) console.error(`启动失败：${summary.message}`);
+      process.exitCode = 1;
+    }
+    if (application) {
+      try { await stop(); }
+      catch { /* stop() reports shutdown failures and retains the lease until exit. */ }
+    } else cleanup();
+    if (!desktop) throw error;
+  }
+}
+
+if (require.main === module) {
+  main().catch(error => {
+    console.error(`启动失败：${error.message}`);
+    process.exitCode = 1;
+  });
+}
+
+module.exports = { acquireLock, DESKTOP_PROTOCOL, DESKTOP_PREFIX };

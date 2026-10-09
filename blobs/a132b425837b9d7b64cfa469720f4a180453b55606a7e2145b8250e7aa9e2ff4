@@ -1,0 +1,143 @@
+"use strict";
+
+const fs = require("node:fs");
+const path = require("node:path");
+const crypto = require("node:crypto");
+const os = require("node:os");
+const { resolveUpdateConfig } = require(path.join(__dirname, "updates", "transport.cjs"));
+const { readUpdateSource } = require(path.join(__dirname, "updates", "source-config.cjs"));
+const { sameOrInside } = require(path.join(__dirname, "updates", "files.cjs"));
+const { defaultConfigFile } = require(path.join(__dirname, "deployment", "layout.cjs"));
+const { validateLan } = require(path.join(__dirname, "shared", "lan-policy.cjs"));
+
+function resolveConfig(file, { programDirectory = __dirname } = {}) {
+  const program = path.resolve(programDirectory);
+  const discovered = file === undefined ? defaultConfigFile(program) : null;
+  const source = path.resolve(file || discovered?.file || path.join(__dirname, "config.json"));
+  const exists = fs.existsSync(source);
+  if ((file !== undefined || discovered?.required) && !exists) throw new Error(`配置文件不存在：${source}`);
+  const settings = JSON.parse(fs.readFileSync(exists ? source : path.join(__dirname, "config.example.json"), "utf8"));
+  if (settings.formatVersion !== 1) throw new Error("配置文件版本不受支持。");
+  const base = path.dirname(source);
+  const roleFile = path.join(base, "电脑角色.json");
+  if (fs.existsSync(roleFile)) {
+    const role = JSON.parse(fs.readFileSync(roleFile, "utf8"));
+    if (role.format !== "industrial-rent-machine-role" || role.formatVersion !== 1 || !["host", "client"].includes(role.mode))
+      throw new Error("电脑职责配置无效，未创建账本。");
+    if (role.mode === "client") throw new Error("这台电脑只加入公司，不保管账本。请打开园区租赁软件，不要另建主机。");
+  }
+  const dataName = settings.dataDirectoryName || "业务数据";
+  if (typeof dataName !== "string" || /[\\/:*?"<>|]/.test(dataName) || dataName === "." || dataName === "..") {
+    throw new Error("默认数据目录名称无效。");
+  }
+  const dataDir = settings.dataDir ? path.resolve(base, settings.dataDir) : path.resolve(base, "..", dataName);
+  const backupDir = settings.backupDir ? path.resolve(base, settings.backupDir) : path.join(dataDir, "备份");
+  if (process.platform === "win32" && dataDir.startsWith("\\\\")) {
+    throw new Error("中心 SQLite 必须使用主机本地磁盘，不允许直接放在 UNC 网络共享目录。备份可以另存到有权限的独立位置。");
+  }
+  const relative = path.relative(dataDir, base);
+  if (dataDir === path.parse(dataDir).root || relative === "" || (relative !== ".." && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative))) {
+    throw new Error("业务数据目录必须与程序目录分开，不能选择磁盘根目录或包含程序的目录。");
+  }
+  const host = settings.host || "127.0.0.1";
+  const port = settings.port ?? 8765;
+  if (typeof host !== "string" || !host || /[\s/\\]/.test(host)) throw new Error("监听地址无效。");
+  if (!Number.isInteger(port) || port < 1 || port > 65535) throw new Error("端口须为 1—65535 的整数。");
+  const publicOrigin = settings.publicOrigin || `http://${host === "::1" ? "[::1]" : host}:${port}`;
+  const origin = new URL(publicOrigin);
+  if (!["http:", "https:"].includes(origin.protocol) || origin.username || origin.password || origin.pathname !== "/" || origin.search || origin.hash) {
+    throw new Error("访问地址必须是完整的 HTTP(S) 来源地址，不含账号、路径或查询参数。");
+  }
+  const loopback = ["127.0.0.1", "::1", "localhost"].includes(host);
+  if (settings.reverseProxy !== undefined && typeof settings.reverseProxy !== "boolean") {
+    throw new Error("reverseProxy 必须明确设置为 true 或 false。");
+  }
+  const reverseProxy = settings.reverseProxy === true;
+  if (settings.tls && (typeof settings.tls !== "object" || typeof settings.tls.keyFile !== "string" ||
+      typeof settings.tls.certFile !== "string")) throw new Error("TLS 证书设置无效。");
+  const tls = settings.tls ? {
+    keyFile: path.resolve(base, settings.tls.keyFile),
+    certFile: path.resolve(base, settings.tls.certFile),
+  } : undefined;
+  if (!loopback && (origin.protocol !== "https:" || !tls)) {
+    throw new Error("非本机访问必须先配置 HTTPS 证书和访问地址。不会自动以明文 HTTP 开放局域网或公网。");
+  }
+  if (reverseProxy) {
+    if (!["127.0.0.1", "::1"].includes(host) || !settings.publicOrigin || origin.protocol !== "https:" || tls) {
+      throw new Error("反向代理模式必须指定固定 HTTPS publicOrigin、数字回环监听地址且不配置后端 TLS；禁止开放业务端口。");
+    }
+  } else if ((origin.protocol === "https:") !== Boolean(tls)) throw new Error("HTTPS 地址和证书配置必须配套。");
+  if (tls) {
+    for (const entry of [tls.keyFile, tls.certFile]) {
+      if (!fs.statSync(entry).isFile()) throw new Error(`证书配置不是文件：${entry}`);
+    }
+  }
+  const lan = validateLan(settings.lan, { host, port, publicOrigin: origin.origin, reverseProxy, tls }, os.networkInterfaces());
+  let updateDir;
+  if (settings.updateDir !== undefined && settings.updateDir !== null) {
+    if (typeof settings.updateDir !== "string" || !settings.updateDir.trim()) throw new Error("更新目录设置无效。");
+    updateDir = path.resolve(base, settings.updateDir);
+    if ([dataDir, backupDir, program, base, tls?.keyFile, tls?.certFile].filter(Boolean)
+      .some(protectedPath => sameOrInside(updateDir, protectedPath) || sameOrInside(protectedPath, updateDir))) {
+      throw new Error("独立更新目录不得与程序、配置、业务数据、备份或证书目录重叠。");
+    }
+  }
+  const sessionHours = settings.sessionHours ?? 8;
+  const backupIntervalMinutes = settings.backupIntervalMinutes ?? 60;
+  if (!Number.isInteger(sessionHours) || sessionHours < 1 || sessionHours > 24) throw new Error("在线会话有效期须为 1—24 小时。");
+  if (!Number.isInteger(backupIntervalMinutes) || backupIntervalMinutes < 0 || backupIntervalMinutes > 10080) {
+    throw new Error("备份间隔须为 0—10080 分钟；0 表示仅手动备份。");
+  }
+  let updateSettings = readUpdateSource(source)?.updates || settings.updates;
+  const policyFile = path.join(program, "updates", "trust-public.json");
+  if (fs.existsSync(policyFile) && !Object.keys(updateSettings?.trustedKeys || {}).length) {
+    const policy = JSON.parse(fs.readFileSync(policyFile, "utf8"));
+    if (policy.format !== "industrial-rent-update-trust" || policy.formatVersion !== 1) throw new Error("内置更新公钥记录无效。");
+    updateSettings = { ...updateSettings, trustedKeys: policy.trustedKeys };
+  }
+  const updates = resolveUpdateConfig(updateSettings);
+  if (settings.push !== undefined) throw new Error("推送密钥不能放入普通程序配置；请使用独立的 pushCredentialsFile。");
+  let pushCredentialsFile, pushCredentialsHash;
+  if (settings.pushCredentialsFile !== undefined && settings.pushCredentialsFile !== null) {
+    const entry = settings.pushCredentialsFile;
+    if (typeof entry !== "string" || !path.isAbsolute(entry) || /[\u0000\r\n]/.test(entry)) {
+      throw new Error("推送凭据文件必须是明确的绝对路径。");
+    }
+    pushCredentialsFile = path.resolve(entry);
+    if (sameOrInside(program, pushCredentialsFile) || updateDir && sameOrInside(updateDir, pushCredentialsFile)) {
+      throw new Error("推送凭据必须放在程序和更新目录之外，不得进入交付包。");
+    }
+    let bytes;
+    try {
+      const stat = fs.lstatSync(pushCredentialsFile);
+      const resolved = fs.realpathSync(pushCredentialsFile);
+      if (!stat.isFile() || stat.isSymbolicLink() || stat.nlink !== 1 || stat.size > 16384 ||
+          sameOrInside(program, resolved) || updateDir && sameOrInside(updateDir, resolved)) {
+        throw new Error("推送凭据必须是程序目录之外、未链接且不超过 16 KiB 的普通文件。");
+      }
+      if (process.platform !== "win32" && ((stat.mode & 0o027) !== 0 ||
+          ![0, process.getuid()].includes(stat.uid))) {
+        throw new Error("推送凭据权限过宽；请使用运行身份或 root 持有的 0600 / 0640 文件。");
+      }
+      bytes = fs.readFileSync(pushCredentialsFile);
+    } catch (error) {
+      if (["ENOENT", "EACCES", "EPERM", "EINVAL", "EISDIR"].includes(error.code)) {
+        throw new Error("无法读取推送凭据文件，请核对路径和访问权限。");
+      }
+      throw error;
+    }
+    if (bytes.length > 16384) throw new Error("推送凭据文件超过 16 KiB。");
+    pushCredentialsHash = crypto.createHash("sha256").update(bytes).digest("hex");
+  }
+  return { dataDir, backupDir, host, port, publicOrigin: origin.origin, reverseProxy, tls,
+    sessionHours, backupIntervalMinutes, updates, ...(updateDir ? { updateDir } : {}),
+    ...(lan ? { lan } : {}),
+    ...(pushCredentialsFile ? { pushCredentialsFile, pushCredentialsHash } : {}) };
+}
+
+function assertRuntime() {
+  const [major, minor] = process.versions.node.split(".").map(Number);
+  if (major !== 24 || minor < 15) throw new Error(`当前运行组件为 ${process.version}，本交付包要求 Node.js 24.15 或更新的 24.x；请使用随包运行组件。`);
+}
+
+module.exports = { resolveConfig, assertRuntime };

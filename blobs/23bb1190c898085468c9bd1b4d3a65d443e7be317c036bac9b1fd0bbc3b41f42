@@ -1,0 +1,29 @@
+"use strict";
+const fs = require("node:fs");
+const path = require("node:path");
+const crypto = require("node:crypto");
+const SOURCES = ["ClientWindow.cs", "ClientUpdates.cs", "ClientState.cs", "Pairing.cs", "NoticeService.cs", "WindowsNotices.cs", "RuntimeSetup.cs", "Program.cs",
+  "dependencies.json", "app.manifest", "Client.exe.config", "build.ps1", "artifact.cjs"];
+const SHARED_SOURCES = ["Protocol.cs", "Safety.cs", "Certificates.cs", "TrustClient.cs"];
+const BINARIES = ["园区租赁.exe", "园区租赁.exe.config", "Microsoft.Web.WebView2.Core.dll", "Microsoft.Web.WebView2.WinForms.dll",
+  "WebView2Loader.dll", "WEBVIEW2-LICENSE.txt"];
+const PACKAGE_FILES = [...SOURCES, ...BINARIES, "build.json"];
+const hash = file => crypto.createHash("sha256").update(fs.readFileSync(file)).digest("hex");
+function verifyClientArtifact(programDirectory = path.resolve(__dirname, "..")) {
+  const directory = path.join(programDirectory, "client-windows");
+  const build = JSON.parse(fs.readFileSync(path.join(directory, "build.json"), "utf8"));
+  const inputs = [...SOURCES, ...SHARED_SOURCES.map(file => `..\\lan-windows\\${file}`)];
+  if (build.format !== "industrial-rent-windows-client" || build.formatVersion !== 1 || build.protocolVersion !== 1 ||
+      JSON.stringify(Object.keys(build.files).sort()) !== JSON.stringify([...BINARIES].sort()) ||
+      JSON.stringify(Object.keys(build.sources).sort()) !== JSON.stringify(inputs.sort())) throw new Error("电脑端构建记录不完整。");
+  for (const [file, expected] of [...Object.entries(build.sources), ...Object.entries(build.files)]) {
+    const location = path.join(directory, file);
+    const stat = fs.lstatSync(location);
+    if (!stat.isFile() || stat.isSymbolicLink() || stat.nlink !== 1 || hash(location) !== expected) throw new Error(`电脑端构建校验失败：${file}`);
+  }
+  const pe = fs.readFileSync(path.join(directory, BINARIES[0])), offset = pe.readUInt32LE(0x3c);
+  if (pe.readUInt16LE(0) !== 0x5a4d || pe.readUInt32LE(offset) !== 0x4550 ||
+      pe.readUInt16LE(offset + 4) !== 0x8664 || pe.readUInt16LE(offset + 24 + 68) !== 2) throw new Error("电脑端不是 x64 Windows 窗口程序。");
+  return build;
+}
+module.exports = { SOURCES, SHARED_SOURCES, BINARIES, PACKAGE_FILES, verifyClientArtifact };

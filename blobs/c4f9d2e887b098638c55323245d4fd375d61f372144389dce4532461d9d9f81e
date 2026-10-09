@@ -1,0 +1,301 @@
+using System;
+using System.Collections.Generic;
+using System.ComponentModel;
+using System.Diagnostics;
+using System.Drawing;
+using System.IO;
+using System.Net;
+using System.Security;
+using System.Security.Cryptography;
+using System.Windows.Forms;
+
+namespace RentLan
+{
+    internal enum InvitationRevocation { NoRecord, Completed, Partial }
+
+    internal interface IInvitationEffects
+    {
+        DateTimeOffset UtcNow { get; }
+        void PrepareTrust(Connection connection);
+        void CheckHost(Connection connection);
+        void CreateEntry(Connection connection);
+        void OpenJoin(string address);
+        InvitationRevocation Revoke(Connection connection);
+    }
+
+    internal sealed class WindowsInvitationEffects : IInvitationEffects
+    {
+        private readonly ITrustStore trust;
+        private readonly IBootstrapProbe probe;
+        private readonly Func<Connection, string> recordDirectory;
+        private readonly Func<string> desktopDirectory;
+        private readonly Action<string> openBrowser;
+        private readonly Func<DateTimeOffset> clock;
+        private readonly List<string> revocationFailures = new List<string>();
+        internal string[] RevocationFailures { get { return revocationFailures.ToArray(); } }
+
+        internal WindowsInvitationEffects(Action<Action> confirm) : this(new CurrentUserTrustStore(confirm), new PinnedBootstrapProbe(), ClientRecords.DirectoryFor,
+            () => Paths.Absolute(Environment.GetFolderPath(Environment.SpecialFolder.DesktopDirectory, Environment.SpecialFolderOption.DoNotVerify), false),
+            address => { using (Process process = Process.Start(new ProcessStartInfo(address) { UseShellExecute = true })) { } },
+            () => DateTimeOffset.UtcNow) { }
+
+        internal WindowsInvitationEffects(ITrustStore trust, IBootstrapProbe probe, Func<Connection, string> recordDirectory,
+            Func<string> desktopDirectory, Action<string> openBrowser, Func<DateTimeOffset> clock)
+        {
+            this.trust = trust; this.probe = probe; this.recordDirectory = recordDirectory;
+            this.desktopDirectory = desktopDirectory; this.openBrowser = openBrowser; this.clock = clock;
+        }
+
+        public DateTimeOffset UtcNow { get { return clock(); } }
+
+        public void PrepareTrust(Connection connection)
+        {
+            connection.Validate(false);
+            using (var record = new RecordFile(recordDirectory(connection), "state.json"))
+            {
+                var state = ClientRecords.Load(record, connection);
+                Trust.Add(trust, connection, state.trust, Product.Sid, true, () => record.Save(state));
+                state.connectionStatus = "pending"; record.Save(state);
+            }
+        }
+
+        public void CheckHost(Connection connection) { probe.Check(connection); }
+
+        public void CreateEntry(Connection connection)
+        {
+            using (var record = new RecordFile(recordDirectory(connection), "state.json"))
+            {
+                var state = ClientRecords.Load(record, connection);
+                state.connectionStatus = "verified-not-logged-in";
+                ClientEntry.Create(connection, state, desktopDirectory(), true, () => record.Save(state));
+            }
+        }
+
+        public void OpenJoin(string address) { openBrowser(address); }
+
+        private void RevokeStep(string stage, Action action)
+        {
+            string category;
+            try { action(); return; }
+            catch (IOException) { category = "io-or-ownership"; }
+            catch (UnauthorizedAccessException) { category = "access-denied"; }
+            catch (SecurityException) { category = "security-policy"; }
+            catch (CryptographicException) { category = "certificate"; }
+            catch (FormatException) { category = "invalid-format"; }
+            catch (ArgumentException) { category = "invalid-argument"; }
+            catch (InvalidOperationException) { category = "invalid-state"; }
+            catch (Win32Exception) { category = "windows-operation"; }
+            revocationFailures.Add(stage + ":" + category);
+        }
+
+        public InvitationRevocation Revoke(Connection connection)
+        {
+            revocationFailures.Clear();
+            string directory = recordDirectory(connection);
+            if (!NativeFiles.Exists(directory)) return InvitationRevocation.NoRecord;
+            using (var record = new RecordFile(directory, "state.json"))
+            {
+                var state = ClientRecords.Load(record, connection);
+                RevokeStep("entry", () => ClientEntry.Remove(connection, state, desktopDirectory(), () => record.Save(state)));
+                RevokeStep("trust", () => Trust.Remove(trust, connection, state.trust, Product.Sid, () => record.Save(state)));
+                state.connectionStatus = revocationFailures.Count == 0 ? "revoked-or-preserved-preexisting" :
+                    "revocation-partial:" + String.Join(",", revocationFailures);
+                // The existing journal stores only fixed stage/category codes. A failed final
+                // save remains observable in memory and is still reported as partial.
+                RevokeStep("record", () => record.Save(state));
+                return revocationFailures.Count == 0 ? InvitationRevocation.Completed : InvitationRevocation.Partial;
+            }
+        }
+    }
+
+    internal sealed class InvitationWorkflow
+    {
+        private readonly InvitationPacket packet;
+        private readonly IInvitationEffects effects;
+        internal bool ConsentGiven { get; private set; }
+        internal bool TrustConfirmed { get; private set; }
+        internal bool VerifiedThisAttempt { get; private set; }
+        internal bool BrowserRequested { get; private set; }
+        internal bool EntryReady { get; private set; }
+        internal bool NeedsNewInvitation { get; private set; }
+        internal bool LastAttemptFailed { get; private set; }
+
+        internal InvitationWorkflow(InvitationPacket packet, IInvitationEffects effects)
+        {
+            if (packet == null || effects == null) throw new ArgumentException("需要负责人提供的个人邀请。");
+            this.packet = packet; this.effects = effects;
+        }
+
+        private void Current()
+        {
+            try { packet.RequireCurrent(effects.UtcNow); }
+            catch (InvitationException) { NeedsNewInvitation = true; throw; }
+        }
+
+        internal string Continue(bool consent, bool createDesktopEntry, Action<string> progress = null)
+        {
+            VerifiedThisAttempt = false; BrowserRequested = false; EntryReady = false; LastAttemptFailed = false;
+            if (!consent) return "没有继续设置。";
+            string phase = "trust";
+            try
+            {
+                Current(); ConsentGiven = true;
+                if (!TrustConfirmed)
+                {
+                    if (progress != null) progress("正在准备安全连接……");
+                    effects.PrepareTrust(packet.Connection);
+                    TrustConfirmed = true;
+                }
+                Current(); phase = "probe";
+                if (progress != null) progress("正在连接公司主机……");
+                effects.CheckHost(packet.Connection);
+                Current(); VerifiedThisAttempt = true;
+                if (createDesktopEntry)
+                {
+                    try { effects.CreateEntry(packet.Connection); EntryReady = true; }
+                    catch (InvitationException) { throw; }
+                    catch (IOException) { EntryReady = false; }
+                    catch (UnauthorizedAccessException) { EntryReady = false; }
+                    catch (SecurityException) { EntryReady = false; }
+                    catch (CryptographicException) { EntryReady = false; }
+                    catch (FormatException) { EntryReady = false; }
+                    catch (ArgumentException) { EntryReady = false; }
+                    catch (InvalidOperationException) { EntryReady = false; }
+                    catch (Win32Exception) { EntryReady = false; }
+                }
+                Current(); phase = "browser";
+                if (progress != null) progress("正在打开账号设置页面……");
+                effects.OpenJoin(packet.JoinAddress());
+                BrowserRequested = true;
+                return "请在浏览器中设置用户名和密码。\r\n" +
+                    (createDesktopEntry ? EntryReady ? "下次可从桌面图标登录。" :
+                        "桌面图标未创建，可先在网页继续。" : "");
+            }
+            catch (InvitationException)
+            {
+                NeedsNewInvitation = true; VerifiedThisAttempt = false; LastAttemptFailed = true;
+                return "这份邀请已过期或不可用，请向负责人领取新邀请。";
+            }
+            catch (IOException) { return ConnectionFailure(phase); }
+            catch (UnauthorizedAccessException) { return ConnectionFailure(phase); }
+            catch (SecurityException) { return ConnectionFailure(phase); }
+            catch (CryptographicException) { return ConnectionFailure(phase); }
+            catch (FormatException) { return ConnectionFailure(phase); }
+            catch (ArgumentException) { return ConnectionFailure(phase); }
+            catch (WebException) { return ConnectionFailure(phase); }
+            catch (InvalidOperationException) { return ConnectionFailure(phase); }
+            catch (Win32Exception) { return ConnectionFailure(phase); }
+        }
+
+        private string ConnectionFailure(string phase)
+        {
+            LastAttemptFailed = true;
+            if (phase == "trust")
+                return "连接设置未完成。请处理 Windows 提示后重试；仍失败请联系负责人。";
+            if (phase == "probe")
+            {
+                VerifiedThisAttempt = false;
+                return "无法安全连接公司主机。请让负责人确认主机已启动、网络正常，再点“重试”。";
+            }
+            return "账号页未打开，请点“重试”；仍失败请联系负责人。";
+        }
+
+        internal string Revoke(bool consent)
+        {
+            if (!consent) return "没有撤销任何设置。";
+            VerifiedThisAttempt = false; BrowserRequested = false; LastAttemptFailed = false;
+            try
+            {
+                InvitationRevocation result = effects.Revoke(packet.Connection);
+                TrustConfirmed = false; EntryReady = false;
+                if (result == InvitationRevocation.Partial)
+                {
+                    LastAttemptFailed = true;
+                    return "部分连接设置未移除，请重试或联系负责人。";
+                }
+                ConsentGiven = false;
+                return result == InvitationRevocation.NoRecord ? "没有找到本程序的连接记录。" :
+                    "本程序新增的连接设置已移除，业务账号不变。";
+            }
+            catch (IOException) { return RevocationFailure(); }
+            catch (UnauthorizedAccessException) { return RevocationFailure(); }
+            catch (SecurityException) { return RevocationFailure(); }
+            catch (CryptographicException) { return RevocationFailure(); }
+            catch (FormatException) { return RevocationFailure(); }
+            catch (ArgumentException) { return RevocationFailure(); }
+            catch (InvalidOperationException) { return RevocationFailure(); }
+            catch (Win32Exception) { return RevocationFailure(); }
+        }
+
+        private string RevocationFailure()
+        {
+            TrustConfirmed = false; LastAttemptFailed = true;
+            return "连接设置未能移除，请重试或联系负责人。";
+        }
+    }
+
+    internal sealed class InvitationForm : WizardForm
+    {
+        private readonly InvitationWorkflow workflow;
+        private readonly CheckBox desktopEntry = new CheckBox {
+            Name = "invitation-desktop", Text = "创建桌面快捷方式", AutoSize = true, Checked = true
+        };
+        private readonly Button proceed, close, revoke;
+
+        internal InvitationForm(InvitationPacket packet) : this(packet, null) { }
+
+        internal InvitationForm(InvitationPacket packet, IInvitationEffects effects) : base("园区租赁 · 我的公司邀请")
+        {
+            workflow = new InvitationWorkflow(packet, effects ?? new WindowsInvitationEffects(ConfirmOnUi));
+            Size = new Size(640, 470); MinimumSize = new Size(600, 440);
+            Row(LabelText("开通员工账号", true), false);
+            Row(LabelText("接下来设置你的用户名和密码。", false), false);
+            Row(LabelText("继续将为当前 Windows 用户添加并信任公司证书。\r\n请只使用负责人发给你的邀请，不要转发。", false), false);
+            Row(desktopEntry, false); Actions.Add(desktopEntry);
+            Output.Name = "invitation-status"; Output.BorderStyle = BorderStyle.None; Output.BackColor = BackColor;
+            Output.ScrollBars = ScrollBars.Vertical; Output.TabStop = false; Output.MinimumSize = new Size(100, 95);
+            Row(Output, true);
+            proceed = Button("同意并继续", async (sender, args) => {
+                bool createEntry = desktopEntry.Checked;
+                await Run(() => workflow.Continue(true, createEntry, ReportProgress));
+            }, true);
+            proceed.Name = "invitation-continue";
+            close = Button("取消", (sender, args) => Close(), false); close.Name = "invitation-close";
+            revoke = Button("移除本机连接", async (sender, args) => {
+                if (MessageBox.Show(this, "移除本程序新增的公司证书和桌面图标？\r\n原有设置、业务账号和账目不变。",
+                    "移除本机连接", MessageBoxButtons.YesNo, MessageBoxIcon.Question, MessageBoxDefaultButton.Button2) != DialogResult.Yes) return;
+                await Run(() => workflow.Revoke(true));
+            }, true);
+            revoke.Name = "invitation-revoke";
+            var details = new LinkLabel { Name = "invitation-help", Text = "连接说明", AutoSize = true, Margin = new Padding(0, 10, 0, 0) };
+            details.LinkClicked += (sender, args) => MessageBox.Show(this,
+                "Windows 可能会要求确认证书，请先核对邀请来自公司负责人。浏览器出现证书警告时，请停止并联系负责人，不要跳过警告。" +
+                "\r\n\r\n桌面图标只打开登录页，不保存邀请或密码。账号是否开通，以网页结果为准。" +
+                "\r\n\r\n移除连接只处理本程序新增且能核对归属的证书和图标，不动原有设置、浏览器资料或业务账号。邀请过期时，请向负责人领取新邀请。",
+                "连接说明", MessageBoxButtons.OK, MessageBoxIcon.Information);
+            Actions.Add(details);
+            Row(Buttons(proceed, close, revoke, details), false);
+            Output.Text = "";
+            Resize += (sender, args) => WrapLabels();
+            WrapLabels(); UpdateButtons();
+        }
+
+        private void WrapLabels()
+        {
+            int width = Math.Max(200, Layout.ClientSize.Width - Layout.Padding.Horizontal - 22);
+            foreach (Control control in Layout.Controls)
+                if (control is Label) control.MaximumSize = new Size(width, 0);
+        }
+
+        protected override void UpdateButtons()
+        {
+            if (proceed == null) return;
+            proceed.Enabled = !Busy && !workflow.NeedsNewInvitation;
+            proceed.Text = !workflow.ConsentGiven ? "同意并继续" : workflow.BrowserRequested ? "再次打开账号页" : "重试";
+            desktopEntry.Enabled = !Busy && !workflow.NeedsNewInvitation;
+            revoke.Visible = workflow.ConsentGiven; revoke.Enabled = !Busy;
+            close.Enabled = !Busy; close.Text = workflow.ConsentGiven ? "关闭" : "取消";
+            if (workflow.LastAttemptFailed) Output.ForeColor = Color.FromArgb(184, 78, 72);
+        }
+    }
+}

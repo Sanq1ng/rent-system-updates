@@ -1,0 +1,16 @@
+@echo off
+setlocal DisableDelayedExpansion
+"%SystemRoot%\System32\chcp.com" 65001 >nul
+if errorlevel 1 exit /b 1
+set "RENT_NODE=%~dp0runtime\node.exe"
+if not exist "%RENT_NODE%" (
+    echo 未找到随包运行组件。请使用完整交付包。
+    pause
+    exit /b 1
+)
+pushd "%~dp0"
+"%RENT_NODE%" --disable-warning=ExperimentalWarning "%~dp0maintenance.cjs" %*
+set "RENT_EXIT=%ERRORLEVEL%"
+popd
+if "%~1"=="" pause
+exit /b %RENT_EXIT%

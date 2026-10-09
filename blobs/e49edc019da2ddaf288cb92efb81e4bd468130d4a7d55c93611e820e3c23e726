@@ -1,0 +1,17 @@
+"use strict";
+
+const { assertSupportedSchema } = require("./push-schema.cjs");
+
+function invalidateRestoredInvitations(db, at = Date.now()) {
+  if (!db.isTransaction || !Number.isSafeInteger(at) || at < 0) {
+    throw new Error("恢复邀请授权必须与清除旧会话在同一个有效事务中执行。");
+  }
+  const version = db.prepare("PRAGMA user_version").get().user_version;
+  assertSupportedSchema(db, version);
+  if (version < 5) return { invitations: 0 };
+  const count = db.prepare(`UPDATE account_invitations SET status='revoked',
+    revoked_at=MAX(created_at,?),revoked_reason='restore' WHERE status='pending'`).run(at).changes;
+  return { invitations: Number(count) };
+}
+
+module.exports = { invalidateRestoredInvitations };

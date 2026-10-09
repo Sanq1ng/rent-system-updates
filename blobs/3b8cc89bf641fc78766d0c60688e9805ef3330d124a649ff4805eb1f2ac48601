@@ -1,0 +1,65 @@
+"use strict";
+
+const LEGACY_INVITATION_COLUMNS = {
+  account_invitations: "id:TEXT,token_hash:TEXT,creator_id:TEXT,roles_json:TEXT,parks_json:TEXT,can_export:INTEGER,receive_reminders:INTEGER,created_at:INTEGER,expires_at:INTEGER,status:TEXT,accepted_user_id:TEXT,accepted_at:INTEGER,revoked_at:INTEGER,revoked_reason:TEXT",
+};
+
+const LEGACY_INVITATION_SCHEMA = `
+  CREATE TABLE account_invitations(
+    id TEXT PRIMARY KEY,
+    token_hash TEXT NOT NULL UNIQUE CHECK(length(token_hash)=64 AND token_hash NOT GLOB '*[^0-9a-f]*'),
+    creator_id TEXT NOT NULL REFERENCES users(id),
+    roles_json TEXT NOT NULL CHECK(json_valid(roles_json) AND json_type(roles_json)='array' AND json_array_length(roles_json) BETWEEN 1 AND 3),
+    parks_json TEXT NOT NULL CHECK(json_valid(parks_json) AND json_type(parks_json)='array' AND json_array_length(parks_json) BETWEEN 1 AND 200),
+    can_export INTEGER NOT NULL CHECK(can_export IN (0,1)),
+    receive_reminders INTEGER NOT NULL CHECK(receive_reminders IN (0,1)),
+    created_at INTEGER NOT NULL CHECK(created_at>=0),
+    expires_at INTEGER NOT NULL CHECK(expires_at>created_at),
+    status TEXT NOT NULL CHECK(status IN ('pending','accepted','revoked')),
+    accepted_user_id TEXT UNIQUE REFERENCES users(id),
+    accepted_at INTEGER,
+    revoked_at INTEGER,
+    revoked_reason TEXT CHECK(revoked_reason IN ('administrator','issuer-permission','restore')),
+    CHECK(
+      (status='pending' AND accepted_user_id IS NULL AND accepted_at IS NULL AND revoked_at IS NULL AND revoked_reason IS NULL) OR
+      (status='accepted' AND accepted_user_id IS NOT NULL AND accepted_at IS NOT NULL AND accepted_at>=created_at AND accepted_at<expires_at AND revoked_at IS NULL AND revoked_reason IS NULL) OR
+      (status='revoked' AND accepted_user_id IS NULL AND accepted_at IS NULL AND revoked_at IS NOT NULL AND revoked_at>=created_at AND revoked_reason IS NOT NULL)
+    )
+  );
+  CREATE INDEX account_invitations_creator ON account_invitations(creator_id,status,created_at);
+  CREATE INDEX account_invitations_expiry ON account_invitations(status,expires_at);
+`;
+
+const INVITATION_COLUMNS = {
+  account_invitations: "id:TEXT,token_hash:TEXT,creator_id:TEXT,roles_json:TEXT,all_parks:INTEGER,parks_json:TEXT,can_export:INTEGER,receive_reminders:INTEGER,created_at:INTEGER,expires_at:INTEGER,status:TEXT,accepted_user_id:TEXT,accepted_at:INTEGER,revoked_at:INTEGER,revoked_reason:TEXT",
+};
+
+const INVITATION_SCHEMA = `
+  CREATE TABLE account_invitations(
+    id TEXT PRIMARY KEY,
+    token_hash TEXT NOT NULL UNIQUE CHECK(length(token_hash)=64 AND token_hash NOT GLOB '*[^0-9a-f]*'),
+    creator_id TEXT NOT NULL REFERENCES users(id),
+    roles_json TEXT NOT NULL CHECK(json_valid(roles_json) AND json_type(roles_json)='array' AND json_array_length(roles_json) BETWEEN 1 AND 3),
+    all_parks INTEGER NOT NULL DEFAULT 0 CHECK(all_parks IN (0,1)),
+    parks_json TEXT NOT NULL CHECK(json_valid(parks_json) AND json_type(parks_json)='array' AND
+      ((all_parks=1 AND json_array_length(parks_json)=0) OR (all_parks=0 AND json_array_length(parks_json) BETWEEN 1 AND 200))),
+    can_export INTEGER NOT NULL CHECK(can_export IN (0,1)),
+    receive_reminders INTEGER NOT NULL CHECK(receive_reminders IN (0,1)),
+    created_at INTEGER NOT NULL CHECK(created_at>=0),
+    expires_at INTEGER NOT NULL CHECK(expires_at>created_at),
+    status TEXT NOT NULL CHECK(status IN ('pending','accepted','revoked')),
+    accepted_user_id TEXT UNIQUE REFERENCES users(id),
+    accepted_at INTEGER,
+    revoked_at INTEGER,
+    revoked_reason TEXT CHECK(revoked_reason IN ('administrator','issuer-permission','restore','park-policy')),
+    CHECK(
+      (status='pending' AND accepted_user_id IS NULL AND accepted_at IS NULL AND revoked_at IS NULL AND revoked_reason IS NULL) OR
+      (status='accepted' AND accepted_user_id IS NOT NULL AND accepted_at IS NOT NULL AND accepted_at>=created_at AND accepted_at<expires_at AND revoked_at IS NULL AND revoked_reason IS NULL) OR
+      (status='revoked' AND accepted_user_id IS NULL AND accepted_at IS NULL AND revoked_at IS NOT NULL AND revoked_at>=created_at AND revoked_reason IS NOT NULL)
+    )
+  );
+  CREATE INDEX account_invitations_creator ON account_invitations(creator_id,status,created_at);
+  CREATE INDEX account_invitations_expiry ON account_invitations(status,expires_at);
+`;
+
+module.exports = { INVITATION_COLUMNS, INVITATION_SCHEMA, LEGACY_INVITATION_COLUMNS, LEGACY_INVITATION_SCHEMA };

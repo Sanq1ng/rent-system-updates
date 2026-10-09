@@ -1,0 +1,156 @@
+"use strict";
+
+const crypto = require("node:crypto");
+const net = require("node:net");
+
+const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+const TOKEN = /^[A-Za-z0-9_-]{43}$/;
+const REMINDER = Object.freeze({ title: "园区租赁", body: "您有新的待处理提醒，请登录查看。", url: "/#notifications" });
+const TEST = Object.freeze({ title: "园区租赁", body: "这是一条设备通知测试，不含业务信息。", url: "/#notifications" });
+
+class PushError extends Error {
+  constructor(status, code, message) {
+    super(message);
+    this.name = "PushError";
+    this.status = status;
+    this.code = code;
+  }
+}
+
+function requirePush(condition, message = "设备通知请求格式无效。", status = 400, code = "PUSH_VALIDATION") {
+  if (!condition) throw new PushError(status, code, message);
+}
+
+function object(value, allowed, required = allowed) {
+  requirePush(value !== null && typeof value === "object" && !Array.isArray(value) &&
+    Object.keys(value).every(key => allowed.includes(key)) && required.every(key => Object.hasOwn(value, key)));
+  return value;
+}
+
+function uuid(value) {
+  requirePush(typeof value === "string" && UUID.test(value), "设备通知标识无效。");
+  return value.toLowerCase();
+}
+
+function base64url(value, bytes) {
+  requirePush(typeof value === "string" && value.length <= 128 && /^[A-Za-z0-9_-]+$/.test(value), "设备密钥格式无效。");
+  const decoded = Buffer.from(value, "base64url");
+  requirePush(decoded.length === bytes && decoded.toString("base64url") === value, "设备密钥长度或编码无效。");
+  return decoded;
+}
+
+function publicPoint(value) {
+  const bytes = base64url(value, 65);
+  requirePush(bytes[0] === 4, "设备公钥格式无效。");
+  try { crypto.ECDH.convertKey(bytes, "prime256v1"); }
+  catch { throw new PushError(400, "PUSH_VALIDATION", "设备公钥无效。"); }
+  return value;
+}
+
+function endpoint(value) {
+  requirePush(typeof value === "string" && value.length >= 20 && value.length <= 2048 &&
+    !/[\s\\\u0000-\u001f\u007f]/.test(value) && !/%(?:2e|2f|5c|00|0a|0d)/i.test(value), "推送订阅地址无效。");
+  let url;
+  try { url = new URL(value); }
+  catch { throw new PushError(400, "PUSH_VALIDATION", "推送订阅地址无效。"); }
+  requirePush(url.protocol === "https:" && !url.username && !url.password && !url.hash && !url.port &&
+    url.href === value, "只接受规范的 HTTPS 推送订阅地址。");
+  const token = "[A-Za-z0-9_:~.+=-]{8,}";
+  const known = (
+    url.hostname === "fcm.googleapis.com" && new RegExp(`^/fcm/send/${token}$`).test(url.pathname) && !url.search
+  ) || (
+    url.hostname === "updates.push.services.mozilla.com" && new RegExp(`^/wpush/v[12]/${token}$`).test(url.pathname) && !url.search
+  ) || (
+    url.hostname === "web.push.apple.com" && new RegExp(`^/${token}$`).test(url.pathname) && !url.search
+  ) || (
+    /^[a-z0-9-]+\.notify\.windows\.com$/.test(url.hostname) && url.pathname === "/w/" &&
+    [...url.searchParams.keys()].join(",") === "token" && /^[A-Za-z0-9_~.%+=/-]{8,}$/.test(url.searchParams.get("token") || "")
+  );
+  requirePush(known, "此订阅的推送服务或路径不在受支持列表中。", 400, "PUSH_ENDPOINT");
+  return url;
+}
+
+function subscription(value, clock = Date.now()) {
+  object(value, ["endpoint", "keys", "expirationTime"], ["endpoint", "keys"]);
+  object(value.keys, ["p256dh", "auth"]);
+  endpoint(value.endpoint);
+  publicPoint(value.keys.p256dh);
+  base64url(value.keys.auth, 16);
+  const expirationTime = value.expirationTime ?? null;
+  requirePush(expirationTime === null || (Number.isSafeInteger(expirationTime) && expirationTime > clock),
+    "浏览器订阅已经到期或到期时间无效。");
+  return { endpoint: value.endpoint, expirationTime, keys: { p256dh: value.keys.p256dh, auth: value.keys.auth } };
+}
+
+function registration(channel, value, clock = Date.now()) {
+  if (channel === "jpush") {
+    object(value, ["registrationId"]);
+    requirePush(typeof value.registrationId === "string" && /^[A-Za-z0-9_-]{8,128}$/.test(value.registrationId),
+      "安卓设备注册标识无效。");
+    return { registrationId: value.registrationId };
+  }
+  requirePush(channel === "webpush", "不支持此通知通道。");
+  return subscription(value, clock);
+}
+
+function enrollmentInput(body, clock) {
+  object(body, ["requestId", "installationId", "channel", "label", "registrationId", "subscription"],
+    ["requestId", "installationId", "channel", "label"]);
+  requirePush(typeof body.label === "string" && body.label.trim().length > 0 && [...body.label.trim()].length <= 48 &&
+    !/[\u0000-\u001f\u007f-\u009f\u202a-\u202e\u2066-\u2069]/.test(body.label), "设备名称须为 1—48 个可见字符。");
+  requirePush(body.channel === "jpush" ? Object.hasOwn(body, "registrationId") && !Object.hasOwn(body, "subscription") :
+    body.channel === "webpush" && Object.hasOwn(body, "subscription") && !Object.hasOwn(body, "registrationId"));
+  const normalized = registration(body.channel,
+    body.channel === "jpush" ? { registrationId: body.registrationId } : body.subscription, clock);
+  return { requestId: uuid(body.requestId), installationId: uuid(body.installationId),
+    channel: body.channel, label: body.label.trim().normalize("NFC"), registration: normalized };
+}
+
+function sha(value) { return crypto.createHash("sha256").update(value).digest("hex"); }
+function registrationHash(channel, value) {
+  return sha(`${channel}:${channel === "jpush" ? value.registrationId : value.endpoint}`);
+}
+function sameHash(value, expected) {
+  return typeof value === "string" && value.length <= 256 && typeof expected === "string" &&
+    /^[a-f0-9]{64}$/.test(expected) && crypto.timingSafeEqual(Buffer.from(sha(value), "hex"), Buffer.from(expected, "hex"));
+}
+
+function isPublicAddress(address) {
+  const family = net.isIP(address);
+  if (family === 4) {
+    const [a, b, c] = address.split(".").map(Number);
+    return !(a === 0 || a === 10 || a === 127 || a >= 224 ||
+      (a === 100 && b >= 64 && b <= 127) || (a === 169 && b === 254) ||
+      (a === 172 && b >= 16 && b <= 31) || (a === 192 && (b === 168 || b === 0 || (b === 88 && c === 99))) ||
+      (a === 198 && (b === 18 || b === 19 || (b === 51 && c === 100))) ||
+      (a === 203 && b === 0 && c === 113));
+  }
+  if (family === 6) {
+    const normalized = new URL(`http://[${address}]/`).hostname.slice(1, -1);
+    if (!/^[23][0-9a-f]{3}:/.test(normalized)) return false;
+    const [first, second = "0"] = normalized.split(":").map(part => Number.parseInt(part || "0", 16));
+    return !(first === 0x2002 || first === 0x3fff ||
+      (first === 0x2001 && [0, 2, 0x10, 0x20, 0xdb8].includes(second)));
+  }
+  return false;
+}
+
+function payload(value) {
+  if (value?.kind === "rent-push-enrollment") {
+    object(value, ["kind", "enrollmentId", "proof"]);
+    uuid(value.enrollmentId);
+    base64url(value.proof, 32);
+  } else {
+    object(value, ["kind", "deliveryId", "receiptToken", "title", "body", "url"]);
+    requirePush(value.kind === "rent-reminder" || value.kind === "rent-push-test");
+    uuid(value.deliveryId);
+    base64url(value.receiptToken, 32);
+    const content = value.kind === "rent-reminder" ? REMINDER : TEST;
+    requirePush(value.title === content.title && value.body === content.body && value.url === content.url,
+      "通知只允许使用不含业务数据的固定内容。");
+  }
+  return value;
+}
+
+module.exports = { PushError, requirePush, object, uuid, TOKEN, base64url, publicPoint, endpoint,
+  subscription, registration, enrollmentInput, sha, registrationHash, sameHash, isPublicAddress, payload, REMINDER, TEST };

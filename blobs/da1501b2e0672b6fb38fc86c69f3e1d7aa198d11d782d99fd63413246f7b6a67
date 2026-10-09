@@ -1,0 +1,256 @@
+"use strict";
+
+const crypto = require("node:crypto");
+const { hashPassword } = require("./bootstrap.cjs");
+
+const INVITATION_ID = /^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/;
+const TOKEN = /^[A-Za-z0-9_-]{42}[AEIMQUYcgkosw048]$/;
+const BUSINESS_ROLES = Object.freeze(["operator", "reviewer", "viewer"]);
+const EXPIRY_MS = 24 * 60 * 60 * 1000;
+
+class InvitationError extends Error {
+  constructor(code, message, status = 400) {
+    super(message);
+    this.name = "InvitationError";
+    this.code = code;
+    this.status = status;
+  }
+}
+
+function requireInvitation(value, message, code = "INVITATION_VALIDATION", status = 400) {
+  if (!value) throw new InvitationError(code, message, status);
+}
+
+function exactObject(input, keys) {
+  requireInvitation(input && typeof input === "object" && !Array.isArray(input) &&
+    Object.keys(input).length === keys.length && keys.every(key => Object.hasOwn(input, key)),
+  "邀请资料格式不正确；只能填写此步骤要求的内容。");
+}
+
+function validateProof(input) {
+  requireInvitation(typeof input.id === "string" && INVITATION_ID.test(input.id) &&
+    typeof input.token === "string" && TOKEN.test(input.token),
+  "邀请内容无效，请重新打开管理员发给你的个人邀请。");
+}
+
+const tokenHash = token => crypto.createHash("sha256").update(Buffer.from(token, "base64url")).digest("hex");
+const iso = value => value === null ? null : new Date(value).toISOString();
+
+function invitationDelivery(origin, builder) {
+  let companyAccessRequired = true;
+  let linkAvailable = false;
+  try {
+    const address = new URL(origin);
+    const host = address.hostname.toLowerCase().replace(/\.$/, "");
+    companyAccessRequired = host === "localhost" || host.endsWith(".localhost") ||
+      /^127\./.test(host) || /^\[::ffff:7f[0-9a-f]{2}:/.test(host) ||
+      ["[::1]", "0.0.0.0", "[::]"].includes(host);
+    linkAvailable = !companyAccessRequired && address.protocol === "https:" &&
+      address.pathname === "/" && !address.search && !address.hash && !address.username && !address.password;
+  } catch (error) {
+    if (!(error instanceof TypeError)) throw error;
+    return { companyAccessRequired: true, linkAvailable: false, packageAvailable: false,
+      reason: "主机访问资料无效，请让维护人员检查；未开放员工注册或生成邀请文件。" };
+  }
+  const packageAvailable = linkAvailable && typeof builder === "function";
+  return {
+    companyAccessRequired, linkAvailable, packageAvailable,
+    reason: companyAccessRequired ? "请先回到主机管理窗口开启同事访问，再从同事入口打开账号管理；本机专用入口不能发给员工。" :
+      !linkAvailable ? "同事访问尚未就绪，请由管理员检查主机上的同事访问状态。" :
+        !packageAvailable ? "当前主机未提供个人 Windows 安装包。可在已部署的安全浏览器入口发送个人邀请链接。" : "",
+  };
+}
+
+function createInvitationService({ store, clock = Date.now }) {
+  const time = () => {
+    const at = clock();
+    requireInvitation(Number.isSafeInteger(at) && at >= 0, "主机时间无效，暂不能处理邀请。", "INVITATION_UNAVAILABLE", 503);
+    return at;
+  };
+  function admin(actorId) {
+    const actor = store.read("users", actorId);
+    requireInvitation(actor?.active && actor.roles.includes("admin"),
+      "当前账号没有邀请员工的管理权限。", "FORBIDDEN", 403);
+    return actor;
+  }
+  function permissions(input) {
+    requireInvitation(Array.isArray(input.roles) && input.roles.length >= 1 && input.roles.length <= 3 &&
+      new Set(input.roles).size === input.roles.length && input.roles.every(role => BUSINESS_ROLES.includes(role)),
+    "请明确选择业务经办、财务复核或业务查看；个人邀请不能授予系统管理权限。");
+    requireInvitation(typeof input.canExport === "boolean" && typeof input.receiveReminders === "boolean",
+      "请明确是否允许导出和接收提醒。");
+    return { roles: [...input.roles], allParks: true, parks: [],
+      canExport: input.canExport, receiveReminders: input.receiveReminders };
+  }
+  function publicInvitation(row, at = time()) {
+    const creator = store.read("users", row.creator_id);
+    return {
+      id: row.id, creatorId: row.creator_id, roles: JSON.parse(row.roles_json), allParks: row.all_parks === 1,
+      parks: JSON.parse(row.parks_json), canExport: Boolean(row.can_export), receiveReminders: Boolean(row.receive_reminders),
+      createdAt: iso(row.created_at), expiresAt: iso(row.expires_at),
+      status: row.status === "pending" && (!creator?.active || !creator.roles.includes("admin")) ? "unavailable" :
+        row.status === "pending" && row.expires_at <= at ? "expired" : row.status,
+      acceptedUserId: row.accepted_user_id, acceptedAt: iso(row.accepted_at), revokedAt: iso(row.revoked_at),
+    };
+  }
+  function audit(action, actor, detail, after) {
+    const entry = { id: crypto.randomUUID(), action, actor, at: iso(time()), detail, after };
+    store.db.prepare("INSERT INTO audit(id,action,actor,at,json) VALUES(?,?,?,?,?)")
+      .run(entry.id, action, actor, entry.at, JSON.stringify(entry));
+    store.changed();
+  }
+  function active(input, at = time()) {
+    validateProof(input);
+    const row = store.db.prepare("SELECT * FROM account_invitations WHERE id=?").get(input.id);
+    const expected = Buffer.from(row?.token_hash || "0".repeat(64), "hex");
+    const matches = expected.length === 32 && crypto.timingSafeEqual(Buffer.from(tokenHash(input.token), "hex"), expected);
+    const creator = row && store.read("users", row.creator_id);
+    requireInvitation(matches && row?.status === "pending" && row.created_at <= at && row.expires_at > at &&
+      creator?.active && creator.roles.includes("admin"),
+    "这份邀请已失效、已被使用或已撤销。请联系管理员重新发一份；现有账号和密码不会更改。",
+    "INVITATION_UNAVAILABLE", 410);
+    // Legacy invitations must be reissued, not silently widened when they are claimed.
+    try {
+      const parks = JSON.parse(row.parks_json);
+      requireInvitation(row.all_parks === 1 && Array.isArray(parks) && parks.length === 0,
+        "旧邀请的工作范围已调整，请重新生成邀请。");
+      const grants = permissions({ roles: JSON.parse(row.roles_json),
+        canExport: Boolean(row.can_export), receiveReminders: Boolean(row.receive_reminders) });
+      return { row, grants };
+    } catch (error) {
+      if (error instanceof InvitationError || error instanceof SyntaxError) {
+        throw new InvitationError("INVITATION_UNAVAILABLE",
+          "管理员预先授权的工作范围已变化，请联系管理员重新发送个人邀请。", 410);
+      }
+      throw error;
+    }
+  }
+  function create(actorId, input) {
+    exactObject(input, ["roles", "canExport", "receiveReminders"]);
+    return store.transaction(() => {
+      const actor = admin(actorId);
+      const grants = permissions(input);
+      const at = time();
+      requireInvitation(store.db.prepare("SELECT COUNT(*) AS n FROM account_invitations WHERE status='pending' AND expires_at>?").get(at).n < 200,
+        "尚未使用的邀请较多，请先撤销不再需要的邀请。", "INVITATION_LIMIT", 409);
+      const id = crypto.randomUUID(), token = crypto.randomBytes(32).toString("base64url");
+      store.db.prepare(`INSERT INTO account_invitations
+        (id,token_hash,creator_id,roles_json,all_parks,parks_json,can_export,receive_reminders,created_at,expires_at,status)
+        VALUES(?,?,?,?,1,?,?,?,?,?,'pending')`).run(id, tokenHash(token), actor.id,
+        JSON.stringify(grants.roles), JSON.stringify(grants.parks), Number(grants.canExport),
+        Number(grants.receiveReminders), at, at + EXPIRY_MS);
+      const invitation = publicInvitation(store.db.prepare("SELECT * FROM account_invitations WHERE id=?").get(id), at);
+      audit("admin.invitation.create", actor.id, "签发一次性员工邀请（全部园区，24 小时有效）", invitation);
+      return { invitation, token };
+    });
+  }
+  function list(actorId) {
+    admin(actorId);
+    const at = time();
+    const rows = store.db.prepare(`SELECT * FROM account_invitations
+      ORDER BY CASE WHEN status='pending' AND expires_at>? THEN 0 ELSE 1 END,created_at DESC,id LIMIT 400`).all(at);
+    return { invitations: rows.map(row => publicInvitation(row, at)),
+      historyLimited: store.db.prepare("SELECT COUNT(*) AS n FROM account_invitations").get().n > rows.length };
+  }
+  function inspect(input) {
+    exactObject(input, ["id", "token"]);
+    const { row } = active(input);
+    return { invitation: publicInvitation(row) };
+  }
+  function claim(input, guard = () => {}) {
+    exactObject(input, ["id", "token", "username", "password"]);
+    requireInvitation(typeof input.username === "string" && input.username.length <= 80 &&
+      input.username.trim() && !/[\u0000-\u001f\u007f]/.test(input.username),
+    "登录名不能为空，不能含控制字符，且不能超过 80 字。");
+    requireInvitation(typeof input.password === "string" && input.password.length >= 10 &&
+      input.password.length <= 128 && input.password.trim(), "密码须为 10 至 128 个字符，且不能全为空格。");
+    const username = input.username.trim();
+    try {
+      return store.transaction(() => {
+        guard();
+        const at = time();
+        const { row, grants } = active(input, at);
+        requireInvitation(!store.db.prepare("SELECT id FROM users WHERE username=? COLLATE NOCASE").get(username),
+          "此登录名已经有人使用，请换一个；不会重置已有账号的密码。", "USERNAME_TAKEN", 409);
+        const user = { id: crypto.randomUUID(), username, displayName: username, ...grants, active: true, version: 1 };
+        const salt = crypto.randomBytes(24).toString("hex");
+        store.db.prepare("INSERT INTO users(id,username,json,salt,password_hash) VALUES(?,?,?,?,?)")
+          .run(user.id, username, JSON.stringify(user), salt, hashPassword(input.password, salt));
+        guard();
+        const acceptedAt = time();
+        requireInvitation(acceptedAt < row.expires_at && acceptedAt >= row.created_at,
+          "邀请已过期，请联系管理员重新签发。", "INVITATION_UNAVAILABLE", 410);
+        const result = store.db.prepare(`UPDATE account_invitations SET status='accepted',accepted_user_id=?,accepted_at=?
+          WHERE id=? AND status='pending' AND expires_at>?`).run(user.id, acceptedAt, row.id, acceptedAt);
+        requireInvitation(result.changes === 1, "邀请已被使用或撤销，请联系管理员。", "INVITATION_UNAVAILABLE", 410);
+        audit("invitation.accept", user.id, "员工通过个人邀请自行建立账号",
+          { invitationId: row.id, creatorId: row.creator_id, user });
+        return { ok: true, username };
+      });
+    } catch (error) {
+      if (error.code === "ERR_SQLITE_ERROR" && /UNIQUE constraint failed: users\.username/.test(error.message)) {
+        throw new InvitationError("USERNAME_TAKEN", "此登录名已经有人使用，请换一个。", 409);
+      }
+      throw error;
+    }
+  }
+  function revoke(actorId, id, input) {
+    exactObject(input, []);
+    requireInvitation(typeof id === "string" && INVITATION_ID.test(id), "邀请标识无效。");
+    return store.transaction(() => {
+      admin(actorId);
+      const row = store.db.prepare("SELECT * FROM account_invitations WHERE id=?").get(id);
+      requireInvitation(row, "邀请不存在。", "NOT_FOUND", 404);
+      requireInvitation(row.status !== "accepted", "员工已建立账号；如需停用，请编辑该账号，不能撤回已接受的邀请。", "INVITATION_ACCEPTED", 409);
+      if (row.status !== "revoked") {
+        store.db.prepare(`UPDATE account_invitations SET status='revoked',revoked_at=?,revoked_reason='administrator' WHERE id=?`)
+          .run(Math.max(time(), row.created_at), id);
+        audit("admin.invitation.revoke", actorId, "撤销尚未使用的员工邀请", { invitationId: id });
+      }
+      return { invitation: publicInvitation(store.db.prepare("SELECT * FROM account_invitations WHERE id=?").get(id)) };
+    });
+  }
+  function revokeIssuer(creatorId, actorId) {
+    requireInvitation(store.db.isTransaction, "邀请撤销须与账号权限变更同时保存。");
+    const changed = store.db.prepare(`UPDATE account_invitations SET status='revoked',
+      revoked_at=MAX(created_at,?),revoked_reason='issuer-permission' WHERE creator_id=? AND status='pending'`).run(time(), creatorId).changes;
+    if (changed) audit("admin.invitation.issuer-revoke", actorId, "签发人失去管理权限，撤销其未使用邀请",
+      { creatorId, invitations: Number(changed) });
+  }
+  function authorizePackage(actorId, input) {
+    exactObject(input, ["id", "token"]);
+    admin(actorId);
+    const { row } = active(input);
+    requireInvitation(row.creator_id === actorId, "只能下载本人刚刚签发的个人邀请文件。", "FORBIDDEN", 403);
+    return { id: row.id, token: input.token, expiresAt: iso(row.expires_at) };
+  }
+  function packageDelivered(actorId, input, guard) {
+    store.transaction(() => {
+      guard();
+      const invitation = authorizePackage(actorId, input);
+      audit("admin.invitation.package", actorId, "生成个人员工安装包", { invitationId: invitation.id });
+    });
+  }
+  return Object.freeze({ create, list, inspect, claim, revoke, revokeIssuer, authorizePackage, packageDelivered });
+}
+
+function createInvitationRateGate({ clock = Date.now } = {}) {
+  const entries = new Map();
+  return (key, maximum, milliseconds = 60_000) => {
+    const at = clock();
+    let entry = entries.get(key);
+    if (!entry || entry.until <= at) {
+      entry = { count: 0, until: at + milliseconds };
+      entries.set(key, entry);
+    }
+    if (entry.count >= maximum) throw new InvitationError("RATE_LIMIT", "邀请操作过于频繁，请稍后再试。", 429);
+    entry.count++;
+    if (entries.size > 5000) {
+      for (const [id, value] of entries) if (value.until <= at) entries.delete(id);
+      while (entries.size > 5000) entries.delete(entries.keys().next().value);
+    }
+  };
+}
+
+module.exports = { createInvitationService, invitationDelivery, createInvitationRateGate,
+  InvitationError, INVITATION_ID, EXPIRY_MS, tokenHash };

@@ -1,0 +1,136 @@
+using System;
+using System.Diagnostics;
+using System.IO;
+using System.Net;
+using System.Runtime.InteropServices;
+using System.Security.Cryptography.X509Certificates;
+using System.Threading;
+using System.Threading.Tasks;
+using Microsoft.Web.WebView2.Core;
+using RentLan;
+
+namespace RentCentre.Client
+{
+    internal static class RuntimeSetup
+    {
+        internal static bool Available()
+        {
+            try { return !String.IsNullOrWhiteSpace(CoreWebView2Environment.GetAvailableBrowserVersionString()); }
+            catch (WebView2RuntimeNotFoundException) { return false; }
+        }
+        internal static bool MicrosoftAddress(Uri uri)
+        {
+            return uri != null && uri.Scheme == "https" && uri.IsDefaultPort && uri.UserInfo.Length == 0 &&
+                uri.Fragment.Length == 0 && (uri.Host == "microsoft.com" || uri.Host.EndsWith(".microsoft.com", StringComparison.OrdinalIgnoreCase));
+        }
+        private static void Download(string file, CancellationToken cancellation)
+        {
+            var address = new Uri("https://go.microsoft.com/fwlink/p/?LinkId=2124703");
+            ServicePointManager.SecurityProtocol |= SecurityProtocolType.Tls12;
+            for (int hop = 0; hop < 5; hop++) {
+                if (!MicrosoftAddress(address)) throw new IOException("微软组件下载地址不受信任，未运行下载文件。");
+                cancellation.ThrowIfCancellationRequested();
+                var request = (HttpWebRequest)WebRequest.Create(address);
+                request.AllowAutoRedirect = false; request.UseDefaultCredentials = false; request.Credentials = null;
+                request.Timeout = 30000; request.ReadWriteTimeout = 30000;
+                using (cancellation.Register(request.Abort))
+                using (var response = (HttpWebResponse)request.GetResponse()) {
+                    int status = (int)response.StatusCode;
+                    if (status == 301 || status == 302 || status == 303 || status == 307 || status == 308) {
+                        string location = response.Headers["Location"];
+                        if (String.IsNullOrWhiteSpace(location)) throw new IOException("微软组件下载跳转不完整。");
+                        address = new Uri(address, location); continue;
+                    }
+                    if (status != 200 || response.ContentLength > 16 * 1024 * 1024) throw new IOException("微软组件下载响应无效或过大。");
+                    using (var input = response.GetResponseStream())
+                    using (var output = new FileStream(file, FileMode.CreateNew, FileAccess.Write, FileShare.None)) {
+                        byte[] buffer = new byte[65536]; int count, length = 0;
+                        while ((count = input.Read(buffer, 0, buffer.Length)) != 0) {
+                            cancellation.ThrowIfCancellationRequested();
+                            length += count;
+                            if (length > 16 * 1024 * 1024) throw new IOException("微软组件下载超过大小限制。");
+                            output.Write(buffer, 0, count);
+                        }
+                        if (length == 0 || response.ContentLength >= 0 && length != response.ContentLength)
+                            throw new IOException("微软组件尚未完整下载。");
+                        output.Flush(true);
+                    }
+                    return;
+                }
+            }
+            throw new IOException("微软组件下载跳转次数过多。");
+        }
+        [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+        private struct TrustFile { internal uint Size; [MarshalAs(UnmanagedType.LPWStr)] internal string Path; internal IntPtr Handle, Subject; }
+        [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+        private struct TrustData
+        {
+            internal uint Size;
+            internal IntPtr Policy, Sip;
+            internal uint Ui, Revocation, Choice;
+            internal IntPtr File;
+            internal uint StateAction;
+            internal IntPtr State, Url;
+            internal uint Flags, Context;
+            internal IntPtr Signature;
+        }
+        [DllImport("wintrust.dll", ExactSpelling = true)]
+        private static extern int WinVerifyTrust(IntPtr window, ref Guid action, ref TrustData data);
+        internal static void VerifyMicrosoftSignature(string file)
+        {
+            var subject = new TrustFile { Size = (uint)Marshal.SizeOf(typeof(TrustFile)), Path = file };
+            IntPtr pointer = Marshal.AllocHGlobal(Marshal.SizeOf(typeof(TrustFile)));
+            var action = new Guid("00AAC56B-CD44-11d0-8CC2-00C04FC295EE");
+            var data = new TrustData { Size = (uint)Marshal.SizeOf(typeof(TrustData)), Ui = 2, Revocation = 1,
+                Choice = 1, File = pointer, StateAction = 1, Flags = 0x80 };
+            try {
+                Marshal.StructureToPtr(subject, pointer, false);
+                if (WinVerifyTrust(new IntPtr(-1), ref action, ref data) != 0)
+                    throw new IOException("微软组件的 Windows 发布签名未通过，未执行。");
+                using (var certificate = new X509Certificate2(X509Certificate.CreateFromSignedFile(file))) {
+                    if (certificate.GetNameInfo(X509NameType.SimpleName, false) != "Microsoft Corporation")
+                        throw new IOException("下载文件不是 Microsoft Corporation 发布的组件，未执行。");
+                }
+            } finally {
+                data.StateAction = 2; WinVerifyTrust(new IntPtr(-1), ref action, ref data);
+                Marshal.DestroyStructure(pointer, typeof(TrustFile)); Marshal.FreeHGlobal(pointer);
+            }
+        }
+        internal static Task Install(string privateRoot, CancellationToken cancellation, Action<string> progress)
+        {
+            return Task.Run(() => {
+                string directory = Path.Combine(privateRoot, "runtime-" + Guid.NewGuid().ToString("N"));
+                string file = Path.Combine(directory, "MicrosoftEdgeWebView2Setup.exe");
+                bool retain = false;
+                using (var parent = new DirectoryPins(privateRoot)) Directory.CreateDirectory(directory);
+                try {
+                    progress("正在从微软下载显示组件……");
+                    Download(file, cancellation);
+                    using (var pins = new DirectoryPins(directory))
+                    using (var held = new CheckedFile(file, false)) {
+                        VerifyMicrosoftSignature(file);
+                        cancellation.ThrowIfCancellationRequested();
+                        progress("正在安装微软显示组件，请稍候……");
+                        using (var process = Process.Start(new ProcessStartInfo(file, "/silent /install") {
+                            UseShellExecute = false, CreateNoWindow = true, WorkingDirectory = directory
+                        })) {
+                            if (!process.WaitForExit(300000)) {
+                                retain = true;
+                                throw new IOException("微软组件仍在安装。请稍后重新打开园区租赁；不要再次安装整套软件。");
+                            }
+                            if (!Available()) throw new IOException("微软显示组件未安装完成（" + process.ExitCode + "）。请检查网络后重新打开软件重试。");
+                        }
+                    }
+                } finally {
+                    if (!retain) {
+                        using (var pins = new DirectoryPins(directory)) {
+                            if (File.Exists(file)) using (var owned = new CheckedFile(file, true))
+                                NativeFiles.Delete(owned.Stream.SafeFileHandle, file);
+                        }
+                        Directory.Delete(directory, false);
+                    }
+                }
+            }, cancellation);
+        }
+    }
+}

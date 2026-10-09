@@ -1,0 +1,158 @@
+(function (root, factory) {
+  "use strict";
+  if (typeof module === "object" && module.exports) module.exports = factory();
+  else root.RentNativeClient = factory();
+})(globalThis, function () {
+  "use strict";
+
+  const isNative = agent => /Rent(?:Native|Android)\//.test(agent || "");
+  const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+  const ACCOUNT_KEY = "rent-native-account:v1";
+  function failure(message, code = "NATIVE_EXPORT") {
+    const error = new Error(message);
+    error.code = code;
+    return error;
+  }
+
+  function createClient({ environment = globalThis, bridge = environment.RentNative } = {}) {
+    const pending = new Map();
+    let generation = 0, busy = false, capabilities = null, activeId = "";
+    function available() { return Boolean(bridge && typeof bridge.postMessage === "function"); }
+    function receive(event) {
+      let value;
+      try { value = JSON.parse(event.data); }
+      catch {
+        for (const entry of pending.values()) entry.reject(failure("安卓客户端返回了无法识别的消息，原文件未删除。"));
+        return;
+      }
+      if (!value || value.v !== 1 || typeof value.requestId !== "string") return;
+      const entry = pending.get(value.requestId);
+      if (!entry) return;
+      if (value.type === "export-error") entry.reject(failure(
+        typeof value.message === "string" ? value.message.slice(0, 500) : "安卓客户端未能完成文件操作，原文件未删除。"));
+      else if (value.type !== entry.type || entry.sequence !== undefined && value.sequence !== entry.sequence) {
+        entry.reject(failure("安卓客户端的文件确认次序不一致，未确认保存成功。"));
+      } else entry.resolve(value);
+    }
+    if (available()) bridge.onmessage = receive;
+
+    function send(type, id, data = {}) {
+      if (!available()) throw failure("此安卓客户端的安全文件接口不可用，请先更新 Android System WebView；不要删除本机草稿。");
+      bridge.postMessage(JSON.stringify({ v: 1, type, requestId: id, ...data }));
+    }
+    function exchange(type, expected, id, data = {}, timeout = 15000) {
+      return new Promise((resolve, reject) => {
+        const finish = (action, value) => {
+          const entry = pending.get(id);
+          if (!entry) return;
+          environment.clearTimeout(entry.timer);
+          pending.delete(id);
+          action(value);
+        };
+        const timer = environment.setTimeout(() => finish(reject,
+          failure("等待安卓客户端确认超时，文件没有被确认完整保存。请保留原件后重试。")), timeout);
+        pending.set(id, { type: expected, sequence: data.sequence, timer,
+          resolve: value => finish(resolve, value), reject: error => finish(reject, error) });
+        try { send(type, id, data); } catch (error) { finish(reject, error); }
+      });
+    }
+    function guard(started) {
+      if (started !== generation) throw failure("账号或工作区已切换，旧文件操作已取消。", "NATIVE_SESSION_CHANGED");
+    }
+    async function hello() {
+      if (capabilities) return capabilities;
+      const started = generation;
+      const result = await exchange("hello", "capabilities", environment.crypto.randomUUID());
+      guard(started);
+      if (result.exports !== true || !Number.isSafeInteger(result.maxBytes) || result.maxBytes < 1 ||
+          result.maxBytes > 512 * 1024 * 1024 || !Number.isSafeInteger(result.chunkBytes) ||
+          result.chunkBytes < 1 || result.chunkBytes > 192 * 1024 ||
+          !UUID.test(result.installationId)) {
+        throw failure("安卓客户端返回的接口版本或文件限制无效，请更新客户端。");
+      }
+      capabilities = result;
+      return result;
+    }
+    async function exportBlob(blob, name) {
+      if (busy) throw failure("已有文件正在交给安卓客户端，请先完成或取消。");
+      if (!(blob instanceof environment.Blob) || typeof name !== "string" || !name || name.length > 180 ||
+          /[\\/\u0000-\u001f]/.test(name)) throw failure("待保存文件或名称无效。");
+      busy = true;
+      const started = generation, id = environment.crypto.randomUUID();
+      activeId = id;
+      try {
+        const limits = await hello();
+        guard(started);
+        if (blob.size > limits.maxBytes) throw failure("文件超过安卓客户端的保存上限，请改用电脑导出；本机工作仍保留。");
+        await exchange("export-begin", "export-ready", id, { name, size: blob.size }, 300000);
+        guard(started);
+        const size = Math.min(limits.chunkBytes, 65536);
+        let sequence = 0;
+        for (let offset = 0; offset < blob.size; offset += size) {
+          const bytes = new Uint8Array(await blob.slice(offset, offset + size).arrayBuffer());
+          guard(started);
+          let binary = "";
+          for (const byte of bytes) binary += String.fromCharCode(byte);
+          await exchange("export-chunk", "export-ack", id, { sequence, base64: environment.btoa(binary) });
+          guard(started);
+          sequence++;
+        }
+        const result = await exchange("export-finish", "export-complete", id);
+        guard(started);
+        if (result.storage !== "app-private") throw failure("安卓客户端尚未确认文件完整写入，请不要删除原文件。");
+        return result;
+      } catch (error) {
+        if (available()) {
+          try { send("export-abort", id); }
+          catch (abortError) { throw new AggregateError([error, abortError], "安卓文件操作和取消确认均未完成，请保留原文件并重新打开客户端。"); }
+        }
+        throw error;
+      } finally {
+        if (activeId === id) { busy = false; activeId = ""; }
+      }
+    }
+    function sessionChanged(reason) {
+      if (reason !== undefined && !["manual-logout", "account-switch"].includes(reason)) {
+        throw failure("安卓账号状态变更原因无效。", "NATIVE_SESSION_CHANGED");
+      }
+      generation++;
+      capabilities = null;
+      for (const entry of pending.values()) entry.reject(failure("账号或工作区已切换，旧文件操作已取消。", "NATIVE_SESSION_CHANGED"));
+      busy = false; activeId = "";
+      if (available()) send("session-changed", environment.crypto.randomUUID(), reason ? { reason } : {});
+      else if (reason) throw failure("安卓账号通知接口不可用，本机通知停用状态尚未确认。", "NATIVE_SESSION_CHANGED");
+    }
+    async function accountReady({ serverId, userId }) {
+      if (!available()) throw failure("安卓账号通知接口不可用，请先更新客户端或 Android System WebView。", "NATIVE_SESSION_CHANGED");
+      if (!UUID.test(serverId || "") || !UUID.test(userId || "")) {
+        throw failure("安卓账号或账套标识无效，不能保留旧设备授权。", "NATIVE_SESSION_CHANGED");
+      }
+      const started = generation;
+      const limits = await hello();
+      guard(started);
+      if (limits.workspaceIdentity !== true || limits.lifecycleReasons !== true) {
+        throw failure("请先更新安卓客户端以保护账号文件与通知；不要卸载或清除本机资料。", "NATIVE_UPDATE_REQUIRED");
+      }
+      const identity = `${serverId.toLowerCase()}:${userId.toLowerCase()}`;
+      if (environment.localStorage.getItem(ACCOUNT_KEY) !== identity) sessionChanged("account-switch");
+      send("workspace-ready", environment.crypto.randomUUID(), { serverId: serverId.toLowerCase(), userId: userId.toLowerCase() });
+      environment.localStorage.setItem(ACCOUNT_KEY, identity);
+    }
+    async function printReport() {
+      const started = generation;
+      const result = await hello();
+      guard(started);
+      if (result.print !== true) throw failure("这个安卓客户端尚不支持直接打印报表，请导出表格或在电脑浏览器中打印。", "NATIVE_PRINT_UNAVAILABLE");
+      const opened = await exchange("print-report", "print-opened", environment.crypto.randomUUID(), {}, 30000);
+      guard(started);
+      return opened;
+    }
+    function dispose() {
+      sessionChanged();
+      if (available() && bridge.onmessage === receive) bridge.onmessage = null;
+    }
+    return Object.freeze({ available, hello, exportBlob, printReport, sessionChanged, accountReady, dispose, isBusy: () => busy });
+  }
+
+  return Object.freeze({ isNative, createClient });
+});

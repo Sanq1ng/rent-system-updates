@@ -1,0 +1,71 @@
+"use strict";
+
+const fs = require("node:fs");
+const path = require("node:path");
+const { DatabaseSync } = require("node:sqlite");
+const { fail, digest, ensureDirectory, regularFile, readJSON, writeJSON } = require("./files.cjs");
+const { stateDirectory } = require("./releases.cjs");
+
+const TERMINAL = new Set(["completed", "committed", "rolled-back", "cancelled", "failed"]);
+const HANDOFF = new Set(["restart-pending", "activating", "trial", "rolling-back", "rollback-trial", "full-apply-pending", "full-applying"]);
+const PHASES = new Set([...TERMINAL, ...HANDOFF, "queued", "checking", "staging", "awaiting-clients", "backing-up", "cancelling"]);
+
+function stateFile(program) { return path.join(stateDirectory(program), "state.json"); }
+
+function loadState(program) {
+  if (!fs.existsSync(stateFile(program))) return { formatVersion: 1, highestSequence: 0, requests: {}, history: [], available: null, staged: null, job: null };
+  const state = readJSON(stateFile(program), 8 * 1024 * 1024);
+  if (!state || state.formatVersion !== 1 || !Number.isSafeInteger(state.highestSequence) || state.highestSequence < 0 ||
+      !state.requests || typeof state.requests !== "object" || Array.isArray(state.requests) ||
+      Object.keys(state.requests).length > 2000 ||
+      (state.history !== undefined && (!Array.isArray(state.history) || state.history.length > 2000)) ||
+      (state.activeReleaseId !== undefined && !/^[a-f0-9]{64}$/.test(state.activeReleaseId || "")) ||
+      (state.highestSeenSequence !== undefined && (!Number.isSafeInteger(state.highestSeenSequence) || state.highestSeenSequence < 1 ||
+        !/^[a-f0-9]{64}$/.test(state.highestSeenReleaseId || ""))) ||
+      (state.job && (!PHASES.has(state.job.phase) || !/^[a-f0-9-]{36}$/.test(state.job.id || "")))) {
+    fail("UPDATE_STATE", "更新任务记录无效；不会尝试初始化或替换程序。");
+  }
+  return state;
+}
+
+function saveState(program, state) { writeJSON(stateFile(program), state); }
+
+function acquireUpdateLease(program) {
+  ensureDirectory(stateDirectory(program));
+  const ownerFile = path.join(stateDirectory(program), "owner.sqlite");
+  if (fs.lstatSync(ownerFile, { throwIfNoEntry: false })) regularFile(ownerFile);
+  const database = new DatabaseSync(path.toNamespacedPath(ownerFile));
+  try {
+    database.exec("PRAGMA busy_timeout=0; PRAGMA journal_mode=DELETE; CREATE TABLE IF NOT EXISTS owner(id INTEGER); BEGIN EXCLUSIVE");
+  } catch (error) {
+    database.close();
+    if (error.errcode === 5 || error.errcode === 6) fail("UPDATE_IN_USE", "另一主机正在管理此程序的更新；不会并发替换程序。");
+    throw error;
+  }
+  return () => { try { database.exec("ROLLBACK"); } finally { database.close(); } };
+}
+
+function configFingerprint(config) {
+  return digest(Buffer.from(JSON.stringify({
+    dataDir: path.resolve(config.dataDir), backupDir: path.resolve(config.backupDir),
+    host: config.host, port: config.port, publicOrigin: config.publicOrigin,
+    tls: config.tls || null, sessionHours: config.sessionHours, backupIntervalMinutes: config.backupIntervalMinutes,
+    ...(config.reverseProxy ? { reverseProxy: true } : {}),
+    ...(config.lan ? { lan: config.lan } : {}),
+    ...(config.updateDir ? { updateDir: path.resolve(config.updateDir) } : {}),
+    ...(config.pushCredentialsFile ? {
+      pushCredentialsFile: path.resolve(config.pushCredentialsFile), pushCredentialsHash: config.pushCredentialsHash,
+    } : {}),
+  })));
+}
+
+function describeError(error) {
+  const code = typeof error?.code === "string" && /^UPDATE_[A-Z_]+$/.test(error.code) ? error.code :
+    error?.name === "AbortError" ? "UPDATE_CANCELLED" : "UPDATE_FAILED";
+  const message = code.startsWith("UPDATE_") && code !== "UPDATE_FAILED" && code !== "UPDATE_CANCELLED"
+    ? String(error.message).replace(/[\u0000-\u001f\u007f]/g, " ").slice(0, 400)
+    : code === "UPDATE_CANCELLED" ? "更新已取消，原程序和本机工作保留。" : "更新未完成；请查看主机维护日志，原程序和备份已保留。";
+  return { code, message };
+}
+
+module.exports = { TERMINAL, HANDOFF, loadState, saveState, acquireUpdateLease, configFingerprint, describeError };

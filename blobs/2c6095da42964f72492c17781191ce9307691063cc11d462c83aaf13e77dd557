@@ -1,0 +1,219 @@
+"use strict";
+
+const fs = require("node:fs");
+const path = require("node:path");
+const crypto = require("node:crypto");
+const { REQUIRED_BUNDLE_FILES, bundlePath } = require("./bundle-layout.cjs");
+
+const MAX_FILES = 512;
+const MAX_FILE_BYTES = 192 * 1024 * 1024;
+const MAX_TOTAL_BYTES = 512 * 1024 * 1024;
+const MAX_MANIFEST_BYTES = 256 * 1024;
+const COMPATIBILITY = Object.freeze({
+  bootstrap: 1, desktopProtocol: 2, schema: 7, apiProtocol: 1, workspace: 1,
+  platform: process.platform, architecture: process.arch, nodeMajor: 24, nodeMinimumMinor: 15,
+});
+
+function compatibilityFor(platform = process.platform, architecture = process.arch) {
+  if (!["win32", "linux"].includes(platform) || architecture !== "x64") {
+    fail("UPDATE_COMPATIBILITY", "在线更新仅支持明确签名的 Windows x64 或 Linux x64 平台。");
+  }
+  return { ...COMPATIBILITY, platform, architecture };
+}
+
+function fail(code, message, status = 409) {
+  const error = new Error(message);
+  error.code = code;
+  error.status = status;
+  throw error;
+}
+
+function digest(bytes) { return crypto.createHash("sha256").update(bytes).digest("hex"); }
+
+async function hashFile(file) {
+  const hash = crypto.createHash("sha256");
+  for await (const chunk of fs.createReadStream(file)) hash.update(chunk);
+  return hash.digest("hex");
+}
+
+function regularFile(file, maximum = Number.MAX_SAFE_INTEGER) {
+  const stat = fs.lstatSync(file);
+  if (!stat.isFile() || stat.isSymbolicLink() || stat.nlink !== 1 || stat.size > maximum) {
+    fail("UPDATE_FILE", "更新文件不是允许的普通文件，或超过大小限制。");
+  }
+  return stat;
+}
+
+function syncDirectory(directory) {
+  if (process.platform !== "linux") return;
+  const handle = fs.openSync(directory, "r");
+  try { fs.fsyncSync(handle); } finally { fs.closeSync(handle); }
+}
+
+function ensureDirectory(directory) {
+  const target = path.resolve(directory);
+  const parent = path.dirname(target);
+  if (parent !== target) ensureDirectory(parent);
+  if (!fs.existsSync(target)) {
+    fs.mkdirSync(target, { mode: 0o700 });
+    syncDirectory(parent);
+  }
+  const stat = fs.lstatSync(target);
+  if (!stat.isDirectory() || stat.isSymbolicLink()) fail("UPDATE_PATH", "更新目录不允许链接或特殊文件。");
+}
+
+function assertDirectory(directory) {
+  const target = path.resolve(directory);
+  const parent = path.dirname(target);
+  if (parent !== target) assertDirectory(parent);
+  const stat = fs.lstatSync(target);
+  if (!stat.isDirectory() || stat.isSymbolicLink()) fail("UPDATE_PATH", "更新目录不允许链接或特殊文件。");
+}
+
+function writeFile(file, bytes) {
+  ensureDirectory(path.dirname(file));
+  const handle = fs.openSync(file, "wx", 0o600);
+  try { fs.writeFileSync(handle, bytes); fs.fsyncSync(handle); }
+  finally { fs.closeSync(handle); }
+  syncDirectory(path.dirname(file));
+}
+
+function writeJSON(file, value) {
+  ensureDirectory(path.dirname(file));
+  if (fs.existsSync(file)) regularFile(file);
+  const temporary = `${file}.pending-${crypto.randomUUID()}`;
+  writeFile(temporary, Buffer.from(`${JSON.stringify(value)}\n`, "utf8"));
+  fs.renameSync(temporary, file);
+  syncDirectory(path.dirname(file));
+}
+
+function readJSON(file, maximum = 4 * 1024 * 1024) {
+  regularFile(file, maximum);
+  try { return JSON.parse(fs.readFileSync(file, "utf8")); }
+  catch (error) {
+    if (!(error instanceof SyntaxError)) throw error;
+    fail("UPDATE_STATE", "更新记录格式损坏；已停止自动更新，请保留现有程序和数据。");
+  }
+}
+
+function sameOrInside(parent, child) {
+  const relative = path.relative(path.resolve(parent), path.resolve(child));
+  return relative === "" || (!relative.startsWith(`..${path.sep}`) && relative !== ".." && !path.isAbsolute(relative));
+}
+
+function versionParts(value) {
+  if (typeof value !== "string" || !/^(0|[1-9]\d{0,6})\.(0|[1-9]\d{0,6})\.(0|[1-9]\d{0,6})$/.test(value)) {
+    fail("UPDATE_VERSION", "更新版本号必须是完整的数字版本。");
+  }
+  return value.split(".").map(Number);
+}
+
+function compareVersions(left, right) {
+  const a = versionParts(left), b = versionParts(right);
+  for (let index = 0; index < 3; index++) if (a[index] !== b[index]) return Math.sign(a[index] - b[index]);
+  return 0;
+}
+
+function payloadPath(value, bundle = false) {
+  if (typeof value !== "string" || value.length > 220 || value.includes("\\")) fail("UPDATE_PATH", "更新清单含有不允许的路径。");
+  const parts = value.split("/");
+  if (parts.some(part => !part || part === "." || part === ".." || /[<>:"|?*\u0000-\u001f]/.test(part) ||
+      /[. ]$/.test(part) || /^(con|prn|aux|nul|clock\$|conin\$|conout\$|com[1-9¹²³]|lpt[1-9¹²³])(?:\.|$)/i.test(part))) {
+    fail("UPDATE_PATH", "更新清单含有不安全的 Windows 文件名。");
+  }
+  if (bundle && bundlePath(value)) return parts;
+  if (parts.some(part => !/^[A-Za-z0-9_-][A-Za-z0-9_.-]{0,119}$/.test(part) || /[. ]$/.test(part) ||
+      /^(con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\.|$)/i.test(part))) {
+    fail("UPDATE_PATH", "更新清单含有不安全的 Windows 文件名。");
+  }
+  const root = parts[0];
+  const valid = value === "package.json" ||
+    (parts.length >= 2 && root === "public" && /\.(?:js|css|html|json|webmanifest|svg|png|jpe?g|webp|ico|woff2?|txt)$/.test(value)) ||
+    (parts.length >= 2 && root === "server" && (/\.(?:cjs|json)$/.test(value) ||
+      /^server\/vendor\/[A-Za-z0-9_.-]+-LICENSE\.txt$/.test(value))) ||
+    (parts.length >= 2 && root === "shared" && /(?:\.d\.ts|\.json)$/.test(value)) ||
+    value === "shared/lan-policy.cjs";
+  if (!valid) fail("UPDATE_PATH", "在线更新仅允许业务页面、服务、共享协议及版本文件，不允许运行组件、配置或数据。");
+  return parts;
+}
+
+function validateManifest(manifest, local = false, compatibility = compatibilityFor()) {
+  if (!manifest || manifest.format !== "industrial-rent-update" || manifest.formatVersion !== 1 ||
+      manifest.application !== "industrial-rent-system" ||
+      !Number.isSafeInteger(manifest.sequence) || manifest.sequence < (local ? 0 : 1)) {
+    fail("UPDATE_MANIFEST", "更新清单格式或发布序号不受支持。");
+  }
+  versionParts(manifest.version);
+  const bundle = manifest.packageKind === "windows-program";
+  if (manifest.packageKind !== undefined && !bundle) fail("UPDATE_MANIFEST", "更新程序种类无效。");
+  if (bundle && (compatibility.platform !== "win32" || !Number.isInteger(manifest.compatibility?.schema) ||
+      manifest.compatibility.schema < 2 || manifest.compatibility.schema > 999 ||
+      !Array.isArray(manifest.migrateFrom) || !manifest.migrateFrom.length || manifest.migrateFrom.length > 32 ||
+      manifest.migrateFrom.some(schema => !Number.isInteger(schema) || schema < 2 || schema > manifest.compatibility.schema))) {
+    fail("UPDATE_COMPATIBILITY", "整程序更新的 Windows 平台或数据库迁移范围不完整。");
+  }
+  if (!manifest.compatibility || Object.keys(manifest.compatibility).length !== Object.keys(compatibility).length ||
+      Object.entries(compatibility).some(([key, value]) => !(bundle && key === "schema") && manifest.compatibility[key] !== value)) {
+    fail("UPDATE_COMPATIBILITY", "此更新需要不同的运行组件、主机、数据库或浏览器格式；不能在线安装。");
+  }
+  if (!Array.isArray(manifest.files) || !manifest.files.length || manifest.files.length > MAX_FILES) {
+    fail("UPDATE_MANIFEST", "更新文件数量不受支持。");
+  }
+  const names = new Set();
+  let total = 0;
+  for (const file of manifest.files) {
+    if (!file || typeof file !== "object") fail("UPDATE_MANIFEST", "更新文件清单无效。");
+    const parts = payloadPath(file.path, bundle);
+    const key = file.path.toLowerCase();
+    if (names.has(key) || !Number.isSafeInteger(file.bytes) || file.bytes < 0 || file.bytes > (bundle ? MAX_FILE_BYTES : 16 * 1024 * 1024) ||
+        !/^[a-f0-9]{64}$/.test(file.sha256 || "")) fail("UPDATE_MANIFEST", "更新清单存在重复、过大或无校验值的文件。");
+    names.add(key);
+    total += file.bytes;
+    for (let index = 1; index < parts.length; index++) {
+      if (names.has(parts.slice(0, index).join("/").toLowerCase())) fail("UPDATE_PATH", "更新清单存在文件与目录冲突。");
+    }
+  }
+  for (const name of names) {
+    const parts = name.split("/");
+    for (let index = 1; index < parts.length; index++) {
+      if (names.has(parts.slice(0, index).join("/"))) fail("UPDATE_PATH", "更新清单存在文件与目录冲突。");
+    }
+  }
+  for (const required of ["package.json", "server/index.cjs", "server/store.cjs", "public/index.html", "shared/api-contract.json"]) {
+    if (!names.has(required)) fail("UPDATE_MANIFEST", "更新不是完整业务程序，不能安装。");
+  }
+  if (bundle) for (const required of REQUIRED_BUNDLE_FILES) if (!names.has(required.toLowerCase())) fail("UPDATE_MANIFEST", "整程序更新缺少运行组件、电脑端或安全交接组件。");
+  if (total > (bundle ? MAX_TOTAL_BYTES : 64 * 1024 * 1024)) fail("UPDATE_SIZE", "更新程序总大小超过当前允许范围。");
+  return manifest;
+}
+
+function decodeBase64(value, maximum) {
+  if (typeof value !== "string" || value.length > Math.ceil(maximum / 3) * 4 ||
+      !/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(value)) {
+    fail("UPDATE_SIGNATURE", "更新签名封装无效。");
+  }
+  return Buffer.from(value, "base64");
+}
+
+function verifyEnvelope(envelope, trustedKeys, compatibility = compatibilityFor()) {
+  if (!envelope || envelope.format !== "industrial-rent-signed-update" || envelope.formatVersion !== 1 ||
+      typeof envelope.keyId !== "string" || !Object.hasOwn(trustedKeys, envelope.keyId)) {
+    fail("UPDATE_SIGNATURE", "更新未由本机预先信任的发布密钥签名。");
+  }
+  const bytes = decodeBase64(envelope.payload, MAX_MANIFEST_BYTES);
+  const signature = decodeBase64(envelope.signature, 64);
+  if (signature.length !== 64 || !crypto.verify(null, bytes, trustedKeys[envelope.keyId], signature)) {
+    fail("UPDATE_SIGNATURE", "更新发布签名校验失败。");
+  }
+  let manifest;
+  try { manifest = JSON.parse(bytes.toString("utf8")); }
+  catch { fail("UPDATE_MANIFEST", "已签名的更新清单不是有效 JSON。"); }
+  validateManifest(manifest, false, compatibility);
+  return { releaseId: digest(bytes), manifest, envelope };
+}
+
+module.exports = {
+  MAX_FILES, MAX_FILE_BYTES, MAX_TOTAL_BYTES, MAX_MANIFEST_BYTES, COMPATIBILITY, compatibilityFor,
+  fail, digest, hashFile, regularFile, syncDirectory, ensureDirectory, assertDirectory, writeFile, writeJSON, readJSON,
+  sameOrInside, versionParts, compareVersions, payloadPath, validateManifest, decodeBase64, verifyEnvelope,
+};

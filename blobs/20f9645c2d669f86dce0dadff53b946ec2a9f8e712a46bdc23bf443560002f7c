@@ -1,0 +1,96 @@
+(function (root, factory) {
+  "use strict";
+  if (typeof module === "object" && module.exports) module.exports = factory(require("./ui.js"));
+  else root.RentPushPanel = factory(root.RentUI);
+})(globalThis, function (UI) {
+  "use strict";
+
+  const { html, button, heading, note, empty, table, cell } = UI;
+  const names = { jpush: "安卓客户端", webpush: "浏览器 / iOS 桌面入口" };
+  const time = value => value ? new Date(value).toLocaleString("zh-CN") : "暂无";
+  function eligible(user) {
+    return user?.active === true && user.receiveReminders === true &&
+      user.roles.some(role => ["operator", "reviewer", "viewer"].includes(role));
+  }
+  function availability({ status, user, capabilities, native, online }) {
+    if (!online) return "需要在线登录主机，才能核对或更改设备通知。";
+    if (!status) return "尚未取得主机的通知配置，不能判断是否可用。";
+    if (status.paused) return "主机正在维护，暂不接受设备绑定或测试。";
+    if (!eligible(user)) return "当前账号尚无业务提醒授权，请由管理员核对业务角色和提醒接收权限。";
+    if (native) return status.channels?.jpush?.configured
+      ? "安卓主机通道已配置，请在客户端自带的通知设置中授权并验证设备。"
+      : "安卓推送通道尚未配置。安装 APK 本身不代表能收到后台提醒。";
+    if (!status.channels?.webpush?.configured) return "主机的浏览器后台通知通道尚未配置，请联系部署负责人。";
+    if (!capabilities.secure) return "当前网址不是安全连接，请使用管理员提供的 HTTPS 网址。";
+    if (capabilities.requiresHomeScreen) return "iPhone / iPad 请先用 Safari 添加到主屏幕，再从桌面图标打开。需要 iOS / iPadOS 16.4 或更新系统。";
+    if (!capabilities.supported) return "这个浏览器不支持标准后台通知；安卓请使用本系统的安卓客户端。";
+    if (capabilities.permission === "denied") return "系统已禁止这个入口的通知，请到系统或浏览器设置中重新允许。";
+    return "";
+  }
+
+  function render({ state = {}, user, capabilities, native = false, online, installationId = "" }) {
+    const status = state.value;
+    const blocked = availability({ status, user, capabilities, native, online });
+    const disabled = !online || state.loading || state.busy || status?.paused ? "disabled" : "";
+    const devices = status?.devices;
+    const current = devices?.find(device => device.status === "active" &&
+      device.installationId === installationId && device.channel === (native ? "jpush" : "webpush"));
+    const enabled = Boolean(current);
+    const enableDisabled = blocked || state.busy || state.loading ? "disabled" : "";
+    const devicesContent = !Array.isArray(devices) ? note("尚未取得设备清单，不能把未知状态当作没有绑定设备。", "warning") :
+      devices.length ? table(["设备", "状态", "最近通道接受", "设备回执", "用户打开", "操作"], devices.map(device => {
+        const active = device.status === "active";
+        const channelReady = status.channels?.[device.channel]?.configured === true;
+        return `<tr><td><strong>${html(device.label)}</strong><small class="cell-note">${html(names[device.channel] || "未知通道")}${device.installationId === installationId ? " · 当前设备" : ""}</small></td>
+          ${cell(active ? "已绑定" : "已停用")}${cell(time(device.lastAcceptedAt))}${cell(time(device.lastReceivedAt))}${cell(time(device.lastOpenedAt))}
+          <td class="button-row">${active ? `${button("测试通知", "push-test", `data-id="${html(device.id)}" ${disabled || !channelReady || !eligible(user) ? "disabled" : ""}`, "small")}
+            ${button("停用", "push-revoke", `data-id="${html(device.id)}" ${disabled}`, "small")}` : "—"}</td></tr>`;
+      })) : empty("还没有绑定通知设备", "开启通知后，需要这台设备真正收到验证消息并完成确认，才会出现在清单中。");
+    return `${heading("通知设置", "推送只显示通用待办提示；租户、金额和合同详情登录后才可查看。",
+      button("刷新设备状态", "push-refresh", disabled))}
+      ${state.error ? note(state.error, "danger") : ""}
+      ${!online ? note("当前显示的旧信息不是实时投递状态。联网后点击“刷新设备状态”。", "warning") : ""}
+      <section class="card card-pad">
+        <h2>${native ? "安卓后台通知" : "这台设备的后台通知"}</h2>
+        ${state.loading ? note("正在向主机核对通知配置和设备状态。") : ""}
+        ${blocked ? note(blocked, "warning") : note(enabled ? "主机已确认这台设备的绑定；仍需通过实际测试核对系统通知权限。" : "主机和浏览器具备开启条件。请先阅读并同意下方说明。")}
+        ${state.busy ? `${note(state.busy)}${button("取消等待", "push-cancel", "", "small")}` : ""}
+        ${native ? `<p class="hint">使用安卓客户端自带的通知设置。厂商推送通道、系统权限、省电和强制停止状态仍会影响到达，不能只看“已绑定”。</p>` : `
+          <label class="push-consent"><input id="push-consent" type="checkbox" ${enableDisabled}>我同意使用设备推送服务。服务商会处理设备标识和通用提示，不接收租户、金额或合同内容。</label>
+          <div class="button-row top-gap">${button(enabled ? "重新验证本设备" : "开启并验证本设备", "push-enable", enableDisabled, "primary")}
+            ${button("关闭本设备浏览器通知", "push-disable", `${disabled || !capabilities.supported ? "disabled" : ""}`)}
+            <button type="button" class="button" data-mobile-action="install-help">桌面入口说明</button></div>`}
+        <p class="hint top-gap">开启时请保持此页打开，设备验证最多等待 5 分钟；取消不会删除业务草稿。手机关机、断网或被系统强制停止时不能保证即时到达。</p>
+      </section>
+      <section class="card top-gap"><div class="card-header"><div><h2>我绑定的设备</h2><p>仅显示自己的设备；未知状态不会显示为送达成功。</p></div></div>
+        ${devicesContent}<div class="card-pad"><p class="hint">“通道接受”只是服务商接单，不等于手机收到。“设备回执”和“用户打开”也不代表业务提醒已读；站内提醒仍单独确认。</p>
+        ${state.readAt ? `<p class="hint">状态读取时间：${html(time(state.readAt))}</p>` : ""}</div></section>`;
+  }
+
+  function renderAdmin(summary) {
+    if (!summary) return `<h3>后台通知</h3>${note("尚未取得主机通知状态，不能判断是否已配置。", "warning")}`;
+    const labels = { pending: "等待发送", retry: "等待重试", sending: "正在提交", "provider-accepted": "通道已接受",
+      received: "已有设备回执", opened: "用户已打开", expired: "已过期", failed: "失败或结果不明", revoked: "已撤销" };
+    const number = value => Number.isSafeInteger(value) && value >= 0 ? value.toLocaleString("zh-CN") : "未知";
+    const readiness = summary.channels || {};
+    const deliveries = Array.isArray(summary.deliveries) ? summary.deliveries : [];
+    const failures = Array.isArray(summary.failures) ? summary.failures : [];
+    return `<h3>后台通知</h3><p class="hint">这里只显示主机通道和统计，不显示设备推送标识、订阅地址或密钥。</p>
+      <p>安卓通道：<strong>${readiness.jpush?.configured ? "已配置" : "未配置"}</strong>
+        · 浏览器 / iOS：<strong>${readiness.webpush?.configured ? "已配置" : "未配置"}</strong></p>
+      ${!readiness.jpush?.vendorChannelsConfigured ? note("安卓厂商通道尚未声明配置完成。基础连接和 APK 安装不等于所有品牌手机后台都能到达。", "warning") : ""}
+      ${summary.paused ? note("主机通知任务已暂停。", "warning") : ""}
+      ${summary.workerError ? note(summary.workerError.code === "PUSH_CAPACITY" ?
+        "通知记录已达到安全上限，新提醒推送暂缓。请维护人员处理；不会通过清空去重记录来冒险重复发送。" :
+        "后台通知任务暂未完成，请维护人员检查主机状态；当前不能宣称消息已经送达。", "danger") : ""}
+      <p class="hint">通道接受记录 ${number(summary.evidence?.providerAccepted)}
+        · 设备接收回执 ${number(summary.evidence?.received)} · 用户打开回执 ${number(summary.evidence?.opened)}。不是业务已读统计。</p>
+      ${deliveries.length ? table(["投递状态", "数量"], deliveries.map(row => `<tr>${cell(labels[row.status] || "未知状态")}${cell(number(row.count))}</tr>`)) :
+        note("尚无投递记录；不代表通知已经到达。")}
+      ${failures.length ? `<h4 class="section-title">近期失败分类</h4>${table(["通道", "错误代码", "数量"], failures.map(row =>
+        `<tr>${cell(names[row.channel] || "未知通道")}${cell(row.code)}${cell(number(row.count))}</tr>`))}` : ""}
+      <p class="hint">后台推送不作必达保证。凭据和厂商资质由部署负责人在受控主机配置，不在此页面输入。</p>`;
+  }
+
+  return Object.freeze({ render, renderAdmin, availability, eligible });
+});

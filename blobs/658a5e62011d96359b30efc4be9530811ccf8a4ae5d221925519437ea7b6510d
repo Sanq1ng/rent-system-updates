@@ -1,0 +1,125 @@
+"use strict";
+
+const https = require("node:https");
+const dns = require("node:dns");
+const net = require("node:net");
+const crypto = require("node:crypto");
+const { fail } = require("./files.cjs");
+
+function resolveUpdateConfig(settings) {
+  if (settings === undefined || settings === null) settings = {};
+  if (typeof settings !== "object" || Array.isArray(settings)) fail("UPDATE_CONFIG", "更新配置必须是对象。");
+  const feedUrl = settings.feedUrl ?? null;
+  const allowPrivateNetwork = settings.allowPrivateNetwork ?? false;
+  const trustedKeys = settings.trustedKeys ?? {};
+  if (typeof allowPrivateNetwork !== "boolean" || !trustedKeys || typeof trustedKeys !== "object" ||
+      Array.isArray(trustedKeys) || Object.keys(trustedKeys).length > 8) fail("UPDATE_CONFIG", "更新信任配置无效。");
+  for (const [id, pem] of Object.entries(trustedKeys)) {
+    if (!/^[A-Za-z0-9_-]{1,48}$/.test(id) || typeof pem !== "string" || pem.length > 4096 ||
+        !pem.startsWith("-----BEGIN PUBLIC KEY-----")) fail("UPDATE_CONFIG", "更新密钥必须是指定名称的 Ed25519 公钥。");
+    let key;
+    try { key = crypto.createPublicKey(pem); }
+    catch { fail("UPDATE_CONFIG", "更新发布公钥无法读取。"); }
+    if (key.asymmetricKeyType !== "ed25519") fail("UPDATE_CONFIG", "更新发布公钥必须使用 Ed25519。");
+  }
+  if (feedUrl !== null) {
+    let url;
+    try { url = new URL(feedUrl); }
+    catch { fail("UPDATE_CONFIG", "更新地址必须是完整的 HTTPS 清单地址。"); }
+    if (typeof feedUrl !== "string" || feedUrl.length > 2048 || url.protocol !== "https:" ||
+        url.username || url.password || url.hash || url.search) fail("UPDATE_CONFIG", "更新地址只允许无账号、查询参数和片段的 HTTPS 地址。");
+  }
+  return { feedUrl, trustedKeys: { ...trustedKeys }, allowPrivateNetwork };
+}
+
+function isPublicAddress(address) {
+  const kind = net.isIP(address);
+  if (kind === 4) {
+    const [a, b, c] = address.split(".").map(Number);
+    return !(a === 0 || a === 10 || a === 127 || a >= 224 ||
+      (a === 100 && b >= 64 && b <= 127) || (a === 169 && b === 254) ||
+      (a === 172 && b >= 16 && b <= 31) || (a === 192 && (b === 168 || b === 0 || (b === 88 && c === 99))) ||
+      (a === 198 && (b === 18 || b === 19 || (b === 51 && c === 100))) ||
+      (a === 203 && b === 0 && c === 113));
+  }
+  if (kind !== 6) return false;
+  const publicRange = new net.BlockList();
+  publicRange.addSubnet("2000::", 3, "ipv6");
+  const reserved = new net.BlockList();
+  reserved.addSubnet("2001::", 23, "ipv6");
+  reserved.addSubnet("2001:db8::", 32, "ipv6");
+  reserved.addSubnet("2002::", 16, "ipv6");
+  return publicRange.check(address, "ipv6") && !reserved.check(address, "ipv6");
+}
+
+function createTransport(config) {
+  return async function download(urlValue, { maxBytes, signal }) {
+    const url = new URL(urlValue);
+    const feed = new URL(config.feedUrl);
+    if (url.protocol !== "https:" || url.origin !== feed.origin || url.username || url.password || url.search || url.hash) {
+      fail("UPDATE_NETWORK", "更新下载地址不属于配置的 HTTPS 来源。");
+    }
+    const hostname = url.hostname.replace(/^\[|\]$/g, "");
+    if (net.isIP(hostname) && !config.allowPrivateNetwork && !isPublicAddress(hostname)) {
+      fail("UPDATE_NETWORK", "更新源指向内网或特殊地址；仅可由部署人员明确允许受信任内网源。");
+    }
+    const combined = AbortSignal.any([...(signal ? [signal] : []), AbortSignal.timeout(maxBytes > 16 * 1024 * 1024 ? 300_000 : 20_000)]);
+    const lookup = (name, options, callback) => {
+      dns.lookup(name, { all: true }, (error, entries) => {
+        if (error) { callback(error); return; }
+        if (!entries.length || (!config.allowPrivateNetwork && entries.some(entry => !isPublicAddress(entry.address)))) {
+          const rejected = new Error("更新源解析到了不允许的网络地址。");
+          rejected.code = "UPDATE_NETWORK";
+          callback(rejected);
+          return;
+        }
+        if (options.all) callback(null, entries);
+        else callback(null, entries[0].address, entries[0].family);
+      });
+    };
+    return new Promise((resolve, reject) => {
+      const request = https.get(url, {
+        signal: combined, lookup, agent: false, maxHeaderSize: 16384,
+        headers: { Accept: "application/octet-stream, application/json", "Accept-Encoding": "identity" },
+      }, response => {
+        const length = response.headers["content-length"];
+        if (response.statusCode !== 200 || (response.headers["content-encoding"] && response.headers["content-encoding"] !== "identity") ||
+            (length !== undefined && (!/^\d+$/.test(length) || Number(length) > maxBytes))) {
+          response.destroy();
+          const error = new Error("更新下载被拒绝：必须直接返回未压缩的完整文件，不支持重定向或超大响应。");
+          error.code = "UPDATE_DOWNLOAD";
+          reject(error);
+          return;
+        }
+        const chunks = [];
+        let bytes = 0;
+        response.on("data", chunk => {
+          bytes += chunk.length;
+          if (bytes > maxBytes) {
+            const error = new Error("更新下载超过大小限制。");
+            error.code = "UPDATE_SIZE";
+            response.destroy(error);
+          } else chunks.push(chunk);
+        });
+        response.once("error", reject);
+        response.once("end", () => {
+          if (length !== undefined && bytes !== Number(length)) {
+            const error = new Error("更新文件下载不完整。");
+            error.code = "UPDATE_DOWNLOAD";
+            reject(error);
+          } else resolve(Buffer.concat(chunks, bytes));
+        });
+      });
+      request.once("socket", socket => socket.once("secureConnect", () => {
+        if (!config.allowPrivateNetwork && !isPublicAddress(socket.remoteAddress || "")) {
+          const error = new Error("更新连接的实际地址不受允许。");
+          error.code = "UPDATE_NETWORK";
+          request.destroy(error);
+        }
+      }));
+      request.once("error", reject);
+    });
+  };
+}
+
+module.exports = { resolveUpdateConfig, isPublicAddress, createTransport };

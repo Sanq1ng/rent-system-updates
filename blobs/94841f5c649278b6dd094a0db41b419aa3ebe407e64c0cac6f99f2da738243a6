@@ -1,0 +1,276 @@
+"use strict";
+
+const fs = require("node:fs");
+const path = require("node:path");
+const crypto = require("node:crypto");
+const { DatabaseSync } = require("node:sqlite");
+const { UUID, readRecord, newDirectory, normalizeOrigin } = require("./layout.cjs");
+const { assertDirectory, regularFile, sameOrInside, writeFile, versionParts } = require("../updates/files.cjs");
+const { SCHEMA_VERSION, assertSupportedSchema, migrateSchema } = require("../server/push-schema.cjs");
+
+const FORMAT = "industrial-rent-migration";
+const RECORD = "migration.json";
+const BACKUP = "ledger-backup";
+const UPGRADE_REPORT_FORMAT = "industrial-rent-schema-upgrade";
+
+function fail(message) {
+  const error = new Error(message);
+  error.code = "MIGRATION";
+  throw error;
+}
+
+function identity(db) {
+  const schemaVersion = db.prepare("PRAGMA user_version").get().user_version;
+  if (!Number.isInteger(schemaVersion) || schemaVersion < 1 || schemaVersion > SCHEMA_VERSION) {
+    fail("账本格式不受当前迁移工具支持，不能降级或猜测恢复。");
+  }
+  assertSupportedSchema(db, schemaVersion);
+  if (!db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='meta'").get()) {
+    fail("账本缺少身份记录，不能当作可迁移的正式账本。");
+  }
+  const serverId = db.prepare("SELECT value FROM meta WHERE key='server_id'").get()?.value;
+  if (!UUID.test(serverId || "")) fail("账套标识无效，不能在迁移时自动生成新标识。");
+  return { serverId, schemaVersion };
+}
+
+function fileIdentity(directory) {
+  const database = path.join(directory, "rent.sqlite");
+  regularFile(database);
+  const db = new DatabaseSync(path.toNamespacedPath(database), { readOnly: true });
+  try { return identity(db); } finally { db.close(); }
+}
+
+function confirmations(options) {
+  if (options["offline-work"] !== "confirmed" || options["source-stopped"] !== "confirmed") {
+    fail("请先确认各设备已同步或导出本机工作，并停止旧主机。须明确提供 --offline-work confirmed --source-stopped confirmed；工具不会替您确认其他设备。");
+  }
+}
+
+async function upgradeSchema(db, config, options, backupTools, admission = () => {}) {
+  confirmations(options);
+  if (db.isTransaction) fail("格式升级不能在其他账本事务中执行。");
+  const source = identity(db);
+  if (config.lan && source.serverId !== config.lan.serverId) {
+    fail("原账本与局域网配置的账套身份不一致，不能通过格式升级替换账套。");
+  }
+  const usersBefore = db.prepare("SELECT COUNT(*) AS n FROM users").get().n;
+  const invitationsBefore = source.schemaVersion >= 5 ?
+    db.prepare("SELECT COUNT(*) AS n FROM account_invitations").get().n : 0;
+  if (!usersBefore) fail("格式升级仅适用于已初始化的原账本，不会新建空账或账号。");
+  const report = (migrated, backup) => {
+    const after = identity(db);
+    const usersAfter = db.prepare("SELECT COUNT(*) AS n FROM users").get().n;
+    const invitationsAfter = db.prepare("SELECT COUNT(*) AS n FROM account_invitations").get().n;
+    if (after.serverId !== source.serverId || usersAfter !== usersBefore || invitationsAfter !== invitationsBefore) {
+      fail("升级后账套身份或账号、邀请数量不符；请保留原账本与完整备份，不要启动主机。");
+    }
+    return { format: UPGRADE_REPORT_FORMAT, formatVersion: 1, ...migrated,
+      beforeSchema: source.schemaVersion, afterSchema: after.schemaVersion,
+      serverId: source.serverId, dataDir: path.resolve(config.dataDir), identityPreserved: true,
+      users: { before: usersBefore, after: usersAfter, changed: migrated.employeeParkPolicy.employees },
+      invitations: { before: invitationsBefore, after: invitationsAfter, revoked: migrated.employeeParkPolicy.invitations },
+      sessionsInvalidated: migrated.employeeParkPolicy.sessions, backup,
+      configurationChanged: false, targetAutoActivated: false };
+  };
+  if (source.schemaVersion === SCHEMA_VERSION) {
+    admission();
+    return report(migrateSchema(db), null);
+  }
+  const dataVersion = db.prepare("PRAGMA data_version").get().data_version;
+  const backup = await backupTools.createBackup(db, config, options.to ? newDirectory(options.to) : undefined);
+  const verified = await backupTools.verifyBackup(backup.path);
+  const sealed = fileIdentity(backup.path);
+  if (sealed.serverId !== source.serverId || sealed.schemaVersion !== source.schemaVersion ||
+      verified.manifest.schemaVersion !== source.schemaVersion ||
+      !/^[a-f0-9]{64}$/.test(verified.manifestSha256 || "") ||
+      db.prepare("PRAGMA data_version").get().data_version !== dataVersion) {
+    fail("升级前备份与原账本身份、格式或状态不一致，未执行格式升级。请确认旧主机已停止。");
+  }
+  admission();
+  const migrated = migrateSchema(db, Date.now(), dataVersion);
+  return { ...report(migrated, { path: backup.path, schemaVersion: source.schemaVersion, manifestSha256: verified.manifestSha256 }),
+    next: "保留升级前完整备份，以原配置重启匹配版本的主机；受影响员工重新登录。旧待用邀请已撤销，须由管理员重新签发。" };
+}
+
+async function upgradeFromConfig(options) {
+  if (!options || typeof options !== "object" || Array.isArray(options) ||
+      Object.keys(options).some(key => !["config", "to", "offline-work", "source-stopped"].includes(key)) ||
+      typeof options.config !== "string" || !options.config.trim() ||
+      options.to !== undefined && (typeof options.to !== "string" || !options.to.trim())) {
+    fail("格式升级必须明确指定 --config 原配置文件；不接受其他入口或隐式新账本。");
+  }
+  confirmations(options);
+  const { resolveConfig, assertRuntime } = require("../config.cjs");
+  const { acquireLock } = require("../host.cjs");
+  const { HANDOFF, loadState } = require("../updates/state.cjs");
+  const { resolveRelease, verifySlot } = require("../updates/releases.cjs");
+  assertRuntime();
+  if (process.platform === "linux" && process.getuid() === 0) {
+    fail("请通过 sudo -u industrial-rent 执行格式升级，不得以 root 创建业务账本或备份。");
+  }
+  const program = path.resolve(__dirname, ".."), configFile = path.resolve(options.config);
+  regularFile(configFile);
+  const configBytes = fs.readFileSync(configFile), config = resolveConfig(configFile);
+  const storage = config.updateDir || program;
+  if (HANDOFF.has(loadState(storage).job?.phase)) fail("程序更新交接尚未完成，不能并行升级账本格式。");
+  const selected = resolveRelease(program, storage);
+  if (selected.releaseId) await verifySlot(storage, selected.releaseId);
+  if (require(path.join(selected.root, "server", "push-schema.cjs")).SCHEMA_VERSION !== SCHEMA_VERSION) {
+    fail("已选业务程序与格式升级工具不是同一数据库版本，请先部署匹配的完整维护程序。");
+  }
+  const database = path.join(config.dataDir, "rent.sqlite");
+  regularFile(database);
+  const release = acquireLock(config.dataDir);
+  let db;
+  try {
+    const admission = () => {
+      if (!fs.readFileSync(configFile).equals(configBytes)) fail("原配置在格式升级期间发生变化，未执行升级；请重新核对配置与原账本。");
+      if (HANDOFF.has(loadState(storage).job?.phase)) fail("程序更新交接尚未完成，不能并行升级账本格式。");
+      const current = resolveRelease(program, storage);
+      if (current.root !== selected.root || current.releaseId !== selected.releaseId || current.version !== selected.version) {
+        fail("已选业务程序在格式升级期间发生变化，未执行升级。");
+      }
+    };
+    admission();
+    db = new DatabaseSync(path.toNamespacedPath(database));
+    db.exec("PRAGMA foreign_keys=ON; PRAGMA synchronous=FULL; PRAGMA busy_timeout=5000");
+    return await upgradeSchema(db, config, options, require(path.join(selected.root, "server", "backup.cjs")), admission);
+  } finally {
+    try { if (db) db.close(); } finally { release(); }
+  }
+}
+
+async function main(args = process.argv.slice(2)) {
+  if (args[0] !== "schema-upgrade" || args.length % 2 !== 1) {
+    fail("用法：deployment\\migration.cjs schema-upgrade --config 原配置.json [--to 新备份目录] --offline-work confirmed --source-stopped confirmed");
+  }
+  const options = {};
+  for (let index = 1; index < args.length; index += 2) {
+    const key = args[index].startsWith("--") ? args[index].slice(2) : "";
+    if (!["config", "to", "offline-work", "source-stopped"].includes(key) || Object.hasOwn(options, key) ||
+        !args[index + 1] || args[index + 1].startsWith("--")) {
+      fail("格式升级参数不受支持、不完整或重复。");
+    }
+    options[key] = args[index + 1];
+  }
+  return upgradeFromConfig(options);
+}
+
+async function exportMigration(db, config, destination, options, backupTools, applicationVersion) {
+  confirmations(options);
+  versionParts(applicationVersion);
+  const target = newDirectory(destination);
+  if (sameOrInside(config.dataDir, target) || sameOrInside(target, config.dataDir)) {
+    fail("迁移包必须放在业务数据目录之外，不能与原账本目录重叠。");
+  }
+  const source = { ...identity(db), platform: process.platform, exporterVersion: applicationVersion,
+    publicOrigin: normalizeOrigin(config.publicOrigin) };
+  if (!["win32", "linux"].includes(source.platform)) fail("迁移工具仅支持 Windows 和 Linux 主机。");
+  const targetOrigin = options["target-origin"] === undefined ? null : normalizeOrigin(options["target-origin"]);
+  const staging = `${target}.migration-incomplete-${crypto.randomUUID()}`;
+  fs.mkdirSync(staging, { recursive: true, mode: 0o700 });
+  const backup = await backupTools.createBackup(db, config, path.join(staging, BACKUP));
+  const sealed = fileIdentity(backup.path);
+  if (sealed.serverId !== source.serverId || sealed.schemaVersion !== source.schemaVersion) {
+    fail("导出期间的账套身份或格式发生变化，迁移包未完成。");
+  }
+  const record = {
+    format: FORMAT, formatVersion: 1, complete: true, createdAt: new Date().toISOString(), source,
+    backup: { directory: BACKUP, manifestSha256: await backupTools.hashFile(path.join(backup.path, "manifest.json")) },
+    targetOrigin, containsBusinessData: true, includesDeploymentCredentials: false,
+    includesOfflineClientWork: false, includesProgram: false,
+    cutover: { sourceMustRemainStopped: true, targetAutoActivated: false },
+  };
+  writeFile(path.join(staging, RECORD), Buffer.from(`${JSON.stringify(record, null, 2)}\n`, "utf8"));
+  fs.renameSync(staging, target);
+  return { path: target, serverId: source.serverId, schemaVersion: source.schemaVersion,
+    sourceOrigin: source.publicOrigin, targetOrigin, files: backup.fileCount,
+    containsBusinessData: true, includesDeploymentCredentials: false, includesOfflineClientWork: false,
+    sourceAutomaticallyDisabled: false, targetAutoActivated: false };
+}
+
+async function verifyMigration(directory, backupTools) {
+  const root = path.resolve(directory);
+  assertDirectory(root);
+  const record = readRecord(path.join(root, RECORD));
+  if (!record || record.format !== FORMAT || record.formatVersion !== 1 || record.complete !== true ||
+      typeof record.createdAt !== "string" || !Number.isFinite(Date.parse(record.createdAt)) ||
+      !record.source || !UUID.test(record.source.serverId || "") ||
+      !["win32", "linux"].includes(record.source.platform) ||
+      !Number.isInteger(record.source.schemaVersion) || record.source.schemaVersion < 1 ||
+      record.source.schemaVersion > SCHEMA_VERSION || record.backup?.directory !== BACKUP ||
+      !/^[a-f0-9]{64}$/.test(record.backup.manifestSha256 || "") ||
+      record.containsBusinessData !== true || record.includesDeploymentCredentials !== false ||
+      record.includesOfflineClientWork !== false || record.includesProgram !== false ||
+      record.cutover?.sourceMustRemainStopped !== true || record.cutover.targetAutoActivated !== false) {
+    fail("迁移包格式、完成状态或边界记录不受支持。");
+  }
+  versionParts(record.source.exporterVersion);
+  if (normalizeOrigin(record.source.publicOrigin) !== record.source.publicOrigin ||
+      record.targetOrigin !== null && normalizeOrigin(record.targetOrigin) !== record.targetOrigin) {
+    fail("迁移包中的访问来源地址不是规范的固定来源。");
+  }
+  const entries = fs.readdirSync(root);
+  if (entries.length !== 2 || !entries.includes(RECORD) || !entries.includes(BACKUP)) {
+    fail("迁移包包含未登记文件，不接受混入的配置、程序或凭据。");
+  }
+  const backup = path.join(root, BACKUP);
+  assertDirectory(backup);
+  if (await backupTools.hashFile(path.join(backup, "manifest.json")) !== record.backup.manifestSha256) {
+    fail("迁移包与完整备份清单不匹配，文件可能损坏或被替换。");
+  }
+  const verified = await backupTools.verifyBackup(backup);
+  if (verified.manifestSha256 !== record.backup.manifestSha256) {
+    fail("核对期间备份清单发生变化，不能继续迁移。请使用匹配版本的完整维护程序。");
+  }
+  const files = fs.readdirSync(backup);
+  if (files.length !== 3 || !["manifest.json", "rent.sqlite", "attachments"].every(name => files.includes(name))) {
+    fail("迁移备份含有清单外的配置或文件，不能携带到新主机。");
+  }
+  assertDirectory(path.join(backup, "attachments"));
+  const originals = fs.readdirSync(path.join(backup, "attachments")).sort();
+  const expectedOriginals = verified.manifest.files.filter(file => file.path.startsWith("attachments/"))
+    .map(file => file.path.slice("attachments/".length)).sort();
+  if (JSON.stringify(originals) !== JSON.stringify(expectedOriginals)) fail("迁移包包含未登记的原件文件。");
+  const actual = fileIdentity(backup);
+  if (actual.serverId !== record.source.serverId || actual.schemaVersion !== record.source.schemaVersion ||
+      verified.manifest.schemaVersion !== actual.schemaVersion) {
+    fail("迁移记录与账本身份或格式不一致。");
+  }
+  return { root, record, backup, verified };
+}
+
+async function restoreMigration(directory, destination, options, backupTools) {
+  confirmations(options);
+  if (backupTools.RESTORE_GUARD_VERSION !== 1) {
+    fail("当前业务版本不支持迁移清单绑定恢复，请使用匹配版本的完整维护程序。");
+  }
+  const targetOrigin = normalizeOrigin(options["target-origin"]);
+  const target = newDirectory(destination);
+  const checked = await verifyMigration(directory, backupTools);
+  if (sameOrInside(checked.root, target) || sameOrInside(target, checked.root)) {
+    fail("恢复目标不能与迁移包重叠。");
+  }
+  if (checked.record.targetOrigin !== null && checked.record.targetOrigin !== targetOrigin) {
+    fail("恢复地址与导出时确认的目标来源不一致。请重新核对迁移计划，不能静默更换地址。");
+  }
+  const restored = await backupTools.restoreBackup(checked.backup, target,
+    { expectedManifestSha256: checked.record.backup.manifestSha256 });
+  return { ...restored, serverId: checked.record.source.serverId, targetOrigin,
+    originChanges: targetOrigin !== checked.record.source.publicOrigin,
+    sessionsInvalidated: true, pushBindingsInvalidated: true, invitationsInvalidated: true,
+    configurationChanged: false, targetAutoActivated: false,
+    next: `${checked.record.source.schemaVersion < SCHEMA_VERSION ?
+      "恢复保留了旧格式；启用入口前须使用 deployment\\migration.cjs schema-upgrade 维护命令备份并升级。旧待用邀请已撤销，须重新签发。" : ""}` +
+      "先为新主机单独配置此数据目录、固定访问地址及部署凭据；保持旧主机停止。所有人重新登录，需要时导入原账号的加密本机工作并重新绑定通知。" };
+}
+
+if (require.main === module) {
+  main().then(result => console.log(JSON.stringify(result, null, 2)), error => {
+    console.error(`格式升级未完成：${error.message}`);
+    process.exitCode = 1;
+  });
+}
+
+module.exports = { FORMAT, RECORD, BACKUP, UPGRADE_REPORT_FORMAT, identity, upgradeSchema, upgradeFromConfig, main,
+  exportMigration, verifyMigration, restoreMigration };

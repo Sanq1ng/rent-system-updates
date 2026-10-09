@@ -1,0 +1,8 @@
+{
+  "format": "industrial-rent-update-trust",
+  "formatVersion": 1,
+  "feedUrl": "https://sanq1ng.github.io/rent-system-updates/manifest.json",
+  "trustedKeys": {
+    "publisher-1": "-----BEGIN PUBLIC KEY-----\nMCowBQYDK2VwAyEAm0H6IJFTzsMy1k1dJOJ2vQQaoegwA5iVIDmlFiMwy04=\n-----END PUBLIC KEY-----\n"
+  }
+}

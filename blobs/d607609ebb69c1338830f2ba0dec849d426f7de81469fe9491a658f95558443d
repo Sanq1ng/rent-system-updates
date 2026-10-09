@@ -1,0 +1,39 @@
+(function (root, factory) {
+  "use strict";
+  if (typeof module === "object" && module.exports) module.exports = factory();
+  else root.RentUI = factory();
+})(globalThis, function () {
+  "use strict";
+
+  const html = value => String(value ?? "").replace(/[&<>"']/g, char =>
+    ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[char]);
+  const money = cents => cents == null ? "待确认" :
+    (cents / 100).toLocaleString("zh-CN", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+  const yuan = cents => String((cents || 0) / 100);
+  const button = (text, action, more = "", cls = "") =>
+    `<button type="button" class="button ${cls}" data-action="${action}" ${more}>${html(text)}</button>`;
+  const link = (text, action, more = "") =>
+    `<button type="button" class="text-button" data-action="${action}" ${more}>${html(text)} →</button>`;
+  const note = (text, tone = "") => `<div class="notice ${tone}">${html(text)}</div>`;
+  const field = (label, name, value = "", type = "text", attrs = "") =>
+    `<div class="field"><label for="${html(name)}">${html(label)}</label><input id="${html(name)}" name="${html(name)}" type="${type}" value="${html(value)}" ${attrs}></div>`;
+  const select = (label, name, values, current, attrs = "") =>
+    `<div class="field"><label for="${html(name)}">${html(label)}</label><select id="${html(name)}" name="${html(name)}" ${attrs}>${values.map(([key, title]) =>
+      `<option value="${html(key)}" ${String(key) === String(current) ? "selected" : ""}>${html(title)}</option>`).join("")}</select></div>`;
+  const heading = (title, subtitle, actions = "") =>
+    `<div class="page-heading"><div><h1>${html(title)}</h1><p>${html(subtitle)}</p></div><div class="heading-actions">${actions}</div></div>`;
+  const empty = (title, hint) => `<div class="empty-state"><h3>${html(title)}</h3><p>${html(hint)}</p></div>`;
+  const table = (heads, rows) => rows.length
+    ? `<div class="table-wrap" tabindex="0" role="region" aria-label="${html(heads.join("、"))}表格，可左右滑动"><table><thead><tr>${heads.map(h => `<th>${html(h)}</th>`).join("")}</tr></thead><tbody>${rows.join("")}</tbody></table></div>`
+    : empty("暂无符合条件的记录", "请切换月份或筛选条件。");
+  const cell = value => `<td>${html(value)}</td>`;
+
+  function passwordField(label, name, attrs = "") {
+    return `<div class="field full"><label for="${html(name)}">${html(label)}</label>
+      <div class="password-input"><input id="${html(name)}" name="${html(name)}" type="password" ${attrs}>
+        <button type="button" class="password-toggle" data-action="toggle-password" data-target="${html(name)}"
+          aria-label="显示${html(label)}" aria-pressed="false">显示</button></div></div>`;
+  }
+
+  return Object.freeze({ html, money, yuan, button, link, note, field, select, heading, empty, table, cell, passwordField });
+});

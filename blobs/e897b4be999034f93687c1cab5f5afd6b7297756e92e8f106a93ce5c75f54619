@@ -1,0 +1,149 @@
+using System;
+using System.Drawing;
+using System.Drawing.Drawing2D;
+using System.Windows.Forms;
+
+namespace RentCentre.Desktop
+{
+    internal static class Theme
+    {
+        public static readonly Color Background = Color.FromArgb(244, 246, 248);
+        public static readonly Color Ink = Color.FromArgb(37, 55, 70);
+        public static readonly Color Muted = Color.FromArgb(104, 121, 137);
+        public static readonly Color Line = Color.FromArgb(230, 235, 239);
+        public static readonly Color Teal = Color.FromArgb(25, 123, 112);
+        public static readonly Color TealSoft = Color.FromArgb(234, 245, 241);
+        public static readonly Color Navy = Color.FromArgb(21, 45, 59);
+        public static readonly Color Amber = Color.FromArgb(168, 103, 16);
+        public static readonly Color Red = Color.FromArgb(184, 78, 72);
+
+        public static GraphicsPath Rounded(Rectangle bounds, int radius)
+        {
+            var path = new GraphicsPath();
+            int diameter = Math.Min(radius * 2, Math.Min(bounds.Width, bounds.Height));
+            path.AddArc(bounds.X, bounds.Y, diameter, diameter, 180, 90);
+            path.AddArc(bounds.Right - diameter, bounds.Y, diameter, diameter, 270, 90);
+            path.AddArc(bounds.Right - diameter, bounds.Bottom - diameter, diameter, diameter, 0, 90);
+            path.AddArc(bounds.X, bounds.Bottom - diameter, diameter, diameter, 90, 90);
+            path.CloseFigure();
+            return path;
+        }
+
+        public static Label Label(string text, float size, Color color, bool bold)
+        {
+            return new Label {
+                Text = text, AutoSize = false, ForeColor = color, BackColor = Color.Transparent,
+                Font = new Font("Microsoft YaHei UI", size, bold ? FontStyle.Bold : FontStyle.Regular),
+                TextAlign = ContentAlignment.MiddleLeft, AutoEllipsis = true, UseMnemonic = false
+            };
+        }
+    }
+
+    internal sealed class Surface : Panel
+    {
+        public Color Fill = Color.White;
+        public Surface()
+        {
+            DoubleBuffered = true;
+            BackColor = Theme.Background;
+            Padding = new Padding(20);
+        }
+        protected override void OnPaint(PaintEventArgs e)
+        {
+            base.OnPaint(e);
+            e.Graphics.SmoothingMode = SmoothingMode.AntiAlias;
+            var bounds = new Rectangle(0, 0, Math.Max(1, Width - 1), Math.Max(1, Height - 1));
+            using (var shape = Theme.Rounded(bounds, 14))
+            using (var fill = new SolidBrush(Fill))
+            using (var border = new Pen(Theme.Line))
+            {
+                e.Graphics.FillPath(fill, shape);
+                e.Graphics.DrawPath(border, shape);
+            }
+        }
+    }
+
+    internal sealed class Sidebar : Panel
+    {
+        public Sidebar() { DoubleBuffered = true; }
+        protected override void OnPaintBackground(PaintEventArgs e)
+        {
+            using (var fill = new LinearGradientBrush(ClientRectangle, Color.FromArgb(25, 57, 71), Theme.Navy, 75f))
+                e.Graphics.FillRectangle(fill, ClientRectangle);
+        }
+    }
+
+    internal sealed class ActionButton : Button
+    {
+        public bool Primary;
+        public bool Dark;
+        private bool hovered;
+        private bool pressed;
+        public ActionButton(string text, string name, bool primary)
+        {
+            Text = text;
+            Name = name;
+            AccessibleName = text;
+            Primary = primary;
+            FlatStyle = FlatStyle.Flat;
+            FlatAppearance.BorderSize = 0;
+            Cursor = Cursors.Hand;
+            Size = new Size(100, 38);
+            Margin = new Padding(0, 0, 10, 0);
+            Font = new Font("Microsoft YaHei UI", 9.5f, FontStyle.Regular);
+            SetStyle(ControlStyles.UserPaint | ControlStyles.AllPaintingInWmPaint |
+                ControlStyles.OptimizedDoubleBuffer | ControlStyles.ResizeRedraw, true);
+        }
+        protected override void OnMouseEnter(EventArgs e) { hovered = true; Invalidate(); base.OnMouseEnter(e); }
+        protected override void OnMouseLeave(EventArgs e) { hovered = false; pressed = false; Invalidate(); base.OnMouseLeave(e); }
+        protected override void OnMouseDown(MouseEventArgs e) { pressed = true; Invalidate(); base.OnMouseDown(e); }
+        protected override void OnMouseUp(MouseEventArgs e) { pressed = false; Invalidate(); base.OnMouseUp(e); }
+        protected override void OnEnabledChanged(EventArgs e) { Invalidate(); base.OnEnabledChanged(e); }
+        protected override void OnPaint(PaintEventArgs e)
+        {
+            e.Graphics.Clear(Dark ? Theme.Navy : Parent == null ? Color.White : Parent.BackColor);
+            e.Graphics.SmoothingMode = SmoothingMode.AntiAlias;
+            Color fill = Primary ? Theme.Teal : Dark ? Color.FromArgb(35, 65, 76) : Color.White;
+            Color ink = Primary || Dark ? Color.White : Theme.Ink;
+            if (!Enabled) { fill = Dark ? Color.FromArgb(31, 54, 65) : Color.FromArgb(241, 244, 245); ink = Theme.Muted; }
+            else if (pressed) fill = Primary ? Color.FromArgb(16, 93, 85) : Theme.TealSoft;
+            else if (hovered) fill = Primary ? Color.FromArgb(22, 109, 100) : Dark ? Color.FromArgb(48, 86, 95) : Theme.TealSoft;
+            using (var shape = Theme.Rounded(new Rectangle(0, 0, Math.Max(1, Width - 1), Math.Max(1, Height - 1)), 8))
+            using (var brush = new SolidBrush(fill))
+            using (var pen = new Pen(Primary || Dark ? fill : Theme.Line))
+            {
+                e.Graphics.FillPath(brush, shape);
+                e.Graphics.DrawPath(pen, shape);
+            }
+            TextRenderer.DrawText(e.Graphics, Text, Font, ClientRectangle, ink,
+                TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.EndEllipsis);
+            if (Focused && ShowFocusCues) ControlPaint.DrawFocusRectangle(e.Graphics, Rectangle.Inflate(ClientRectangle, -5, -5), ink, fill);
+        }
+    }
+
+    internal sealed class BrandMark : Control
+    {
+        public BrandMark()
+        {
+            DoubleBuffered = true;
+            SetStyle(ControlStyles.SupportsTransparentBackColor, true);
+            BackColor = Color.Transparent;
+            Size = new Size(44, 48);
+        }
+        protected override void OnPaint(PaintEventArgs e)
+        {
+            e.Graphics.SmoothingMode = SmoothingMode.AntiAlias;
+            float sx = Width / 44f, sy = Height / 48f;
+            e.Graphics.ScaleTransform(sx, sy);
+            using (var shape = Theme.Rounded(new Rectangle(0, 0, 43, 47), 12))
+            using (var fill = new LinearGradientBrush(new Rectangle(0, 0, 44, 48), Color.FromArgb(102, 178, 161), Color.FromArgb(33, 139, 127), 50f))
+            using (var line = new Pen(Color.White, 1.8f))
+            {
+                e.Graphics.FillPath(fill, shape);
+                e.Graphics.DrawRectangle(line, 11, 12, 15, 25);
+                e.Graphics.DrawLines(line, new Point[] { new Point(26, 21), new Point(33, 21), new Point(33, 37), new Point(9, 37) });
+                for (int y = 17; y < 30; y += 6) { e.Graphics.DrawLine(line, 16, y, 21, y); }
+            }
+        }
+    }
+}

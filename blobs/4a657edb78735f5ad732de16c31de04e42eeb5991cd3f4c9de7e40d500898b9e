@@ -1,0 +1,574 @@
+"use strict";
+
+const crypto = require("node:crypto");
+const { PushError, requirePush, object, uuid, base64url, enrollmentInput, sha, registrationHash, sameHash,
+  REMINDER, TEST } = require("./push-validation.cjs");
+const { ProviderError, createTransports, REQUEST_TIMEOUT_MS } = require("./push-transports.cjs");
+
+const LIMITS = Object.freeze({
+  devicesPerUser: 8, devices: 4096, enrollments: 20000, deliveries: 20000,
+  enrollmentsPerHour: 6, registrationsPerHour: 3, testsPerHour: 6,
+  enrollmentMs: 5 * 60_000, deliveryMs: 24 * 3600_000, retentionMs: 30 * 24 * 3600_000,
+  attempts: 4, confirmAttempts: 5, concurrency: 4, batch: 8,
+});
+const iso = value => value === null || value === undefined ? null : new Date(value).toISOString();
+const resultForEnrollment = row => ({ id: row.id, status: "pending", expiresAt: iso(row.expires_at) });
+const safeDevice = row => ({
+  id: row.id, installationId: row.installation_id, channel: row.channel, label: row.label, status: row.status,
+  createdAt: iso(row.created_at), updatedAt: iso(row.updated_at), lastAcceptedAt: iso(row.last_accepted_at),
+  lastReceivedAt: iso(row.last_received_at), lastOpenedAt: iso(row.last_opened_at), revokedAt: iso(row.revoked_at),
+});
+
+function createPushService({ store, config = {}, publicOrigin, resolveUser = id => store.read("users", id),
+  listNotifications, resolveNotification, isWritable = () => true, clock = Date.now,
+  transports = createTransports(config, publicOrigin, { clock }), transportTimeoutMs = REQUEST_TIMEOUT_MS }) {
+  if (typeof listNotifications !== "function" || typeof resolveNotification !== "function" ||
+    typeof resolveUser !== "function" || typeof isWritable !== "function" ||
+    !Number.isInteger(transportTimeoutMs) || transportTimeoutMs < 1 || transportTimeoutMs > REQUEST_TIMEOUT_MS) {
+    throw new TypeError("Push service requires current synchronous authorization hooks and a bounded transport.");
+  }
+  const db = store.db;
+  const active = new Set();
+  const enrollmentRequests = new Map();
+  const pauses = new Set();
+  let closed = false;
+  let recovered = false;
+  let lastCleanup = -Infinity;
+  let tickPromise = null;
+  let timer = null;
+  let workerError = null;
+  const writable = () => !closed && pauses.size === 0 && isWritable() === true;
+  const admission = () => requirePush(writable(), "通知服务正在维护，请稍后重试。", 503, "MAINTENANCE");
+  const mutate = callback => {
+    const run = () => { const result = callback(); store.changed(); return result; };
+    return db.isTransaction ? run() : store.transaction(run);
+  };
+  const currentUser = userId => {
+    const user = resolveUser(userId);
+    requirePush(user && typeof user.then !== "function" && user.id === userId && user.active === true,
+      "账号已失效，请重新登录。", 401, "UNAUTHORIZED");
+    return user;
+  };
+  const remindersAllowed = user => Boolean(user?.active === true && user.receiveReminders === true &&
+    Array.isArray(user.roles) && user.roles.some(role => ["operator", "reviewer", "viewer"].includes(role)));
+  const configured = channel => transports[channel]?.configured === true && typeof transports[channel]?.send === "function";
+  const requireConfigured = channel => requirePush(configured(channel),
+    "此通知通道尚未配置，不能启用设备通知。", 503, "PUSH_UNAVAILABLE");
+  const getDevice = id => db.prepare("SELECT * FROM push_devices WHERE id=?").get(id);
+  const getEnrollment = id => db.prepare("SELECT * FROM push_enrollments WHERE id=?").get(id);
+  const getDelivery = id => db.prepare("SELECT * FROM push_deliveries WHERE id=?").get(id);
+  const registrationExpired = (row, at) => {
+    if (row.channel !== "webpush") return false;
+    const expires = JSON.parse(row.registration_json)?.expirationTime;
+    return typeof expires === "number" && expires <= at;
+  };
+  const ownsDevice = (userId, deviceId) => {
+    const device = getDevice(uuid(deviceId));
+    requirePush(device?.user_id === userId, "设备不存在。", 404, "PUSH_NOT_FOUND");
+    return device;
+  };
+
+  function revokeDeviceRow(device, code, at) {
+    db.prepare("UPDATE push_devices SET status='revoked',registration_json=NULL,updated_at=?,revoked_at=COALESCE(revoked_at,?) WHERE id=?")
+      .run(at, at, device.id);
+    db.prepare(`UPDATE push_deliveries SET status='revoked',receipt_hash=NULL,error_code=?,updated_at=?
+      WHERE device_id=? AND status<>'revoked'`).run(code, at, device.id);
+    db.prepare("UPDATE push_attempts SET receipt_hash=NULL WHERE delivery_id IN (SELECT id FROM push_deliveries WHERE device_id=?)").run(device.id);
+    db.prepare(`UPDATE push_enrollments SET status='revoked',proof_hash=NULL,registration_json=NULL,error_code=?,updated_at=?
+      WHERE device_id=? AND status IN ('sending','pending','confirmed')`).run(code, at, device.id);
+  }
+
+  function revokeUser(userId, installationId = null) {
+    if (installationId !== null) installationId = uuid(installationId);
+    const at = clock();
+    const filter = installationId === null ? "" : " AND installation_id=?";
+    const parameters = installationId === null ? [userId] : [userId, installationId];
+    const devices = db.prepare(`SELECT * FROM push_devices WHERE user_id=? AND status='active'${filter}`).all(...parameters);
+    const enrollments = db.prepare(`SELECT id FROM push_enrollments WHERE user_id=? AND status IN ('sending','pending')${filter}`).all(...parameters);
+    if (devices.length || enrollments.length) mutate(() => {
+      devices.forEach(device => revokeDeviceRow(device, "OWNER_REVOKED", at));
+      for (const row of enrollments) db.prepare(`UPDATE push_enrollments
+        SET status='revoked',proof_hash=NULL,registration_json=NULL,error_code='OWNER_REVOKED',updated_at=? WHERE id=?`).run(at, row.id);
+    });
+    return { ok: true };
+  }
+
+  function recoverAndClean() {
+    if (!writable()) return;
+    const at = clock();
+    if (!recovered) {
+      const count = db.prepare(`SELECT (SELECT COUNT(*) FROM push_enrollments WHERE status='sending') +
+        (SELECT COUNT(*) FROM push_deliveries WHERE status='sending') AS count`).get().count;
+      if (count) mutate(() => {
+        db.prepare(`UPDATE push_enrollments SET status='failed',proof_hash=NULL,registration_json=NULL,
+          error_code='INTERRUPTED_UNKNOWN',updated_at=? WHERE status='sending'`).run(at);
+        db.prepare(`UPDATE push_deliveries SET status='failed',error_code='INTERRUPTED_UNKNOWN',updated_at=?
+          WHERE status='sending'`).run(at);
+        db.prepare(`UPDATE push_attempts SET outcome='failed',error_code='INTERRUPTED_UNKNOWN',finished_at=?
+          WHERE outcome='sending'`).run(at);
+      });
+      recovered = true;
+    }
+    if (at - lastCleanup < 60_000) return;
+    lastCleanup = at;
+    const cutoff = at - LIMITS.retentionMs;
+    // Keep an active binding's event history so retention cannot turn an old unread event into a new one.
+    const removableDelivery = `created_at<? AND status<>'sending' AND NOT (
+      kind='reminder' AND notification_id IS NOT NULL AND EXISTS (
+        SELECT 1 FROM push_devices WHERE id=push_deliveries.device_id AND status='active'))`;
+    const change = db.prepare(`SELECT
+      (SELECT COUNT(*) FROM push_enrollments WHERE created_at<? OR (expires_at<=? AND proof_hash IS NOT NULL)) +
+      (SELECT COUNT(*) FROM push_deliveries WHERE (${removableDelivery}) OR (expires_at<=? AND status IN ('pending','retry','sending','provider-accepted'))) +
+      (SELECT COUNT(*) FROM push_devices WHERE status='revoked' AND updated_at<?) AS count`).get(cutoff, at, cutoff, at, cutoff).count;
+    if (!change) return;
+    mutate(() => {
+      db.prepare(`UPDATE push_enrollments SET status=CASE WHEN status IN ('sending','pending') THEN 'expired' ELSE status END,
+        proof_hash=NULL,registration_json=NULL,updated_at=? WHERE expires_at<=? AND proof_hash IS NOT NULL`).run(at, at);
+      db.prepare(`UPDATE push_deliveries SET status='expired',receipt_hash=NULL,error_code='EXPIRED',updated_at=?
+        WHERE expires_at<=? AND status IN ('pending','retry','sending','provider-accepted')`).run(at, at);
+      db.prepare(`DELETE FROM push_deliveries WHERE ${removableDelivery}`).run(cutoff);
+      db.prepare("DELETE FROM push_enrollments WHERE created_at<? AND status<>'sending'").run(cutoff);
+      db.prepare(`DELETE FROM push_devices WHERE status='revoked' AND updated_at<?
+        AND NOT EXISTS(SELECT 1 FROM push_deliveries WHERE device_id=push_devices.id)
+        AND NOT EXISTS(SELECT 1 FROM push_enrollments WHERE device_id=push_devices.id)`).run(cutoff);
+    });
+  }
+
+  function track(callback) {
+    requirePush(active.size < LIMITS.concurrency, "通知通道正忙，请稍后重试。", 429, "PUSH_RATE_LIMIT");
+    const controller = new AbortController();
+    const pending = Promise.withResolvers();
+    const task = { controller, promise: pending.promise };
+    active.add(task);
+    task.promise.then(() => active.delete(task), () => active.delete(task));
+    try { Promise.resolve(callback(controller)).then(pending.resolve, pending.reject); }
+    catch (error) { pending.reject(error); }
+    return task.promise;
+  }
+
+  async function transportSend(channel, input, controller) {
+    let deadline;
+    const timeout = new Promise((_, reject) => {
+      deadline = setTimeout(() => {
+        controller.abort();
+        reject(new ProviderError("TRANSPORT_UNCERTAIN", { uncertain: true }));
+      }, transportTimeoutMs);
+    });
+    try {
+      const result = await Promise.race([
+        transports[channel].send({ ...input, signal: controller.signal }), timeout,
+      ]);
+      if (result?.accepted !== true || !Number.isInteger(result.providerStatus) ||
+        result.providerStatus < 200 || result.providerStatus >= 300) throw new ProviderError("PROVIDER_REJECTED");
+      return result;
+    } finally { clearTimeout(deadline); }
+  }
+
+  function devices(userId) {
+    currentUser(userId);
+    return db.prepare("SELECT * FROM push_devices WHERE user_id=? ORDER BY created_at DESC,id LIMIT 40").all(userId).map(safeDevice);
+  }
+
+  function status(userId) {
+    return {
+      protocolVersion: 1, publicOrigin,
+      channels: {
+        jpush: { configured: configured("jpush"), appKey: configured("jpush") ? transports.jpush.appKey || null : null,
+          vendorChannelsConfigured: configured("jpush") && transports.jpush.vendorChannelsConfigured === true },
+        webpush: { configured: configured("webpush"), publicKey: configured("webpush") ? transports.webpush.publicKey || null : null },
+      },
+      devices: devices(userId), paused: !writable(), backgroundDeliveryGuaranteed: false,
+    };
+  }
+
+  async function enroll(userId, body) {
+    admission();
+    currentUser(userId);
+    recoverAndClean();
+    const at = clock();
+    const input = enrollmentInput(body, at);
+    requireConfigured(input.channel);
+    const requestHash = sha(JSON.stringify(input));
+    const requestKey = `${userId}:${input.requestId}`;
+    const existing = db.prepare("SELECT * FROM push_enrollments WHERE user_id=? AND request_id=?").get(userId, input.requestId);
+    if (existing) {
+      requirePush(existing.request_hash === requestHash, "请求标识已用于不同的设备通知操作。", 409, "PUSH_IDEMPOTENCY");
+      if (enrollmentRequests.has(requestKey)) return enrollmentRequests.get(requestKey);
+      requirePush(["pending", "confirmed"].includes(existing.status) && existing.expires_at > at,
+        "此设备验证已失效，请重新发起。", 409, "PUSH_ENROLLMENT_EXPIRED");
+      return resultForEnrollment(existing);
+    }
+    requirePush(active.size < LIMITS.concurrency, "通知通道正忙，请稍后重试。", 429, "PUSH_RATE_LIMIT");
+    const id = crypto.randomUUID();
+    const proof = crypto.randomBytes(32).toString("base64url");
+    const registrationDigest = registrationHash(input.channel, input.registration);
+    mutate(() => {
+      requirePush(db.prepare("SELECT COUNT(*) AS count FROM push_enrollments").get().count < LIMITS.enrollments,
+        "通知验证记录达到安全上限，请管理员处理。", 503, "PUSH_CAPACITY");
+      requirePush(db.prepare("SELECT COUNT(*) AS count FROM push_enrollments WHERE user_id=? AND created_at>?")
+        .get(userId, at - 3600_000).count < LIMITS.enrollmentsPerHour &&
+        db.prepare("SELECT COUNT(*) AS count FROM push_enrollments WHERE channel=? AND registration_hash=? AND created_at>?")
+          .get(input.channel, registrationDigest, at - 3600_000).count < LIMITS.registrationsPerHour,
+      "设备验证请求过多，请一小时后重试。", 429, "PUSH_RATE_LIMIT");
+      db.prepare(`INSERT INTO push_enrollments(id,user_id,request_id,request_hash,installation_id,channel,registration_hash,
+        registration_json,label,proof_hash,status,created_at,expires_at,updated_at)
+        VALUES(?,?,?,?,?,?,?,?,?,?,'sending',?,?,?)`).run(id, userId, input.requestId, requestHash, input.installationId,
+        input.channel, registrationDigest, JSON.stringify(input.registration), input.label, sha(proof), at, at + LIMITS.enrollmentMs, at);
+    });
+    const promise = track(async controller => {
+      try {
+        admission();
+        currentUser(userId);
+        requirePush(getEnrollment(id)?.status === "sending", "设备验证已被撤销。", 409, "PUSH_ENROLLMENT_EXPIRED");
+        await transportSend(input.channel, { registration: input.registration,
+          payload: { kind: "rent-push-enrollment", enrollmentId: id, proof }, ttl: LIMITS.enrollmentMs / 1000 }, controller);
+        currentUser(userId);
+        const latest = getEnrollment(id);
+        requirePush(latest?.status === "sending" && latest.expires_at > clock(),
+          "设备验证已失效，请重新发起。", 409, "PUSH_ENROLLMENT_EXPIRED");
+        mutate(() => db.prepare("UPDATE push_enrollments SET status='pending',updated_at=? WHERE id=? AND status='sending'").run(clock(), id));
+        return resultForEnrollment(getEnrollment(id));
+      } catch (error) {
+        const code = error instanceof ProviderError ? error.code :
+          error instanceof PushError && error.code === "MAINTENANCE" ? "MAINTENANCE" : "ENROLLMENT_FAILED";
+        if (getEnrollment(id)?.status === "sending") mutate(() => db.prepare(`UPDATE push_enrollments SET status='failed',
+          proof_hash=NULL,registration_json=NULL,error_code=?,updated_at=? WHERE id=? AND status='sending'`).run(code, clock(), id));
+        if (error instanceof PushError) throw error;
+        throw new PushError(503, "PUSH_PROVIDER", "通知服务商未确认接受验证请求，设备尚未启用；请稍后重新发起。");
+      }
+    });
+    enrollmentRequests.set(requestKey, promise);
+    try { return await promise; }
+    finally { enrollmentRequests.delete(requestKey); }
+  }
+
+  function confirm(userId, enrollmentId, body) {
+    admission();
+    currentUser(userId);
+    object(body, ["proof"]);
+    base64url(body.proof, 32);
+    const row = getEnrollment(uuid(enrollmentId));
+    requirePush(row?.user_id === userId, "设备验证不存在。", 404, "PUSH_NOT_FOUND");
+    const at = clock();
+    if (row.expires_at <= at) {
+      if (row.proof_hash) mutate(() => db.prepare(`UPDATE push_enrollments SET status=CASE WHEN status='pending' THEN 'expired' ELSE status END,
+        proof_hash=NULL,registration_json=NULL,updated_at=? WHERE id=?`).run(at, row.id));
+      throw new PushError(410, "PUSH_ENROLLMENT_EXPIRED", "设备验证已过期，请重新发起。");
+    }
+    requirePush(["pending", "confirmed"].includes(row.status), "请等待验证请求完成，或重新发起已失效的验证。", 409, "PUSH_ENROLLMENT_STATE");
+    if (!sameHash(body.proof, row.proof_hash)) {
+      mutate(() => db.prepare(`UPDATE push_enrollments SET proof_attempts=proof_attempts+1,
+        status=CASE WHEN proof_attempts+1>=? THEN 'failed' ELSE status END,
+        proof_hash=CASE WHEN proof_attempts+1>=? THEN NULL ELSE proof_hash END,
+        registration_json=CASE WHEN proof_attempts+1>=? THEN NULL ELSE registration_json END,updated_at=? WHERE id=?`)
+        .run(LIMITS.confirmAttempts, LIMITS.confirmAttempts, LIMITS.confirmAttempts, at, row.id));
+      throw new PushError(403, "PUSH_PROOF", "设备验证凭据不正确。");
+    }
+    if (row.status === "confirmed") {
+      const device = getDevice(row.device_id);
+      requirePush(device?.user_id === userId && device.status === "active", "设备绑定已撤销，请重新验证。", 409, "PUSH_REVOKED");
+      return safeDevice(device);
+    }
+    requireConfigured(row.channel);
+    if (registrationExpired(row, at)) {
+      mutate(() => db.prepare(`UPDATE push_enrollments SET status='expired',proof_hash=NULL,registration_json=NULL,
+        error_code='SUBSCRIPTION_EXPIRED',updated_at=? WHERE id=?`).run(at, row.id));
+      throw new PushError(410, "PUSH_ENROLLMENT_EXPIRED", "浏览器订阅已过期，请重新发起设备验证。");
+    }
+    let created;
+    mutate(() => {
+      const replaced = db.prepare(`SELECT * FROM push_devices WHERE status='active' AND channel=?
+        AND (registration_hash=? OR (user_id=? AND installation_id=?))`)
+        .all(row.channel, row.registration_hash, userId, row.installation_id);
+      const own = db.prepare("SELECT COUNT(*) AS count FROM push_devices WHERE user_id=? AND status='active'").get(userId).count;
+      requirePush(own - replaced.filter(device => device.user_id === userId).length < LIMITS.devicesPerUser,
+        "此账号启用的设备已达上限，请先移除旧设备。", 429, "PUSH_DEVICE_LIMIT");
+      requirePush(db.prepare("SELECT COUNT(*) AS count FROM push_devices").get().count < LIMITS.devices,
+        "设备记录已达安全上限，请管理员处理。", 503, "PUSH_CAPACITY");
+      replaced.forEach(device => revokeDeviceRow(device, "BINDING_REPLACED", at));
+      db.prepare(`UPDATE push_enrollments SET status='revoked',proof_hash=NULL,registration_json=NULL,
+        error_code='BINDING_REPLACED',updated_at=? WHERE channel=? AND registration_hash=? AND id<>?
+        AND status IN ('pending','sending')`).run(at, row.channel, row.registration_hash, row.id);
+      const id = crypto.randomUUID();
+      db.prepare(`INSERT INTO push_devices(id,user_id,installation_id,channel,registration_hash,registration_json,label,status,created_at,updated_at)
+        VALUES(?,?,?,?,?,?,?,'active',?,?)`).run(id, userId, row.installation_id, row.channel, row.registration_hash,
+        row.registration_json, row.label, at, at);
+      db.prepare("UPDATE push_enrollments SET status='confirmed',device_id=?,registration_json=NULL,updated_at=? WHERE id=?")
+        .run(id, at, row.id);
+      created = getDevice(id);
+    });
+    return safeDevice(created);
+  }
+
+  function revoke(userId, deviceId) {
+    admission();
+    currentUser(userId);
+    const device = ownsDevice(userId, deviceId);
+    if (device.status !== "revoked") mutate(() => revokeDeviceRow(device, "OWNER_REVOKED", clock()));
+    return { ok: true };
+  }
+
+  function queueTest(userId, body) {
+    admission();
+    currentUser(userId);
+    recoverAndClean();
+    object(body, ["requestId", "deviceId"]);
+    const key = `test:${uuid(body.requestId)}`;
+    const device = ownsDevice(userId, body.deviceId);
+    requirePush(device.status === "active", "设备通知已撤销，请重新启用。", 409, "PUSH_REVOKED");
+    requireConfigured(device.channel);
+    const existing = db.prepare("SELECT * FROM push_deliveries WHERE user_id=? AND kind='test' AND dedupe_key=?").get(userId, key);
+    if (existing) {
+      requirePush(existing.device_id === device.id, "请求标识已用于不同设备。", 409, "PUSH_IDEMPOTENCY");
+      return { deliveryId: existing.id, status: existing.status, kind: "test" };
+    }
+    const at = clock();
+    const id = crypto.randomUUID();
+    mutate(() => {
+      requirePush(db.prepare("SELECT COUNT(*) AS count FROM push_deliveries WHERE user_id=? AND kind='test' AND created_at>?")
+        .get(userId, at - 3600_000).count < LIMITS.testsPerHour, "测试通知过多，请一小时后重试。", 429, "PUSH_RATE_LIMIT");
+      requirePush(db.prepare("SELECT COUNT(*) AS count FROM push_deliveries").get().count < LIMITS.deliveries,
+        "通知记录已达安全上限，请管理员处理。", 503, "PUSH_CAPACITY");
+      db.prepare(`INSERT INTO push_deliveries(id,device_id,user_id,kind,dedupe_key,status,next_attempt_at,created_at,updated_at,expires_at)
+        VALUES(?,?,?,'test',?,'pending',?,?,?,?)`).run(id, device.id, userId, key, at, at, at, at + LIMITS.deliveryMs);
+    });
+    return { deliveryId: id, status: "pending", kind: "test" };
+  }
+
+  function relevant(user, id) {
+    if (!remindersAllowed(user)) return false;
+    const notification = resolveNotification(user, id);
+    if (notification && typeof notification.then === "function") throw new TypeError("Push authorization hooks must be synchronous.");
+    return Boolean(notification && notification.id === id && notification.read === false);
+  }
+
+  function reconcile() {
+    if (!writable()) return { queued: 0 };
+    recoverAndClean();
+    const at = clock();
+    const day = new Intl.DateTimeFormat("en-CA", { timeZone: "Asia/Shanghai", year: "numeric", month: "2-digit", day: "2-digit" }).format(new Date(at));
+    const key = `reminder:${day}`;
+    const devices = db.prepare("SELECT * FROM push_devices WHERE status='active' ORDER BY id LIMIT ?").all(LIMITS.devices);
+    const candidates = new Map();
+    let queued = 0;
+    let capacity = LIMITS.deliveries - db.prepare("SELECT COUNT(*) AS count FROM push_deliveries").get().count;
+    for (const device of devices) {
+      const user = resolveUser(device.user_id);
+      if (!user?.active || registrationExpired(device, at)) {
+        mutate(() => revokeDeviceRow(device, !user?.active ? "OWNER_INACTIVE" : "SUBSCRIPTION_EXPIRED", at));
+        continue;
+      }
+      if (!configured(device.channel) || !remindersAllowed(user)) continue;
+      if (capacity <= 0 || db.prepare("SELECT id FROM push_deliveries WHERE device_id=? AND dedupe_key=?").get(device.id, key)) continue;
+      if (!candidates.has(user.id)) {
+        const entries = listNotifications(user);
+        if (!Array.isArray(entries)) throw new TypeError("listNotifications must return the currently visible notification array.");
+        candidates.set(user.id, entries.filter(entry => typeof entry?.id === "string" && entry.id.length <= 200 &&
+          entry.read === false));
+      }
+      const seen = new Set(db.prepare(`SELECT notification_id FROM push_deliveries
+        WHERE device_id=? AND kind='reminder' AND notification_id IS NOT NULL`).all(device.id)
+        .map(row => row.notification_id));
+      const notification = candidates.get(user.id).find(entry => !seen.has(entry.id) && relevant(user, entry.id));
+      if (!notification) continue;
+      mutate(() => db.prepare(`INSERT INTO push_deliveries(id,device_id,user_id,kind,dedupe_key,notification_id,status,
+        next_attempt_at,created_at,updated_at,expires_at) VALUES(?,?,?,'reminder',?,?,'pending',?,?,?,?)`)
+        .run(crypto.randomUUID(), device.id, user.id, key, notification.id, at, at, at, at + LIMITS.deliveryMs));
+      capacity--;
+      queued++;
+    }
+    return { queued, capacityReached: capacity <= 0 };
+  }
+
+  function eligible(row, device) {
+    const user = resolveUser(row.user_id);
+    return Boolean(device?.status === "active" && device.user_id === row.user_id && user?.active === true &&
+      (row.kind === "test" || relevant(user, row.notification_id)));
+  }
+
+  async function sendDelivery(id) {
+    if (!writable() || active.size >= LIMITS.concurrency) return;
+    const row = getDelivery(id);
+    if (!row || !["pending", "retry"].includes(row.status)) return;
+    const at = clock();
+    if (row.attempts >= LIMITS.attempts) {
+      mutate(() => db.prepare("UPDATE push_deliveries SET status='failed',error_code='RETRY_LIMIT',updated_at=? WHERE id=?").run(at, id));
+      return;
+    }
+    const device = getDevice(row.device_id);
+    if (device?.status === "active" && registrationExpired(device, at)) {
+      mutate(() => revokeDeviceRow(device, "SUBSCRIPTION_EXPIRED", at));
+      return;
+    }
+    if (row.expires_at <= at || !eligible(row, device)) {
+      mutate(() => db.prepare("UPDATE push_deliveries SET status=?,receipt_hash=NULL,error_code=?,updated_at=? WHERE id=?")
+        .run(row.expires_at <= at ? "expired" : "revoked", row.expires_at <= at ? "EXPIRED" : "NO_LONGER_ELIGIBLE", at, id));
+      return;
+    }
+    if (!configured(device.channel)) {
+      mutate(() => db.prepare("UPDATE push_deliveries SET status='failed',error_code='PUSH_UNAVAILABLE',updated_at=? WHERE id=?").run(at, id));
+      return;
+    }
+    const token = crypto.randomBytes(32).toString("base64url");
+    const attemptId = crypto.randomUUID();
+    mutate(() => {
+      db.prepare(`UPDATE push_deliveries SET status='sending',attempts=attempts+1,receipt_hash=?,updated_at=?
+        WHERE id=? AND status IN ('pending','retry')`).run(sha(token), at, id);
+      db.prepare("INSERT INTO push_attempts(id,delivery_id,attempt,started_at,outcome,receipt_hash) VALUES(?,?,?,?,'sending',?)")
+        .run(attemptId, id, row.attempts + 1, at, sha(token));
+    });
+    return track(async controller => {
+      let result = null;
+      let failure = null;
+      try {
+        admission();
+        requirePush(eligible(getDelivery(id), getDevice(row.device_id)), "通知权限已变化。", 403, "PUSH_REVOKED");
+        const target = JSON.parse(getDevice(row.device_id).registration_json);
+        result = await transportSend(device.channel, {
+          registration: target, ttl: Math.ceil((row.expires_at - clock()) / 1000),
+          payload: { kind: row.kind === "test" ? "rent-push-test" : "rent-reminder", deliveryId: id, receiptToken: token,
+            ...(row.kind === "test" ? TEST : REMINDER) },
+        }, controller);
+      } catch (error) {
+        failure = error instanceof ProviderError ? error : new ProviderError(
+          error instanceof PushError && ["MAINTENANCE", "PUSH_REVOKED", "PUSH_VALIDATION"].includes(error.code) ? error.code : "TRANSPORT_UNCERTAIN",
+          { uncertain: !(error instanceof PushError) });
+      }
+      const finishedAt = clock();
+      mutate(() => {
+        const latest = getDelivery(id);
+        let outcome = "failed";
+        let status = latest.status;
+        let code = failure?.code || null;
+        let nextAt = latest.next_attempt_at;
+        if (failure?.unregistered) {
+          revokeDeviceRow(getDevice(row.device_id), "REGISTRATION_GONE", finishedAt);
+          status = "revoked";
+          outcome = "revoked";
+        } else if (!eligible(latest, getDevice(row.device_id)) || latest.status === "revoked") {
+          status = "revoked";
+          outcome = "revoked";
+          code = "NO_LONGER_ELIGIBLE";
+        } else if (["received", "opened"].includes(latest.status)) {
+          outcome = result ? "provider-accepted" : "failed";
+        } else if (result) {
+          status = "provider-accepted";
+          outcome = "provider-accepted";
+        } else if (failure?.retryable && latest.attempts < LIMITS.attempts) {
+          const backoff = Math.min(3600_000, 30_000 * 2 ** (latest.attempts - 1)) +
+            Number.parseInt(sha(id).slice(0, 4), 16) % 5000;
+          nextAt = finishedAt + Math.max(backoff, failure.retryAfterMs || 0);
+          status = nextAt < latest.expires_at ? "retry" : "expired";
+          outcome = status === "retry" ? "retry" : "failed";
+        } else {
+          status = failure?.code === "PUSH_REVOKED" ? "revoked" : "failed";
+          outcome = status === "revoked" ? "revoked" : "failed";
+        }
+        db.prepare(`UPDATE push_attempts SET outcome=?,finished_at=?,provider_status=?,error_code=? WHERE id=?`)
+          .run(outcome, finishedAt, result?.providerStatus ?? failure?.status ?? null, code, attemptId);
+        db.prepare(`UPDATE push_deliveries SET status=?,next_attempt_at=?,updated_at=?,error_code=?,
+          accepted_at=CASE WHEN ? THEN COALESCE(accepted_at,?) ELSE accepted_at END,
+          receipt_hash=CASE WHEN ? IN ('revoked','expired') THEN NULL ELSE receipt_hash END WHERE id=?`)
+          .run(status, nextAt, finishedAt, code, result ? 1 : 0, finishedAt, status, id);
+        if (result) db.prepare("UPDATE push_devices SET last_accepted_at=?,updated_at=? WHERE id=?").run(finishedAt, finishedAt, device.id);
+      });
+    });
+  }
+
+  function receipt(body) {
+    admission();
+    object(body, ["deliveryId", "receiptToken", "stage"]);
+    const id = uuid(body.deliveryId);
+    base64url(body.receiptToken, 32);
+    requirePush(["received", "opened"].includes(body.stage), "通知回执阶段无效。");
+    const row = getDelivery(id);
+    const at = clock();
+    const proven = row && (sameHash(body.receiptToken, row.receipt_hash) ||
+      db.prepare("SELECT receipt_hash FROM push_attempts WHERE delivery_id=? ORDER BY attempt DESC LIMIT ?")
+        .all(id, LIMITS.attempts).some(attempt => sameHash(body.receiptToken, attempt.receipt_hash)));
+    requirePush(row && proven && row.expires_at > at &&
+      !["revoked", "expired"].includes(row.status) && getDevice(row.device_id)?.status === "active" &&
+      resolveUser(row.user_id)?.active === true, "通知回执已失效。", 404, "PUSH_RECEIPT");
+    if (row.status === "opened" || (row.status === "received" && body.stage === "received")) {
+      return { ok: true, stage: row.status };
+    }
+    mutate(() => {
+      db.prepare(`UPDATE push_deliveries SET status=?,received_at=COALESCE(received_at,?),
+        opened_at=CASE WHEN ?='opened' THEN COALESCE(opened_at,?) ELSE opened_at END,updated_at=? WHERE id=?`)
+        .run(body.stage, at, body.stage, at, at, id);
+      db.prepare(`UPDATE push_devices SET last_received_at=?,
+        last_opened_at=CASE WHEN ?='opened' THEN ? ELSE last_opened_at END,updated_at=? WHERE id=?`)
+        .run(at, body.stage, at, at, row.device_id);
+    });
+    return { ok: true, stage: body.stage };
+  }
+
+  function adminSummary(userId) {
+    const user = currentUser(userId);
+    requirePush(user.roles?.includes("admin"), "需要管理员权限。", 403, "FORBIDDEN");
+    return {
+      protocolVersion: 1, paused: !writable(), inFlight: active.size, backgroundDeliveryGuaranteed: false,
+      channels: { jpush: { configured: configured("jpush"), vendorChannelsConfigured: transports.jpush?.vendorChannelsConfigured === true },
+        webpush: { configured: configured("webpush") } },
+      devices: db.prepare("SELECT channel,status,COUNT(*) AS count FROM push_devices GROUP BY channel,status").all(),
+      enrollments: db.prepare("SELECT status,COUNT(*) AS count FROM push_enrollments GROUP BY status").all(),
+      deliveries: db.prepare("SELECT status,COUNT(*) AS count FROM push_deliveries GROUP BY status").all(),
+      failures: db.prepare(`SELECT a.error_code AS code,d.channel,COUNT(*) AS count FROM push_attempts a
+        JOIN push_deliveries n ON n.id=a.delivery_id JOIN push_devices d ON d.id=n.device_id
+        WHERE a.error_code IS NOT NULL GROUP BY a.error_code,d.channel ORDER BY count DESC LIMIT 20`).all(),
+      evidence: db.prepare(`SELECT COUNT(accepted_at) AS providerAccepted,COUNT(received_at) AS received,
+        COUNT(opened_at) AS opened FROM push_deliveries`).get(),
+      oldestPendingAt: iso(db.prepare("SELECT MIN(created_at) AS at FROM push_deliveries WHERE status IN ('pending','retry')").get().at),
+      workerError, limits: { devicesPerUser: LIMITS.devicesPerUser, attempts: LIMITS.attempts, retentionDays: 30,
+        reminderHistory: "retained-while-device-active" },
+    };
+  }
+
+  function tick() {
+    if (tickPromise) return tickPromise;
+    if (!writable()) return Promise.resolve({ paused: true });
+    tickPromise = (async () => {
+      const reconciled = reconcile();
+      const rows = db.prepare(`SELECT id FROM push_deliveries WHERE status IN ('pending','retry') AND next_attempt_at<=?
+        ORDER BY next_attempt_at,id LIMIT ?`).all(clock(), LIMITS.batch);
+      for (const row of rows) {
+        if (!writable() || active.size >= LIMITS.concurrency) break;
+        await sendDelivery(row.id);
+      }
+      workerError = reconciled.capacityReached ? { code: "PUSH_CAPACITY", at: iso(clock()) } : null;
+      return { checked: rows.length };
+    })();
+    tickPromise.then(() => { tickPromise = null; }, () => { tickPromise = null; });
+    return tickPromise;
+  }
+
+  function start() {
+    if (closed) throw new Error("Cannot restart a closed push service.");
+    if (timer) return;
+    timer = setInterval(() => {
+      if (!writable()) return;
+      tick().catch(() => { workerError = { code: "PUSH_WORKER", at: iso(clock()) }; });
+    }, 15_000);
+    timer.unref?.();
+  }
+
+  async function pause(reason = "maintenance") {
+    pauses.add(reason);
+    await Promise.allSettled([...active].map(task => task.promise));
+    if (tickPromise) await Promise.allSettled([tickPromise]);
+  }
+
+  function resume(reason = "maintenance") { if (!closed) pauses.delete(reason); }
+
+  async function close() {
+    closed = true;
+    clearInterval(timer);
+    timer = null;
+    await pause("shutdown");
+  }
+
+  return { status, devices, enroll, confirm, revoke, revokeUser, queueTest, receipt, adminSummary,
+    reconcile, tick, start, pause, resume, close, limits: LIMITS };
+}
+
+module.exports = { createPushService, PushError, LIMITS };

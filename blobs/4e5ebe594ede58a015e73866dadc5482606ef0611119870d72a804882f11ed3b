@@ -1,0 +1,109 @@
+"use strict";
+
+const path = require("node:path");
+const Reporting = require(path.join(__dirname, "..", "public", "reporting.js"));
+const { deflateRawSync } = require("node:zlib");
+
+const crcTable = Uint32Array.from({ length: 256 }, (_, index) => {
+  let value = index;
+  for (let bit = 0; bit < 8; bit++) value = value & 1 ? 0xedb88320 ^ (value >>> 1) : value >>> 1;
+  return value >>> 0;
+});
+
+function crc32(buffer) {
+  let value = 0xffffffff;
+  for (const byte of buffer) value = crcTable[(value ^ byte) & 255] ^ (value >>> 8);
+  return (value ^ 0xffffffff) >>> 0;
+}
+
+function zip(files) {
+  const chunks = [];
+  const directory = [];
+  let offset = 0;
+  let directoryBytes = 0;
+  for (const [fileName, text] of files) {
+    const name = Buffer.from(fileName, "utf8");
+    const original = Buffer.from(text, "utf8");
+    const compressed = deflateRawSync(original);
+    const checksum = crc32(original);
+    const header = Buffer.alloc(30);
+    header.writeUInt32LE(0x04034b50, 0);
+    header.writeUInt16LE(20, 4);
+    header.writeUInt16LE(0x800, 6);
+    header.writeUInt16LE(8, 8);
+    header.writeUInt16LE(33, 12);
+    header.writeUInt32LE(checksum, 14);
+    header.writeUInt32LE(compressed.length, 18);
+    header.writeUInt32LE(original.length, 22);
+    header.writeUInt16LE(name.length, 26);
+    chunks.push(header, name, compressed);
+    const entry = Buffer.alloc(46);
+    entry.writeUInt32LE(0x02014b50, 0);
+    entry.writeUInt16LE(20, 4);
+    header.copy(entry, 6, 4, 28);
+    entry.writeUInt32LE(offset, 42);
+    directory.push(entry, name);
+    directoryBytes += entry.length + name.length;
+    offset += header.length + name.length + compressed.length;
+    if (offset >= 0xffffffff) throw new Error("报表超过 ZIP32 范围，请缩小筛选范围。");
+  }
+  const end = Buffer.alloc(22);
+  end.writeUInt32LE(0x06054b50, 0);
+  end.writeUInt16LE(files.length, 8);
+  end.writeUInt16LE(files.length, 10);
+  end.writeUInt32LE(directoryBytes, 12);
+  end.writeUInt32LE(offset, 16);
+  return Buffer.concat([...chunks, ...directory, end]);
+}
+
+function xml(value) {
+  return String(value ?? "").replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f]/g, "")
+    .replace(/[&<>"']/g, char => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&apos;" })[char]);
+}
+
+function columnName(index) {
+  let result = "";
+  for (let value = index + 1; value; value = Math.floor((value - 1) / 26)) {
+    result = String.fromCharCode(65 + (value - 1) % 26) + result;
+  }
+  return result;
+}
+
+function worksheetRow(values, rowNumber, header = false) {
+  return `<row r="${rowNumber}">${values.map((value, index) => {
+    const address = `${columnName(index)}${rowNumber}`;
+    if (typeof value === "number" && Number.isFinite(value)) return `<c r="${address}" s="2"><v>${value.toFixed(2)}</v></c>`;
+    return `<c r="${address}" t="inlineStr"${header ? ' s="1"' : ""}><is><t xml:space="preserve">${xml(value)}</t></is></c>`;
+  }).join("")}</row>`;
+}
+
+function buildWorkbook(snapshot, filters) {
+  const report = Reporting.select(snapshot, filters);
+  if (report.rows.length > 1_048_570) throw new Error("明细超过 Excel 工作表行数上限，请缩小筛选范围。");
+  const totals = report.totals;
+  const summary = report.filters.basis === "cash" ?
+    ["已审核现金净额（元）", totals.cashCents / 100] :
+    ["应收合计（元）", totals.amountCents / 100, "对应已收（元）", totals.paidCents / 100, "未收合计（元）", totals.balanceCents / 100];
+  const rows = [
+    worksheetRow(["园区租赁 · 收租报表"], 1, true),
+    worksheetRow([report.caption], 2),
+    worksheetRow([`生成时间：${snapshot.serverTime}；金额单位：人民币元；仅含当前账号授权范围`], 3),
+    worksheetRow(report.columns, 4, true),
+    ...report.rows.map((row, index) => worksheetRow(row, index + 5)),
+    worksheetRow(summary, report.rows.length + 5, true),
+  ].join("");
+  const lastColumn = columnName(report.columns.length - 1);
+  const spreadsheet = "http://schemas.openxmlformats.org/spreadsheetml/2006/main";
+  const officeRel = "http://schemas.openxmlformats.org/officeDocument/2006/relationships";
+  const packageRel = "http://schemas.openxmlformats.org/package/2006/relationships";
+  return zip([
+    ["[Content_Types].xml", `<?xml version="1.0" encoding="UTF-8"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/><Override PartName="/xl/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml"/><Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/></Types>`],
+    ["_rels/.rels", `<Relationships xmlns="${packageRel}"><Relationship Id="rId1" Type="${officeRel}/officeDocument" Target="xl/workbook.xml"/></Relationships>`],
+    ["xl/workbook.xml", `<workbook xmlns="${spreadsheet}" xmlns:r="${officeRel}"><sheets><sheet name="收租报表" sheetId="1" r:id="rId1"/></sheets></workbook>`],
+    ["xl/_rels/workbook.xml.rels", `<Relationships xmlns="${packageRel}"><Relationship Id="rId1" Type="${officeRel}/worksheet" Target="worksheets/sheet1.xml"/><Relationship Id="rId2" Type="${officeRel}/styles" Target="styles.xml"/></Relationships>`],
+    ["xl/styles.xml", `<styleSheet xmlns="${spreadsheet}"><fonts count="2"><font><sz val="11"/><name val="Microsoft YaHei"/></font><font><b/><sz val="11"/><name val="Microsoft YaHei"/></font></fonts><fills count="2"><fill><patternFill patternType="none"/></fill><fill><patternFill patternType="gray125"/></fill></fills><borders count="1"><border/></borders><cellStyleXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/></cellStyleXfs><cellXfs count="3"><xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0"/><xf numFmtId="0" fontId="1" fillId="0" borderId="0" xfId="0" applyFont="1"/><xf numFmtId="4" fontId="0" fillId="0" borderId="0" xfId="0" applyNumberFormat="1"/></cellXfs><cellStyles count="1"><cellStyle name="Normal" xfId="0" builtinId="0"/></cellStyles></styleSheet>`],
+    ["xl/worksheets/sheet1.xml", `<worksheet xmlns="${spreadsheet}"><sheetViews><sheetView workbookViewId="0"><pane ySplit="4" topLeftCell="A5" activePane="bottomLeft" state="frozen"/></sheetView></sheetViews><cols><col min="1" max="${report.columns.length}" width="23" customWidth="1"/></cols><sheetData>${rows}</sheetData><autoFilter ref="A4:${lastColumn}${report.rows.length + 4}"/><mergeCells count="3"><mergeCell ref="A1:${lastColumn}1"/><mergeCell ref="A2:${lastColumn}2"/><mergeCell ref="A3:${lastColumn}3"/></mergeCells></worksheet>`],
+  ]);
+}
+
+module.exports = { buildWorkbook };

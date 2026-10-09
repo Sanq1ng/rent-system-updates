@@ -1,0 +1,72 @@
+"use strict";
+
+const fs = require("node:fs");
+const fsp = require("node:fs/promises");
+const path = require("node:path");
+const crypto = require("node:crypto");
+const {
+  fail, hashFile, regularFile, ensureDirectory, writeFile, writeJSON, sameOrInside, payloadPath, MAX_MANIFEST_BYTES,
+  compatibilityFor, readJSON, verifyEnvelope,
+} = require("./files.cjs");
+const { resolveRelease, inventory, makeManifest } = require("./releases.cjs");
+
+async function publishUpdate(program, options) {
+  if (!options.to || !options.key || !/^[A-Za-z0-9_-]{1,48}$/.test(options["key-id"] || "") ||
+      !/^[1-9]\d{0,14}$/.test(options.sequence || "")) {
+    fail("UPDATE_PUBLISH", "发布更新须指定 --to 新目录、--key 私钥文件、--key-id 密钥名及 --sequence 正整数。");
+  }
+  const sourceProgram = path.resolve(options.from || program);
+  const source = resolveRelease(sourceProgram);
+  const target = path.resolve(options.to);
+  const keyFile = path.resolve(options.key);
+  if (fs.existsSync(target) || target === path.parse(target).root || sameOrInside(sourceProgram, target) ||
+      sameOrInside(target, sourceProgram) || sameOrInside(target, keyFile) || sameOrInside(sourceProgram, keyFile)) {
+    fail("UPDATE_PUBLISH", "发布输出须为独立新目录；签名私钥必须放在程序及发布目录之外。");
+  }
+  regularFile(keyFile, 16384);
+  let key;
+  try { key = crypto.createPrivateKey(fs.readFileSync(keyFile)); }
+  catch { fail("UPDATE_PUBLISH", "不能读取发布私钥；不会生成或替换密钥。"); }
+  if (key.asymmetricKeyType !== "ed25519") fail("UPDATE_PUBLISH", "发布签名需要 Ed25519 私钥。");
+  const bundle = options.scope === "windows-program";
+  if (options.scope !== undefined && !bundle && options.scope !== "business") fail("UPDATE_PUBLISH", "发布范围只接受 business 或 windows-program。");
+  const compatibility = compatibilityFor(options.platform || process.platform);
+  if (bundle) compatibility.schema = require(path.join(source.root, "server", "push-schema.cjs")).SCHEMA_VERSION;
+  const manifest = makeManifest(source.version, Number(options.sequence), await inventory(source.root, bundle),
+    compatibility, bundle, bundle ? require(path.join(source.root, "server", "schema-update.cjs")).SUPPORTED_FROM : [compatibility.schema]);
+  const bytes = Buffer.from(JSON.stringify(manifest), "utf8");
+  if (bytes.length > MAX_MANIFEST_BYTES) fail("UPDATE_SIZE", "发布清单超过大小上限。");
+  const envelope = {
+    format: "industrial-rent-signed-update", formatVersion: 1, keyId: options["key-id"],
+    payload: bytes.toString("base64"), signature: crypto.sign(null, bytes, key).toString("base64"),
+  };
+  if (bundle) {
+    const policy = readJSON(path.join(source.root, "updates", "trust-public.json"), 65536);
+    if (policy.format !== "industrial-rent-update-trust" || policy.formatVersion !== 1)
+      fail("UPDATE_SIGNATURE", "整程序发布缺少安装包预置的公钥记录。");
+    verifyEnvelope(envelope, require("./transport.cjs").resolveUpdateConfig(policy).trustedKeys, compatibility);
+  }
+  const temporary = `${target}.incomplete-${crypto.randomUUID()}`;
+  ensureDirectory(path.join(temporary, "blobs"));
+  for (const file of manifest.files) {
+    const destination = path.join(temporary, "blobs", file.sha256);
+    if (!fs.existsSync(destination)) {
+      await fsp.copyFile(path.join(source.root, ...payloadPath(file.path, bundle)), destination, fs.constants.COPYFILE_EXCL);
+      const handle = fs.openSync(destination, "r+");
+      try { fs.fsyncSync(handle); } finally { fs.closeSync(handle); }
+    }
+    if (regularFile(destination).size !== file.bytes || await hashFile(destination) !== file.sha256) {
+      fail("UPDATE_HASH", "发布过程中源文件发生变化；未生成可用更新。");
+    }
+  }
+  writeJSON(path.join(temporary, "manifest.json"), envelope);
+  writeFile(path.join(temporary, "发布说明.txt"), Buffer.from(
+    "仅发布 manifest.json 与 blobs 目录；先上传不可变 blobs，最后切换 manifest.json。\r\n" +
+    (bundle ? "包含签名的 Windows 程序和运行组件；不含账本、原件、私人配置、凭证或草稿。\r\n" :
+      "此目录不含私钥、运行组件、配置或业务数据。\r\n") + "终端仅信任部署人员预置的公钥。\r\n", "utf8"));
+  fs.renameSync(temporary, target);
+  return { path: target, version: manifest.version, sequence: manifest.sequence, fileCount: manifest.files.length,
+    platform: manifest.compatibility.platform, architecture: manifest.compatibility.architecture };
+}
+
+module.exports = { publishUpdate };

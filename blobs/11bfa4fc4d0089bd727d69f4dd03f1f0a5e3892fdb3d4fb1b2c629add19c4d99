@@ -1,0 +1,225 @@
+using System;
+using System.Collections.Generic;
+using System.Diagnostics;
+using System.Globalization;
+using System.IO;
+using System.Linq;
+using System.Text;
+using System.Threading;
+
+namespace RentLan
+{
+    internal static class Pe
+    {
+        internal static void Require(Stream stream, bool gui)
+        {
+            if (stream.Length < 512 || stream.Length > 128 * 1024 * 1024) throw new IOException("可执行文件大小不合理。");
+            stream.Position = 0;
+            var reader = new BinaryReader(stream);
+            if (reader.ReadUInt16() != 0x5a4d) throw new IOException("不是 Windows 可执行文件。");
+            stream.Position = 0x3c; uint offset = reader.ReadUInt32();
+            if (offset < 64 || offset + 96 > stream.Length) throw new IOException("PE 头部越界。");
+            stream.Position = offset;
+            if (reader.ReadUInt32() != 0x4550 || reader.ReadUInt16() != 0x8664) throw new IOException("必须使用 Windows x64 可执行文件。");
+            stream.Position = offset + 24;
+            if (reader.ReadUInt16() != 0x20b) throw new IOException("必须使用 PE32+ x64 可执行文件。");
+            stream.Position = offset + 24 + 68;
+            if (reader.ReadUInt16() != (gui ? 2 : 3)) throw new IOException("Windows 程序子系统类型不正确。");
+            stream.Position = 0;
+        }
+    }
+    internal sealed class InterfaceChoice
+    {
+        public string name { get; set; }
+        public string address { get; set; }
+        public string subnet { get; set; }
+        public int prefixLength { get; set; }
+        public override string ToString() { return name + "  " + address + "/" + prefixLength + "（仅允许 " + subnet + "）"; }
+        internal void Validate()
+        {
+            if (String.IsNullOrEmpty(name) || name.Length > 512 || name.Any(Char.IsControl) || subnet != Network.Subnet(address, prefixLength))
+                throw new IOException("主机返回的网卡或子网信息无效。");
+        }
+    }
+    internal sealed class LanStatus
+    {
+        public string format { get; set; }
+        public int formatVersion { get; set; }
+        public string configFile { get; set; }
+        public string programDirectory { get; set; }
+        public string dataDir { get; set; }
+        public string backupDir { get; set; }
+        public string updateDir { get; set; }
+        public string serverId { get; set; }
+        public string sourceOrigin { get; set; }
+        public bool initialized { get; set; }
+        public bool lanEnabled { get; set; }
+        public bool addressChanged { get; set; }
+        public bool recoveryAvailable { get; set; }
+        public int port { get; set; }
+        public string certificateDirectory { get; set; }
+        public InterfaceChoice[] interfaces { get; set; }
+        internal void Validate(string program, string explicitConfig)
+        {
+            if (format != "industrial-rent-lan-status" || formatVersion != 1 ||
+                !String.Equals(Paths.Absolute(programDirectory, false), program, StringComparison.OrdinalIgnoreCase))
+                throw new IOException("主机状态协议或程序目录不匹配。");
+            Paths.Absolute(configFile, false); Paths.Absolute(dataDir, false); Paths.Absolute(backupDir, false);
+            if (updateDir != null) Paths.Absolute(updateDir, false);
+            if (explicitConfig != null && !String.Equals(configFile, explicitConfig, StringComparison.OrdinalIgnoreCase))
+                throw new IOException("返回的配置不是明确指定的原配置；不能操作另一套安装。");
+            if (initialized) Product.Uuid(serverId);
+            Network.Port(port);
+            if (interfaces == null || interfaces.Length > 128) throw new IOException("网卡列表缺失或过大。");
+            foreach (InterfaceChoice choice in interfaces) choice.Validate();
+            if (certificateDirectory != null) Paths.Absolute(certificateDirectory, false);
+            if (String.IsNullOrEmpty(sourceOrigin) || sourceOrigin.Length > 2048 || sourceOrigin.Any(Char.IsControl))
+                throw new IOException("原来源记录无效。");
+        }
+    }
+    internal interface ICoreLan
+    {
+        LanStatus Status();
+        void Enable(string certificateDirectory, string address, int prefixLength);
+        void Disable();
+    }
+    internal sealed class NodeCore : ICoreLan
+    {
+        internal readonly string Program, Config;
+        internal NodeCore(string program, string config)
+        {
+            Program = Paths.Absolute(program, false); Config = config == null ? null : Paths.Absolute(config, false);
+        }
+        internal static string Discover(string explicitProgram)
+        {
+            if (explicitProgram != null) return Paths.Absolute(explicitProgram, false);
+            string adjacent = Path.GetDirectoryName(System.Windows.Forms.Application.ExecutablePath);
+            foreach (string directory in new[] { adjacent, Path.GetDirectoryName(adjacent) })
+                if (directory != null && NativeFiles.Exists(Path.Combine(directory, "host.cjs")))
+                {
+                    using (var file = new CheckedFile(Path.Combine(directory, "host.cjs"), false)) { }
+                    return directory;
+                }
+            throw new IOException("找不到相邻的正式主机程序。请从主机窗口打开局域网配置，或明确提供 --program；不会扫描旧安装。");
+        }
+        private Dictionary<string, object> Invoke(string verb, params string[] extra)
+        {
+            string nodePath = Path.Combine(Program, "runtime", "node.exe");
+            string script = Path.Combine(Program, "deployment", "lan.cjs");
+            using (var program = new DirectoryPins(Program))
+            using (var node = new CheckedFile(nodePath, false))
+            using (var command = new CheckedFile(script, false))
+            {
+                Pe.Require(node.Stream, false);
+                var args = new List<string> { "--disable-warning=ExperimentalWarning", script, verb }; args.AddRange(extra);
+                if (Config != null) { args.Add("--config"); args.Add(Config); }
+                var start = new ProcessStartInfo(nodePath, String.Join(" ", args.Select(Arguments.Quote))) {
+                    WorkingDirectory = Program, UseShellExecute = false, CreateNoWindow = true,
+                    RedirectStandardOutput = true, RedirectStandardError = true,
+                    StandardOutputEncoding = Product.Utf8, StandardErrorEncoding = Product.Utf8
+                };
+                start.EnvironmentVariables.Remove("NODE_OPTIONS"); start.EnvironmentVariables.Remove("NODE_PATH");
+                start.EnvironmentVariables.Remove("ELECTRON_RUN_AS_NODE");
+                using (var process = new Process { StartInfo = start })
+                {
+                    if (!process.Start()) throw new IOException("无法启动随附 Node 维护模块。");
+                    var output = new StringBuilder(); var errors = new StringBuilder();
+                    Exception outputFailure = null, errorFailure = null;
+                    var stdout = new Thread(() => { try { Drain(process.StandardOutput, output); } catch (Exception failure) { outputFailure = failure; } });
+                    var stderr = new Thread(() => { try { Drain(process.StandardError, errors); } catch (Exception failure) { errorFailure = failure; } });
+                    stdout.IsBackground = true; stderr.IsBackground = true; stdout.Start(); stderr.Start();
+                    if (!process.WaitForExit(60000))
+                    {
+                        process.Kill(); process.WaitForExit(); stdout.Join(); stderr.Join();
+                        throw new IOException("主机维护调用超时（仅结束本次启动的维护子进程）。操作可能部分保存；请刷新状态或明确停用，不能假定已回退。");
+                    }
+                    stdout.Join(); stderr.Join();
+                    if (outputFailure != null || errorFailure != null)
+                        throw new IOException("读取维护输出失败：" + (outputFailure ?? errorFailure).Message);
+                    if (process.ExitCode != 0)
+                    {
+                        string detail = errors.ToString().Trim();
+                        if (detail.StartsWith("{", StringComparison.Ordinal))
+                        {
+                            var errorValue = Json.Object(detail);
+                            object message;
+                            if (errorValue.TryGetValue("message", out message) && message is string) detail = (string)message;
+                        }
+                        throw new IOException("主机维护未完成：" + detail);
+                    }
+                    return Json.Object(output.ToString());
+                }
+            }
+        }
+        private static void Drain(StreamReader source, StringBuilder destination)
+        {
+            var buffer = new char[2048]; int count; bool tooLarge = false;
+            while ((count = source.Read(buffer, 0, buffer.Length)) > 0)
+            {
+                if (destination.Length + count > 65536) tooLarge = true;
+                else if (!tooLarge) destination.Append(buffer, 0, count);
+            }
+            if (tooLarge) throw new IOException("维护模块输出超过 64 KiB，未按成功处理。");
+        }
+        public LanStatus Status()
+        {
+            var value = Invoke("status");
+            Json.Integer(value, "formatVersion"); Json.Integer(value, "port");
+            Json.Boolean(value, "initialized"); Json.Boolean(value, "lanEnabled");
+            var status = Json.Decode<LanStatus>(Json.Encode(value));
+            status.Validate(Program, Config);
+            return status;
+        }
+        private void Configured(Dictionary<string, object> result)
+        {
+            if (Json.String(result, "status") != "configured" || !Json.Boolean(result, "needsHostRestart"))
+                throw new IOException("维护模块没有确认配置完成，不能继续假定已启用。");
+        }
+        public void Enable(string directory, string address, int prefix)
+        {
+            Paths.Absolute(directory, false); Network.Subnet(address, prefix);
+            Configured(Invoke("enable", "--certificate-dir", directory, "--address", address, "--prefix-length",
+                prefix.ToString(CultureInfo.InvariantCulture), "--offline-work", "confirmed"));
+        }
+        public void Disable() { Configured(Invoke("disable", "--offline-work", "confirmed")); }
+    }
+
+    internal static class ClientPackage
+    {
+        internal static byte[] Executable(string program)
+        {
+            string directory = Path.Combine(Paths.Absolute(program, false), "lan-windows");
+            string file = Path.Combine(directory, Product.ClientExe);
+            var metadata = Json.Object(Product.Utf8.GetString(Paths.Read(Path.Combine(directory, "build.json"), 32768)));
+            if (Json.String(metadata, "format") != "industrial-rent-lan-windows" || Json.Integer(metadata, "formatVersion") != 1)
+                throw new IOException("员工接入程序的构建清单无效。");
+            object item;
+            var hashes = metadata.TryGetValue("executableSha256", out item) ? item as Dictionary<string, object> : null;
+            if (hashes == null) throw new IOException("员工接入程序缺少 SHA-256 清单。");
+            byte[] exe = Paths.Read(file, 32 * 1024 * 1024);
+            if (Product.Hash(exe) != Json.String(hashes, Product.ClientExe)) throw new IOException("员工接入程序与构建清单不一致，拒绝发包。");
+            using (var stream = new MemoryStream(exe)) Pe.Require(stream, true);
+            return exe;
+        }
+        internal static void Create(string path, string program, Connection connection)
+        {
+            connection.Validate(false);
+            byte[] exe = Executable(program);
+            using (var directory = new PrivateDirectory(path))
+            {
+                directory.Write(Product.ClientExe, exe);
+                directory.Text("connection.rent-lan", Json.Encode(connection) + "\n");
+                directory.Text("接入必读.txt", "园区租赁 · 同一办公室局域网接入\r\n\r\n" +
+                    "请完整复制本文件夹到员工 Windows 电脑，再双击“员工电脑接入.exe”。不需要域名、云服务、VPN 或管理员安装。\r\n" +
+                    "来源：" + connection.origin + "\r\n账套：" + connection.serverId + "\r\nCA SHA-256：" + connection.Fingerprint() + "\r\n" +
+                    "请通过当面/电话等独立方式与负责人核对完整指纹后，再同意添加当前 Windows 用户根证书。\r\n" +
+                    "负责人须先关闭主机向导并恢复主机；员工工具会用正常 HTTPS 验证、此 CA 和账套身份检查连接，成功后才能创建入口或打开浏览器。\r\n" +
+                    "证书已信任不代表主机已连接；连接成功也不代表已经业务登录。使用负责人分配的既有账号，不会创建或重置管理员。\r\n" +
+                    "叶证书到期：" + connection.expiresAt + "（一年；CA 五年且私钥已销毁，没有自动续期）。请提前同步/导出草稿并联系负责人重新配置、重新发包。\r\n" +
+                    "网址使用固定 IP；建议由负责人在路由器设置 DHCP 保留。工具不会改路由/IP；地址变化时先同步或导出草稿，再按停用、重配流程操作。\r\n" +
+                    "撤销请再次打开本工具，明确选择撤销；只删除本工具新增且归属吻合的证书/入口，不删除浏览器、缓存或草稿。\r\n" +
+                    "不要发送任何 server-key.pem、整个证书目录、业务文件或口令。这个接入包只含公有信息与程序。不宣称支持 Android。\r\n");
+            }
+        }
+    }
+}

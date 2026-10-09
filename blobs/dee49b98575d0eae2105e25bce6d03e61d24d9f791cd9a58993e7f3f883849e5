@@ -1,0 +1,152 @@
+using System;
+using System.IO;
+using System.Runtime.InteropServices;
+using System.Runtime.InteropServices.ComTypes;
+using System.Security;
+using System.Text;
+using Microsoft.Win32;
+using RentLan;
+using Windows.Data.Xml.Dom;
+using Windows.UI.Notifications;
+
+namespace RentCentre.Client
+{
+    internal sealed class WindowsNotices
+    {
+        private readonly ClientState state;
+        private readonly string executable;
+        internal readonly string AppId, Scheme;
+        private bool registered;
+        internal WindowsNotices(ClientState state, string executable)
+        {
+            this.state = state; this.executable = executable;
+            AppId = "RentCentre." + state.InstallationId.Replace("-", "");
+            Scheme = "rent-" + state.InstallationId.Replace("-", "");
+        }
+        internal void Register()
+        {
+            if (registered) return;
+            string protocolPath = @"Software\Classes\" + Scheme;
+            using (var key = Registry.CurrentUser.CreateSubKey(protocolPath)) {
+                object owner = key.GetValue("RentOwner");
+                if (owner != null && (string)owner != state.InstallationId) throw new IOException("通知打开方式已被其他安装占用。");
+                key.SetValue("RentOwner", state.InstallationId); key.SetValue("", "URL:园区租赁提醒"); key.SetValue("URL Protocol", "");
+                using (var command = key.CreateSubKey(@"shell\open\command"))
+                    command.SetValue("", Quote(executable) + " --state " + Quote(state.Root) + " --activate \"%1\"");
+            }
+            using (var key = Registry.CurrentUser.CreateSubKey(@"Software\Classes\AppUserModelId\" + AppId)) {
+                key.SetValue("DisplayName", "园区租赁"); key.SetValue("ShowInSettings", 1, RegistryValueKind.DWord);
+            }
+            string directory = Environment.GetFolderPath(Environment.SpecialFolder.Programs);
+            string shortcut = Path.Combine(directory, "园区租赁提醒-" + state.InstallationId + ".lnk");
+            SaveShortcut(shortcut);
+            Marshal.ThrowExceptionForHR(SetCurrentProcessExplicitAppUserModelID(AppId));
+            registered = true;
+        }
+        internal void SaveShortcut(string shortcut)
+        {
+            using (var pins = new DirectoryPins(Path.GetDirectoryName(shortcut))) {
+                object shell = new ShellLink();
+                try {
+                    var link = (IShellLinkW)shell;
+                    if (File.Exists(shortcut)) {
+                        using (var file = new CheckedFile(shortcut, false)) { }
+                        ((IPersistFile)shell).Load(shortcut, 2);
+                        var description = new StringBuilder(1024); link.GetDescription(description, description.Capacity);
+                        if (description.ToString() != "RentOwner:" + state.InstallationId) throw new IOException("通知快捷方式归属不符，未覆盖。");
+                    }
+                    link.SetPath(executable); link.SetArguments("--state " + Quote(state.Root));
+                    link.SetWorkingDirectory(Path.GetDirectoryName(executable));
+                    link.SetDescription("RentOwner:" + state.InstallationId);
+                    var property = (IPropertyStore)shell;
+                    var key = new PropertyKey { format = new Guid("9F4C2855-9F79-4B39-A8D0-E1D42DE1D5F3"), id = 5 };
+                    var value = new PropVariant { type = 31, pointer = Marshal.StringToCoTaskMemUni(AppId) };
+                    try { Marshal.ThrowExceptionForHR(property.SetValue(ref key, ref value)); }
+                    finally { Marshal.FreeCoTaskMem(value.pointer); }
+                    // Protocol-only toasts use a stable stub CLSID; no COM server is registered.
+                    key.id = 26;
+                    value = new PropVariant { type = 72, pointer = Marshal.AllocCoTaskMem(16) };
+                    try {
+                        Marshal.Copy(new Guid(state.InstallationId).ToByteArray(), 0, value.pointer, 16);
+                        Marshal.ThrowExceptionForHR(property.SetValue(ref key, ref value));
+                        Marshal.ThrowExceptionForHR(property.Commit());
+                    }
+                    finally { Marshal.FreeCoTaskMem(value.pointer); }
+                    ((IPersistFile)shell).Save(shortcut, true);
+                } finally { Marshal.FinalReleaseComObject(shell); }
+            }
+        }
+        internal string Show(string eventId, string title, string body, NoticeTarget target)
+        {
+            target.Validate(); Register();
+            var notifier = ToastNotificationManager.CreateToastNotifier(AppId);
+            string activation = Scheme + "://open/?kind=" + target.kind + (target.id == null ? "" : "&id=" + target.id);
+            var xml = new XmlDocument();
+            xml.LoadXml("<toast activationType=\"protocol\" launch=\"" + SecurityElement.Escape(activation) +
+                "\"><visual><binding template=\"ToastGeneric\"><text>" + SecurityElement.Escape(title) +
+                "</text><text>" + SecurityElement.Escape(body) + "</text></binding></visual></toast>");
+            var toast = new ToastNotification(xml) {
+                Tag = Product.Hash(Product.Utf8.GetBytes(eventId)).Substring(0, 16), Group = "rent",
+                ExpirationTime = DateTimeOffset.Now.AddDays(1)
+            };
+            notifier.Show(toast);
+            // A new Win32 app has no readable notification setting until its first Show.
+            if (notifier.Setting != NotificationSetting.Enabled)
+                throw new IOException("Windows 未允许此软件通知。请在“设置 → 系统 → 通知”中打开园区租赁。");
+            return "已交给 Windows。勿扰模式可能隐藏右下角横幅。";
+        }
+        internal void Clear()
+        {
+            using (var key = Registry.CurrentUser.OpenSubKey(@"Software\Classes\AppUserModelId\" + AppId))
+                if (key != null) ToastNotificationManager.History.Clear(AppId);
+        }
+        internal NoticeTarget ParseActivation(string argument)
+        {
+            var match = System.Text.RegularExpressions.Regex.Match(argument ?? "", @"\A" + Scheme +
+                @"://open/?\?kind=(notifications|application|invoice)(?:&id=([a-f0-9-]{36}))?\z");
+            if (!match.Success) throw new IOException("通知打开参数无效。");
+            var target = new NoticeTarget { kind = match.Groups[1].Value, id = match.Groups[2].Success ? match.Groups[2].Value : null };
+            target.Validate(); return target;
+        }
+        internal static string Quote(string value)
+        {
+            if (value.IndexOf('"') >= 0 || value.EndsWith("\\", StringComparison.Ordinal)) throw new IOException("启动路径格式无效。");
+            return "\"" + value + "\"";
+        }
+        [DllImport("shell32.dll", CharSet = CharSet.Unicode)]
+        private static extern int SetCurrentProcessExplicitAppUserModelID(string appId);
+        [ComImport, Guid("00021401-0000-0000-C000-000000000046")]
+        private class ShellLink { }
+        [StructLayout(LayoutKind.Sequential)]
+        private struct PropertyKey { internal Guid format; internal uint id; }
+        [StructLayout(LayoutKind.Explicit, Size = 24)]
+        private struct PropVariant {
+            [FieldOffset(0)] internal ushort type;
+            [FieldOffset(8)] internal IntPtr pointer;
+        }
+        [ComImport, Guid("886D8EEB-8CF2-4446-8D02-CDBA1DBDCF99"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+        private interface IPropertyStore {
+            int GetCount(out uint count);
+            int GetAt(uint index, out PropertyKey key);
+            int GetValue(ref PropertyKey key, out PropVariant value);
+            [PreserveSig] int SetValue(ref PropertyKey key, ref PropVariant value);
+            [PreserveSig] int Commit();
+        }
+        [ComImport, Guid("000214F9-0000-0000-C000-000000000046"), InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+        private interface IShellLinkW {
+            void GetPath([Out, MarshalAs(UnmanagedType.LPWStr)] StringBuilder file, int count, IntPtr data, uint flags);
+            void GetIDList(out IntPtr id); void SetIDList(IntPtr id);
+            void GetDescription([Out, MarshalAs(UnmanagedType.LPWStr)] StringBuilder value, int count);
+            void SetDescription([MarshalAs(UnmanagedType.LPWStr)] string value);
+            void GetWorkingDirectory([Out, MarshalAs(UnmanagedType.LPWStr)] StringBuilder value, int count);
+            void SetWorkingDirectory([MarshalAs(UnmanagedType.LPWStr)] string value);
+            void GetArguments([Out, MarshalAs(UnmanagedType.LPWStr)] StringBuilder value, int count);
+            void SetArguments([MarshalAs(UnmanagedType.LPWStr)] string value);
+            void GetHotkey(out short value); void SetHotkey(short value); void GetShowCmd(out int value); void SetShowCmd(int value);
+            void GetIconLocation([Out, MarshalAs(UnmanagedType.LPWStr)] StringBuilder value, int count, out int index);
+            void SetIconLocation([MarshalAs(UnmanagedType.LPWStr)] string value, int index);
+            void SetRelativePath([MarshalAs(UnmanagedType.LPWStr)] string value, uint reserved);
+            void Resolve(IntPtr window, uint flags); void SetPath([MarshalAs(UnmanagedType.LPWStr)] string value);
+        }
+    }
+}

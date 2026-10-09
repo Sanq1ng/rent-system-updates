@@ -1,0 +1,120 @@
+"use strict";
+
+const fs = require("node:fs");
+const path = require("node:path");
+const crypto = require("node:crypto");
+const { DatabaseSync } = require("node:sqlite");
+const { createBackup } = require("./backup.cjs");
+const { SCHEMA_VERSION, PUSH_SCHEMA, assertSupportedSchema, migrateSchema } = require("./push-schema.cjs");
+const { INVITATION_SCHEMA } = require("./invitation-schema.cjs");
+const { DESKTOP_SCHEMA } = require("./desktop-schema.cjs");
+
+function openStore(config) {
+  const databasePath = path.join(config.dataDir, "rent.sqlite");
+  if (fs.existsSync(databasePath) || config.lan) {
+    const existing = new DatabaseSync(path.toNamespacedPath(databasePath), { readOnly: true });
+    try {
+      const version = existing.prepare("PRAGMA user_version").get().user_version;
+      assertSupportedSchema(existing, version);
+      if (config.lan && (version !== SCHEMA_VERSION ||
+          !existing.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='meta'").get() ||
+          existing.prepare("SELECT value FROM meta WHERE key='server_id'").get()?.value !== config.lan.serverId ||
+          !existing.prepare("SELECT 1 FROM users LIMIT 1").get())) {
+        const error = new Error("局域网入口必须使用同版本已初始化的原账本，不会自动迁移或重建账套；旧格式须先停止主机，通过 deployment\\migration.cjs schema-upgrade 维护命令备份并升级。");
+        error.code = "LAN_IDENTITY";
+        error.status = 503;
+        throw error;
+      }
+    } finally { existing.close(); }
+  }
+  fs.mkdirSync(config.dataDir, { recursive: true, mode: 0o700 });
+  fs.mkdirSync(path.join(config.dataDir, "attachments"), { recursive: true, mode: 0o700 });
+  const db = new DatabaseSync(path.toNamespacedPath(databasePath));
+  try {
+    const version = db.prepare("PRAGMA user_version").get().user_version;
+    assertSupportedSchema(db, version);
+    db.exec("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000");
+    if (version === 0) {
+      db.exec(`BEGIN IMMEDIATE;
+        CREATE TABLE meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);
+        CREATE TABLE users(id TEXT PRIMARY KEY, username TEXT NOT NULL UNIQUE COLLATE NOCASE, json TEXT NOT NULL, salt TEXT NOT NULL, password_hash TEXT NOT NULL);
+        CREATE TABLE sessions(token_hash TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id), csrf TEXT NOT NULL, expires_at INTEGER NOT NULL);
+        CREATE INDEX sessions_user ON sessions(user_id);
+        CREATE TABLE settings(id INTEGER PRIMARY KEY CHECK(id=1), json TEXT NOT NULL);
+        CREATE TABLE contracts(id TEXT PRIMARY KEY, version INTEGER NOT NULL, status TEXT NOT NULL, json TEXT NOT NULL);
+        CREATE TABLE invoices(id TEXT PRIMARY KEY, contract_id TEXT NOT NULL REFERENCES contracts(id), row_id TEXT NOT NULL, version INTEGER NOT NULL, status TEXT NOT NULL, json TEXT NOT NULL);
+        CREATE INDEX invoices_contract ON invoices(contract_id, row_id);
+        CREATE TABLE payments(id TEXT PRIMARY KEY, invoice_id TEXT NOT NULL REFERENCES invoices(id), version INTEGER NOT NULL, status TEXT NOT NULL, json TEXT NOT NULL);
+        CREATE TABLE refunds(id TEXT PRIMARY KEY, invoice_id TEXT NOT NULL REFERENCES invoices(id), json TEXT NOT NULL);
+        CREATE TABLE applications(id TEXT PRIMARY KEY, creator TEXT NOT NULL REFERENCES users(id), version INTEGER NOT NULL, status TEXT NOT NULL, json TEXT NOT NULL);
+        CREATE TABLE operations(actor TEXT NOT NULL REFERENCES users(id), id TEXT NOT NULL, digest TEXT NOT NULL, result TEXT NOT NULL, PRIMARY KEY(actor,id));
+        CREATE TABLE attachments(id TEXT PRIMARY KEY, upload_id TEXT NOT NULL, owner TEXT NOT NULL REFERENCES users(id), name TEXT NOT NULL, size INTEGER NOT NULL, mime TEXT NOT NULL, sha256 TEXT NOT NULL, UNIQUE(owner,upload_id));
+        CREATE TABLE audit(id TEXT PRIMARY KEY, action TEXT NOT NULL, actor TEXT NOT NULL, at TEXT NOT NULL, json TEXT NOT NULL);
+        CREATE TABLE notifications(id TEXT PRIMARY KEY, type TEXT NOT NULL, date TEXT NOT NULL, invoice_id TEXT, month TEXT);
+        CREATE TABLE notification_reads(id TEXT NOT NULL REFERENCES notifications(id), user_id TEXT NOT NULL REFERENCES users(id), PRIMARY KEY(id,user_id));
+        INSERT INTO meta VALUES('server_id','${crypto.randomUUID()}');
+        INSERT INTO meta VALUES('changes','0');
+        INSERT INTO meta VALUES('backed_up','0');
+        ${PUSH_SCHEMA}
+        ${INVITATION_SCHEMA}
+        ${DESKTOP_SCHEMA}
+        PRAGMA user_version=${SCHEMA_VERSION};
+        COMMIT;`);
+    }
+    if (version >= 1 && version < SCHEMA_VERSION) migrateSchema(db);
+    const get = key => db.prepare("SELECT value FROM meta WHERE key=?").get(key)?.value;
+    const set = (key, value) => db.prepare("INSERT INTO meta(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value").run(key, String(value));
+    const transaction = callback => {
+      db.exec("BEGIN IMMEDIATE");
+      try {
+        const result = callback();
+        if (result && typeof result.then === "function") throw new Error("SQLite transaction callback must be synchronous.");
+        db.exec("COMMIT");
+        return result;
+      } catch (error) {
+        if (db.isTransaction) {
+          try { db.exec("ROLLBACK"); }
+          catch (rollbackError) { throw new AggregateError([error, rollbackError], "SQLite transaction and rollback failed."); }
+        }
+        throw error;
+      }
+    };
+    const changed = () => set("changes", Number(get("changes")) + 1);
+    const read = (table, id) => {
+      if (!["users", "contracts", "invoices", "payments", "refunds", "applications"].includes(table)) throw new Error("Invalid table");
+      const row = db.prepare(`SELECT json FROM ${table} WHERE id=?`).get(id);
+      return row && JSON.parse(row.json);
+    };
+    const all = table => {
+      if (!["users", "contracts", "invoices", "payments", "refunds", "applications", "audit"].includes(table)) throw new Error("Invalid table");
+      return db.prepare(`SELECT json FROM ${table}`).all().map(row => JSON.parse(row.json));
+    };
+    const put = (table, entity, extra = {}) => {
+      const json = JSON.stringify(entity);
+      if (table === "contracts") db.prepare("INSERT INTO contracts(id,version,status,json) VALUES(?,?,?,?) ON CONFLICT(id) DO UPDATE SET version=excluded.version,status=excluded.status,json=excluded.json").run(entity.id, entity.version, entity.status, json);
+      else if (table === "invoices") db.prepare("INSERT INTO invoices(id,contract_id,row_id,version,status,json) VALUES(?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET version=excluded.version,status=excluded.status,json=excluded.json").run(entity.id, entity.contractId, extra.rowId || entity.rowId, entity.version, entity.status, json);
+      else if (table === "payments") db.prepare("INSERT INTO payments(id,invoice_id,version,status,json) VALUES(?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET version=excluded.version,status=excluded.status,json=excluded.json").run(entity.id, entity.invoiceId, entity.version, entity.status, json);
+      else if (table === "refunds") db.prepare("INSERT INTO refunds(id,invoice_id,json) VALUES(?,?,?)").run(entity.id, entity.invoiceId, json);
+      else if (table === "applications") db.prepare("INSERT INTO applications(id,creator,version,status,json) VALUES(?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET version=excluded.version,status=excluded.status,json=excluded.json").run(entity.id, entity.creator, entity.version, entity.status, json);
+      else throw new Error("Invalid table");
+    };
+    const backups = new Set();
+    const makeBackup = destination => {
+      const pending = createBackup(db, { dataDir: config.dataDir, backupDir: config.backupDir }, destination);
+      backups.add(pending);
+      pending.then(() => backups.delete(pending), () => backups.delete(pending));
+      return pending;
+    };
+    const waitForBackups = async () => {
+      while (backups.size) await Promise.allSettled([...backups]);
+    };
+    return { db, get, set, transaction, changed, read, all, put,
+      createBackup: makeBackup, waitForBackups, serverId: get("server_id"), close: () => db.close() };
+  } catch (error) {
+    if (db.isTransaction) db.exec("ROLLBACK");
+    db.close();
+    throw error;
+  }
+}
+
+module.exports = { openStore, SCHEMA_VERSION };

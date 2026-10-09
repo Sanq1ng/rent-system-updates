@@ -1,0 +1,136 @@
+using System;
+using System.ComponentModel;
+using System.Diagnostics;
+using System.IO;
+using System.Threading.Tasks;
+using System.Windows.Forms;
+
+namespace RentCentre.Desktop
+{
+    internal sealed partial class Manager
+    {
+        private ActionButton lanButton;
+        private bool configuringLan, pendingLan, resumeAfterLan, firstLanSetup;
+        private OwnedJob lanProcessJob;
+
+        private void ConfigureLan(bool firstSetup = false)
+        {
+            if (configuringLan || updating || exitAfterStop) return;
+            if (current != null && (!current.Ready || current.ReportedError || current.ExpectedStop))
+            {
+                ShowNotice("请先等待主机启动或停止完成。");
+                return;
+            }
+            if (current != null && !initialized)
+            {
+                ShowNotice("请先创建管理员账号，再设置其他电脑的连接。");
+                return;
+            }
+            try
+            {
+                applicationDirectory = LaunchOptions.FindApplication();
+                if (!File.Exists(Path.Combine(applicationDirectory, "lan-windows", "局域网配置.exe")))
+                    throw new IOException("缺少同版本的局域网配置组件，请使用完整的局域网主机包；原账本没有改动。");
+            }
+            catch (IOException error) { ShowNotice(error.Message); return; }
+            if (!firstSetup && MessageBox.Show(this,
+                "设置期间会暂时停止连接。\n请让同事先保存并同步工作；未同步的内容请先导出。\n\n继续设置其他电脑的连接吗？",
+                "其他电脑连接", MessageBoxButtons.YesNo, MessageBoxIcon.Information,
+                MessageBoxDefaultButton.Button2) != DialogResult.Yes) return;
+            firstLanSetup = firstSetup;
+            resumeAfterLan = current != null;
+            configuringLan = true;
+            if (current != null)
+            {
+                pendingLan = true;
+                StopHost(false);
+            }
+            else OpenLanWizard();
+            RefreshControls();
+        }
+
+        private bool ContinueLanAfterExit(HostRun run, int code)
+        {
+            if (!pendingLan) return false;
+            pendingLan = false;
+            if (code == 0 && run.ExpectedStop && !run.ReportedError)
+            {
+                SetState(HostState.Stopped, "主机已停止，正在打开连接设置。");
+                OpenLanWizard();
+            }
+            else
+            {
+                configuringLan = false;
+                resumeAfterLan = false;
+                SetState(HostState.Error, "停止过程未正常完成，未打开局域网向导。请先核对主机错误。");
+            }
+            return true;
+        }
+
+        private async void OpenLanWizard()
+        {
+            OwnedJob owned = null;
+            try
+            {
+                owned = new OwnedJob();
+                lanProcessJob = owned;
+                var start = new ProcessStartInfo {
+                    FileName = Path.Combine(applicationDirectory, "lan-windows", "局域网配置.exe"),
+                    Arguments = "--program " + LaunchOptions.Quote(applicationDirectory) +
+                        (options.ConfigFile == null ? "" : " --config " + LaunchOptions.Quote(options.ConfigFile)) +
+                        (options.AdvancedSetup ? " --advanced" : "") +
+                        (firstLanSetup ? " --first-setup" : ""),
+                    WorkingDirectory = applicationDirectory, UseShellExecute = false
+                };
+                start.EnvironmentVariables.Remove("NODE_OPTIONS");
+                start.EnvironmentVariables.Remove("NODE_PATH");
+                int code;
+                using (Process process = Process.Start(start))
+                {
+                    if (process == null) throw new IOException("未能打开局域网向导。");
+                    try { owned.Assign(process); }
+                    catch (Win32Exception)
+                    {
+                        if (!process.HasExited) { process.Kill(); process.WaitForExit(10000); }
+                        throw;
+                    }
+                    AddActivity("连接设置已打开。出现 Windows 提示时，请在提示窗口中确认。");
+                    code = await Task.Run(() => { process.WaitForExit(); return process.ExitCode; });
+                }
+                if (IsDisposed || Disposing) return;
+                configuringLan = false;
+                if (code != 0)
+                {
+                    resumeAfterLan = false;
+                    SetState(HostState.Error, "局域网向导未全部完成，主机保持停止。请按向导提示恢复或修复后再启动。");
+                    return;
+                }
+                AddActivity("连接设置已关闭。主机启动后，到“系统管理 → 连接同事电脑”核对配对申请。");
+                if (resumeAfterLan)
+                {
+                    resumeAfterLan = false;
+                    firstBrowser = true;
+                    StartHost();
+                }
+                else SetState(HostState.Stopped, "可点击“启动主机”，再在系统管理中核对同事的配对申请。");
+            }
+            catch (IOException error) { LanFailed(error); }
+            catch (Win32Exception error) { LanFailed(error); }
+            catch (InvalidOperationException error) { LanFailed(error); }
+            finally
+            {
+                if (owned != null) owned.Dispose();
+                if (lanProcessJob == owned) lanProcessJob = null;
+                if (!IsDisposed && !Disposing) RefreshControls();
+            }
+        }
+
+        private void LanFailed(Exception error)
+        {
+            configuringLan = false;
+            resumeAfterLan = false;
+            if (IsDisposed || Disposing) return;
+            SetState(HostState.Error, "局域网向导未完成：" + error.Message + "。原账本保留，请核对后手动启动。");
+        }
+    }
+}

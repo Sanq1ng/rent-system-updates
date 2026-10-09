@@ -1,0 +1,140 @@
+using System;
+using System.Collections.Generic;
+using System.Diagnostics;
+using System.IO;
+using System.Security.Cryptography;
+using System.Text;
+using System.Text.RegularExpressions;
+using System.Threading.Tasks;
+using System.Web.Script.Serialization;
+
+namespace RentCentre.Desktop
+{
+    internal static class FullUpdateLaunch
+    {
+        internal static string Config(string program, LaunchOptions options)
+        {
+            if (options.ConfigFile != null) return options.ConfigFile;
+            string managed = Path.Combine(Directory.GetParent(program).FullName, "配置", "config.json");
+            return File.Exists(managed) ? managed : Path.Combine(program, "config.json");
+        }
+        internal static string Storage(string program, LaunchOptions options)
+        {
+            string file = Config(program, options);
+            if (!File.Exists(file)) return program;
+            var value = Read(file, 65536); object entry;
+            if (!value.TryGetValue("updateDir", out entry) || entry == null) return program;
+            if (!(entry is string) || String.IsNullOrWhiteSpace((string)entry)) throw new IOException("更新目录配置无效。");
+            return Path.GetFullPath(Path.Combine(Path.GetDirectoryName(file), (string)entry));
+        }
+        internal static Dictionary<string, object> Read(string file, int maximum)
+        {
+            var stat = new FileInfo(file);
+            if (stat.Length > maximum || (stat.Attributes & FileAttributes.ReparsePoint) != 0) throw new IOException("更新记录不是允许的普通文件。");
+            using (var stream = new FileStream(file, FileMode.Open, FileAccess.Read, FileShare.Read | FileShare.Delete))
+            using (var reader = new StreamReader(stream, Encoding.UTF8)) {
+                if (stream.Length > maximum) throw new IOException("更新记录超过大小限制。");
+                return new JavaScriptSerializer { MaxJsonLength = maximum, RecursionLimit = 32 }
+                    .Deserialize<Dictionary<string, object>>(reader.ReadToEnd());
+            }
+        }
+        internal static void VerifyHelper(string helper, string expected, string storage)
+        {
+            if (!Regex.IsMatch(expected ?? "", "^[a-f0-9]{64}$") || Path.GetFileName(helper) != "应用程序更新.exe" ||
+                Path.GetFileName(Path.GetDirectoryName(helper)) != "desktop") throw new IOException("更新助手归属无效。");
+            string release = Directory.GetParent(Path.GetDirectoryName(helper)).FullName;
+            if (!Regex.IsMatch(Path.GetFileName(release), "^[a-f0-9]{64}$") ||
+                !String.Equals(Directory.GetParent(release).FullName, Path.Combine(storage, "releases"), StringComparison.OrdinalIgnoreCase))
+                throw new IOException("更新助手不属于本次暂存目录。");
+            using (var stream = new FileStream(helper, FileMode.Open, FileAccess.Read, FileShare.Read))
+            using (var hash = SHA256.Create()) {
+                string actual = BitConverter.ToString(hash.ComputeHash(stream)).Replace("-", "").ToLowerInvariant();
+                if (actual != expected) throw new IOException("更新助手在启动前发生变化，已停止交接。");
+            }
+        }
+        internal static bool ClientResumeRequired(string program, string config, Dictionary<string, object> job,
+            Dictionary<string, object> receipt)
+        {
+            if (job == null || !Equals(job["id"], receipt["jobId"]) ||
+                !Equals(receipt["format"], "industrial-rent-full-apply") || Convert.ToInt32(receipt["formatVersion"]) != 1 ||
+                !Equals(receipt["program"], program) || !Equals(receipt["configFile"], config) ||
+                !Equals(receipt["mode"], "client") || !Equals(receipt["phase"], "copying") ||
+                !Equals(receipt["sourceId"], job["candidateReleaseId"]) ||
+                !Equals(receipt["targetVersion"], job["targetVersion"]))
+                throw new IOException("员工更新收据与本机任务不符。");
+            if (Equals(job["phase"], "committed")) return false;
+            if (!Equals(job["phase"], "copying") && !Equals(job["phase"], "staged"))
+                throw new IOException("员工更新交接阶段无效。");
+            object previous;
+            if (!job.TryGetValue("previousReleaseId", out previous) || !(previous is string) ||
+                !Regex.IsMatch((string)previous, "^[a-f0-9]{64}$"))
+                throw new IOException("员工更新缺少原程序快照，不能继续交接。");
+            return true;
+        }
+        internal static bool Resume(LaunchOptions options)
+        {
+            if (options.UpdateJob != null) return false;
+            string program = LaunchOptions.FindApplication(), storage = Storage(program, options);
+            string roleFile = Path.Combine(Directory.GetParent(program).FullName, "配置", "电脑角色.json");
+            if (File.Exists(roleFile) && Equals(Read(roleFile, 2048)["mode"], "client")) {
+                string clientStorage = Path.Combine(Directory.GetParent(program).FullName, "更新", "client-runtime");
+                string clientReceiptFile = Path.Combine(clientStorage, "full-apply.json");
+                if (!File.Exists(clientReceiptFile)) return false;
+                var clientReceipt = Read(clientReceiptFile, 2097152);
+                var clientState = Read(Path.Combine(clientStorage, "client-state.json"), 2097152);
+                var clientJob = clientState["job"] as Dictionary<string, object>;
+                if (!ClientResumeRequired(program, Config(program, options), clientJob, clientReceipt)) return false;
+                string clientHelper = (string)clientReceipt["helper"];
+                VerifyHelper(clientHelper, (string)clientReceipt["helperSha256"], clientStorage);
+                Process.Start(new ProcessStartInfo(clientHelper, "--recover --client --program " + LaunchOptions.Quote(program) +
+                    " --config " + LaunchOptions.Quote(Config(program, options)) + " --job " + (string)clientJob["id"]) {
+                    UseShellExecute = false, WorkingDirectory = Path.GetDirectoryName(clientHelper)
+                });
+                return true;
+            }
+            string receiptFile = Path.Combine(storage, "update-state", "full-apply.json");
+            if (!File.Exists(receiptFile)) return false;
+            var receipt = Read(receiptFile, 2097152);
+            var state = Read(Path.Combine(storage, "update-state", "state.json"), 8388608);
+            var job = state["job"] as Dictionary<string, object>;
+            if (job == null || !Equals(job["id"], receipt["jobId"]) || (string)receipt["format"] != "industrial-rent-full-apply" ||
+                Convert.ToInt32(receipt["formatVersion"]) != 1 || (string)receipt["program"] != program ||
+                (string)receipt["configFile"] != Config(program, options)) throw new IOException("未完成更新不属于本次安装，请维护人员核对。");
+            string phase = (string)job["phase"];
+            if (phase == "committed" || phase == "rolled-back") return false;
+            if (phase == "trial" || phase == "rollback-trial") { options.UpdateJob = (string)job["id"]; return false; }
+            if (phase != "full-applying" && phase != "full-apply-pending") throw new IOException("未完成更新的交接阶段无效。");
+            string helper = (string)receipt["helper"];
+            VerifyHelper(helper, (string)receipt["helperSha256"], storage);
+            Process.Start(new ProcessStartInfo(helper, "--recover --program " + LaunchOptions.Quote(program) +
+                " --config " + LaunchOptions.Quote(Config(program, options)) + " --job " + (string)job["id"] +
+                (Equals(job.ContainsKey("fullRollback") ? job["fullRollback"] : receipt["rollback"], true) ? " --rollback" : "")) {
+                    UseShellExecute = false, WorkingDirectory = Path.GetDirectoryName(helper) });
+            return true;
+        }
+    }
+    internal sealed partial class Manager
+    {
+        private async Task LaunchFullUpdate(Dictionary<string, object> result)
+        {
+            string helper = Value(result, "helper"), id = Value(result, "jobId");
+            FullUpdateLaunch.VerifyHelper(helper, Value(result, "helperSha256"), FullUpdateLaunch.Storage(applicationDirectory, options));
+            var parent = Process.GetCurrentProcess();
+            var start = new ProcessStartInfo(helper, "--program " + LaunchOptions.Quote(applicationDirectory) +
+                " --config " + LaunchOptions.Quote(FullUpdateLaunch.Config(applicationDirectory, options)) +
+                " --job " + id + " --parent " + parent.Id + " --parent-start " + parent.StartTime.ToUniversalTime().Ticks +
+                ((bool)result["rollback"] ? " --rollback" : "")) {
+                UseShellExecute = false, WorkingDirectory = Path.GetDirectoryName(helper),
+                RedirectStandardInput = true, RedirectStandardOutput = true, StandardOutputEncoding = new UTF8Encoding(false)
+            };
+            using (var helperProcess = Process.Start(start)) {
+                byte[] frame = new UTF8Encoding(false).GetBytes("{\"command\":\"apply\",\"protocol\":1,\"jobId\":\"" + id + "\"}\n");
+                helperProcess.StandardInput.BaseStream.Write(frame, 0, frame.Length); helperProcess.StandardInput.BaseStream.Flush();
+                var reading = helperProcess.StandardOutput.ReadLineAsync();
+                if (await Task.WhenAny(reading, Task.Delay(15000)) != reading || await reading != "{\"ready\":true}")
+                    throw new IOException("更新助手未确认接管，原窗口仍保留。");
+                exitAfterStop = true; FinishExit();
+            }
+        }
+    }
+}

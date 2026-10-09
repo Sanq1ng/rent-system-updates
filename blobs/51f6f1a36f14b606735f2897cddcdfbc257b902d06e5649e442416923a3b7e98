@@ -1,0 +1,25 @@
+"use strict";
+const ROOT_FILES = new Set(["host.cjs", "config.cjs", "logging.cjs", "maintenance.cjs", "config.example.json",
+  "启动主机.cmd", "维护工具.cmd", "设置开机启动.ps1", "操作与部署说明.md", "部署检查表.md", "园区租赁主机.exe"]);
+const NATIVE_FILES = new Set(["园区租赁主机.exe", "应用程序更新.exe", "园区租赁.exe", "园区租赁.exe.config",
+  "局域网配置.exe", "员工电脑接入.exe", "Microsoft.Web.WebView2.Core.dll", "Microsoft.Web.WebView2.WinForms.dll", "WebView2Loader.dll"]);
+const BUNDLE_DIRECTORIES = ["runtime", "desktop", "client-windows", "lan-windows", "deployment", "updates", "third_party"];
+const REQUIRED_BUNDLE_FILES = ["host.cjs", "config.cjs", "logging.cjs", "runtime/node.exe", "desktop/园区租赁主机.exe",
+  "desktop/应用程序更新.exe", "client-windows/园区租赁.exe", "client-windows/园区租赁.exe.config",
+  "client-windows/Microsoft.Web.WebView2.Core.dll", "client-windows/Microsoft.Web.WebView2.WinForms.dll",
+  "client-windows/WebView2Loader.dll", "client-windows/WEBVIEW2-LICENSE.txt", "updates/supervisor.cjs",
+  "updates/full-apply.cjs", "server/schema-update.cjs", "third_party/NODE-LICENSE.txt"];
+function bundlePath(value) {
+  if (ROOT_FILES.has(value)) return true;
+  if (value === "runtime/node.exe" || value === "third_party/NODE-LICENSE.txt" || value === "third_party/node-license.json") return true;
+  const parts = value.split("/");
+  if (parts.length !== 2) return false;
+  const [directory, name] = parts;
+  if (["desktop", "client-windows", "lan-windows"].includes(directory)) return NATIVE_FILES.has(name) ||
+    /^[A-Za-z][A-Za-z0-9_.-]*\.(?:cs|ps1|cjs|ico)$/.test(name) ||
+    ["build.json", "dependencies.json", "app.manifest", "Client.exe.config", "README.md", "WEBVIEW2-LICENSE.txt"].includes(name);
+  if (["updates", "deployment"].includes(directory)) return /^[A-Za-z][A-Za-z0-9_.-]*\.cjs$/.test(name) ||
+    name === "README.md" || directory === "updates" && name === "trust-public.json";
+  return false;
+}
+module.exports = { ROOT_FILES, BUNDLE_DIRECTORIES, REQUIRED_BUNDLE_FILES, bundlePath };

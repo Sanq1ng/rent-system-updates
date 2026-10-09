@@ -1,0 +1,638 @@
+(function (root, factory) {
+  "use strict";
+  if (typeof module === "object" && module.exports) module.exports = factory();
+  else root.RentUpdateClient = factory();
+})(globalThis, function () {
+  "use strict";
+
+  const POLL_MS = 5000;
+
+  function createController(options) {
+    return new Controller(options);
+  }
+
+  function randomId() {
+    if (globalThis.crypto && typeof globalThis.crypto.randomUUID === "function") {
+      return globalThis.crypto.randomUUID();
+    }
+    return `rent-update-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
+  }
+
+  function normalizeMaintenance(value) {
+    if (!value || typeof value !== "object") return null;
+    const phase = typeof value.phase === "string" ? value.phase : "idle";
+    if (phase === "idle") return null;
+    const id = typeof value.id === "string" && value.id ? value.id :
+      typeof value.windowId === "string" && value.windowId ? value.windowId : null;
+    const expiresAt = Number.isFinite(value.expiresAt) ? Number(value.expiresAt) :
+      typeof value.expiresAt === "string" ? value.expiresAt : null;
+    return {
+      phase,
+      id,
+      targetVersion: typeof value.targetVersion === "string" ? value.targetVersion : null,
+      expiresAt,
+      pageCount: Number.isFinite(value.pageCount) ? Number(value.pageCount) : null,
+      readyCount: Number.isFinite(value.readyCount) ? Number(value.readyCount) : null,
+      message: typeof value.message === "string" && value.message ? value.message : null,
+    };
+  }
+
+  function normalizeWorkState(value) {
+    const source = value && typeof value === "object" ? value : {};
+    return {
+      authenticated: !!source.authenticated,
+      online: source.online !== false,
+      generation: source.generation === undefined || source.generation === null ? null : source.generation,
+      busy: !!source.busy,
+      modalOpen: !!source.modalOpen,
+      fileBusy: !!source.fileBusy,
+      navigating: !!source.navigating,
+      editorDirty: !!source.editorDirty,
+      queueCount: Number.isFinite(source.queueCount) ? Math.max(0, Number(source.queueCount)) : 0,
+      importAwaitingReview: !!source.importAwaitingReview,
+    };
+  }
+
+  function errorMessage(error) {
+    if (error && typeof error.message === "string" && error.message.trim()) return error.message.trim();
+    if (typeof error === "string" && error.trim()) return error.trim();
+    return "更新发生未能识别的错误，请联系维护人员。";
+  }
+
+  function isOfflineError(error, workState) {
+    if (workState && workState.online === false) return true;
+    if (!error || typeof error !== "object") return false;
+    return error.offline === true || error.network === true ||
+      error.code === "OFFLINE" ||
+      error.code === "NETWORK" ||
+      error.code === "NETWORK_ERROR" ||
+      error.code === "ECONNRESET" ||
+      error.code === "ECONNREFUSED" ||
+      error.code === "ENOTFOUND" ||
+      error.code === "ETIMEDOUT" ||
+      error.name === "TypeError";
+  }
+
+  function maintenanceBlocker(workState, availableVersion, currentVersion, postSave) {
+    if (workState.modalOpen) {
+      return { code: "form", message: "请先保存主机设置，或完成、关闭当前弹窗，再确认主机更新。" };
+    }
+    if (workState.fileBusy) {
+      return { code: "busy", message: "正在处理原件或加密存储，请稍后再确认主机更新。" };
+    }
+    if (workState.busy) {
+      return { code: "busy", message: "正在处理当前操作，请等待完成后再确认主机更新。" };
+    }
+    if (workState.navigating) {
+      return { code: "busy", message: "页面正在切换，请等待当前导航完成后再确认主机更新。" };
+    }
+    if (workState.queueCount > 0) {
+      return { code: "queue", message: "仍有已保存的排队操作待同步，暂不确认主机更新。" };
+    }
+    if (workState.importAwaitingReview) {
+      return { code: "queue", message: "存在待人工核对的迁入请求，请先在本机工作与同步中确认处理。" };
+    }
+    if (availableVersion && availableVersion !== currentVersion) {
+      return { code: "old-client", message: "当前页面已落后于主机程序版本，请在安全时手动刷新。" };
+    }
+    if (postSave && workState.editorDirty) {
+      return { code: "storage", message: "草稿尚未保存完成，暂不确认主机更新。" };
+    }
+    return null;
+  }
+
+  function reloadBlocker(workState, postSave) {
+    if (workState.modalOpen) {
+      return { code: "form", message: "请先保存主机设置，或完成、关闭当前弹窗，再保存并刷新页面。" };
+    }
+    if (workState.fileBusy) {
+      return { code: "busy", message: "正在处理原件或加密存储，请稍后再保存并刷新页面。" };
+    }
+    if (workState.busy) {
+      return { code: "busy", message: "正在处理当前操作，请等待完成后再保存并刷新页面。" };
+    }
+    if (workState.navigating) {
+      return { code: "busy", message: "页面正在切换，请等待当前导航完成后再保存并刷新页面。" };
+    }
+    if (postSave && workState.editorDirty) {
+      return { code: "storage", message: "草稿尚未保存完成，请稍后再刷新页面。" };
+    }
+    return null;
+  }
+
+  function cloneState(state) {
+    return {
+      version: state.version,
+      tabId: state.tabId,
+      availableVersion: state.availableVersion,
+      maintenance: state.maintenance ? { ...state.maintenance } : null,
+      paused: state.paused,
+      blocker: state.blocker,
+      blockerCode: state.blockerCode,
+      waitingForHost: state.waitingForHost,
+      error: state.error,
+    };
+  }
+
+  class Controller {
+    constructor(options) {
+      if (!options || typeof options !== "object") throw new TypeError("Update client options are required.");
+      if (typeof options.version !== "string" || !options.version.trim()) {
+        throw new TypeError("Update client version is required.");
+      }
+      if (typeof options.request !== "function") throw new TypeError("Update client request(path, options) is required.");
+      if (typeof options.getWorkState !== "function") throw new TypeError("Update client getWorkState() is required.");
+      if (typeof options.saveDraft !== "function") throw new TypeError("Update client saveDraft() is required.");
+
+      this.version = options.version.trim();
+      this.tabId = typeof options.tabId === "string" && options.tabId ? options.tabId : randomId();
+      this._request = options.request;
+      this._getWorkState = options.getWorkState;
+      this._saveDraft = options.saveDraft;
+      this._pause = typeof options.pause === "function" ? options.pause : function () {};
+      this._changed = typeof options.changed === "function" ? options.changed : function () {};
+      this._reportError = typeof options.reportError === "function" ? options.reportError : function () {};
+      this._reload = typeof options.reload === "function" ? options.reload : function () {
+        if (globalThis.location && typeof globalThis.location.reload === "function") {
+          globalThis.location.reload();
+        }
+      };
+      this._prepareReload = typeof options.prepareReload === "function" ? options.prepareReload : async function () {};
+      this._setTimeout = typeof options.setTimeout === "function" ? options.setTimeout : globalThis.setTimeout.bind(globalThis);
+      this._clearTimeout = typeof options.clearTimeout === "function" ? options.clearTimeout : globalThis.clearTimeout.bind(globalThis);
+      this._onlineTarget = options.onlineTarget && typeof options.onlineTarget.addEventListener === "function" &&
+        typeof options.onlineTarget.removeEventListener === "function"
+        ? options.onlineTarget
+        : typeof globalThis.addEventListener === "function" && typeof globalThis.removeEventListener === "function"
+          ? globalThis
+          : null;
+      this._boundHandleOnline = this._handleOnline.bind(this);
+      this._onlineListening = false;
+
+      this._running = false;
+      this._timer = null;
+      this._epoch = 0;
+      this._heartbeatPromise = null;
+      this._savePromise = null;
+      this._reloadPromise = null;
+      this._maintenanceReadyId = null;
+      this._reported = new Set();
+
+      this._state = {
+        version: this.version,
+        tabId: this.tabId,
+        availableVersion: null,
+        maintenance: null,
+        paused: false,
+        blocker: null,
+        blockerCode: null,
+        waitingForHost: false,
+        error: null,
+      };
+    }
+
+    getState() {
+      return cloneState(this._state);
+    }
+
+    start() {
+      if (this._running) return this;
+      this._running = true;
+      this._bindOnline();
+      this._emit();
+      this._schedule(0);
+      return this;
+    }
+
+    stop() {
+      this._running = false;
+      this._epoch += 1;
+      this._maintenanceReadyId = null;
+      this._reported.clear();
+      this._unbindOnline();
+      if (this._timer !== null) {
+        this._clearTimeout(this._timer);
+        this._timer = null;
+      }
+      this._replaceState({
+        version: this.version,
+        tabId: this.tabId,
+        availableVersion: null,
+        maintenance: null,
+        paused: false,
+        blocker: null,
+        blockerCode: null,
+        waitingForHost: false,
+        error: null,
+      });
+      return this;
+    }
+
+    observeVersion(version) {
+      const normalized = typeof version === "string" && version.trim() ? version.trim() : null;
+      const next = normalized && normalized !== this.version ? normalized : null;
+      if (this._state.availableVersion !== next) {
+        this._replaceState({ availableVersion: next });
+      }
+      return this.getState();
+    }
+
+    tick() {
+      if (this._reloadPromise) return Promise.resolve(this.getState());
+      if (this._heartbeatPromise) return this._heartbeatPromise;
+      const run = this._runHeartbeat().finally(() => {
+        if (this._heartbeatPromise === run) this._heartbeatPromise = null;
+        if (this._running) this._schedule(POLL_MS);
+      });
+      this._heartbeatPromise = run;
+      return run;
+    }
+
+    safeReload() {
+      if (this._reloadPromise) return this._reloadPromise;
+      const pending = this._heartbeatPromise || this._savePromise;
+      if (pending) {
+        const generation = this._workState().generation, epoch = this._epoch;
+        const chained = pending.then(() => {
+          if (this._reloadPromise === chained) this._reloadPromise = null;
+          if (!this._isCurrentGeneration(generation, epoch)) return false;
+          return this.safeReload();
+        }).finally(() => {
+          if (this._reloadPromise === chained) this._reloadPromise = null;
+        });
+        this._reloadPromise = chained;
+        return chained;
+      }
+      const run = this._runSafeReload().finally(() => {
+        if (this._reloadPromise === run) this._reloadPromise = null;
+      });
+      this._reloadPromise = run;
+      return run;
+    }
+
+    _schedule(delay) {
+      if (!this._running) return;
+      if (this._timer !== null) this._clearTimeout(this._timer);
+      this._timer = this._setTimeout(() => {
+        this._timer = null;
+        this.tick().catch(() => {});
+      }, delay);
+    }
+
+    _bindOnline() {
+      if (!this._onlineTarget || this._onlineListening) return;
+      this._onlineTarget.addEventListener("online", this._boundHandleOnline);
+      this._onlineListening = true;
+    }
+
+    _unbindOnline() {
+      if (!this._onlineTarget || !this._onlineListening) return;
+      this._onlineTarget.removeEventListener("online", this._boundHandleOnline);
+      this._onlineListening = false;
+    }
+
+    _handleOnline() {
+      if (!this._running) return;
+      if (this._timer !== null) {
+        this._clearTimeout(this._timer);
+        this._timer = null;
+      }
+      this.tick().catch(() => {});
+    }
+
+    _emit() {
+      this._changed(this.getState());
+    }
+
+    _replaceState(nextState) {
+      const previous = this._state;
+      const merged = {
+        version: previous.version,
+        tabId: previous.tabId,
+        availableVersion: previous.availableVersion,
+        maintenance: previous.maintenance,
+        paused: previous.paused,
+        blocker: previous.blocker,
+        blockerCode: previous.blockerCode,
+        waitingForHost: previous.waitingForHost,
+        error: previous.error,
+        ...nextState,
+      };
+      const pauseChanged = previous.paused !== merged.paused;
+      const changed = previous.version !== merged.version ||
+        previous.tabId !== merged.tabId ||
+        previous.availableVersion !== merged.availableVersion ||
+        pauseChanged ||
+        previous.blocker !== merged.blocker ||
+        previous.blockerCode !== merged.blockerCode ||
+        previous.waitingForHost !== merged.waitingForHost ||
+        previous.error !== merged.error ||
+        JSON.stringify(previous.maintenance) !== JSON.stringify(merged.maintenance);
+      this._state = merged;
+      if (changed) {
+        if (pauseChanged) this._pause(merged.paused);
+        this._emit();
+      }
+    }
+
+    _resetForWorkspaceChange() {
+      this._maintenanceReadyId = null;
+      this._replaceState({
+        availableVersion: null,
+        maintenance: null,
+        paused: false,
+        blocker: null,
+        blockerCode: null,
+        waitingForHost: false,
+        error: null,
+      });
+    }
+
+    _workState() {
+      return normalizeWorkState(this._getWorkState());
+    }
+
+    _isCurrentGeneration(expectedGeneration, epoch) {
+      if (epoch !== this._epoch) return false;
+      const workState = this._workState();
+      if (!workState.authenticated || workState.generation !== expectedGeneration) {
+        this._resetForWorkspaceChange();
+        return false;
+      }
+      return true;
+    }
+
+    _heartbeatBody(workState) {
+      const maintenance = this._state.maintenance;
+      if (maintenance && maintenance.phase === "preparing") {
+        if (this._savePromise) {
+          return { maintenanceId: maintenance.id, ready: false, reason: "saving" };
+        }
+        const blocker = maintenanceBlocker(workState, this._state.availableVersion, this.version, false);
+        if (blocker) return { maintenanceId: maintenance.id, ready: false, reason: blocker.code };
+        if (this._state.blockerCode === "storage") {
+          return { maintenanceId: maintenance.id, ready: false, reason: "storage" };
+        }
+        if (this._maintenanceReadyId && this._maintenanceReadyId === maintenance.id && this._state.paused) {
+          return { maintenanceId: maintenance.id, ready: true, reason: "waiting" };
+        }
+        return { maintenanceId: maintenance.id, ready: false, reason: "waiting" };
+      }
+      if (maintenance && maintenance.phase === "installing") {
+        return { maintenanceId: maintenance.id, ready: this._state.paused, reason: "waiting" };
+      }
+      if (this._state.availableVersion) {
+        return { maintenanceId: null, ready: false, reason: "old-client" };
+      }
+      return { maintenanceId: null, ready: false, reason: "waiting" };
+    }
+
+    async _runHeartbeat() {
+      const workState = this._workState();
+      if (!workState.authenticated) {
+        this._resetForWorkspaceChange();
+        return this.getState();
+      }
+      const epoch = this._epoch;
+      try {
+        const response = await this._request("/api/workspaces/heartbeat", {
+          method: "POST",
+          body: this._heartbeatBody(workState),
+        });
+        if (!this._isCurrentGeneration(workState.generation, epoch)) return this.getState();
+        if (!response || typeof response.applicationVersion !== "string" || !response.applicationVersion.trim() ||
+            !response.maintenance || !["idle", "preparing", "installing", "expired"].includes(response.maintenance.phase) ||
+            (response.maintenance.phase !== "idle" &&
+              ((typeof response.maintenance.id !== "string" || !response.maintenance.id) &&
+                (typeof response.maintenance.windowId !== "string" || !response.maintenance.windowId)))) {
+          throw new Error("主机返回的更新状态不完整，当前工作不会自动恢复或刷新；请稍后重试或联系维护人员。");
+        }
+        if (response && typeof response.applicationVersion === "string") this.observeVersion(response.applicationVersion);
+        this._applyMaintenance(normalizeMaintenance(response && response.maintenance), workState.generation);
+        if (this._state.error) this._replaceState({ error: null });
+        return this.getState();
+      } catch (error) {
+        if (!this._isCurrentGeneration(workState.generation, epoch)) return this.getState();
+        if (error && typeof error.applicationVersion === "string") this.observeVersion(error.applicationVersion);
+        if (error && error.maintenance) {
+          this._applyMaintenance(normalizeMaintenance(error.maintenance), workState.generation);
+          return this.getState();
+        }
+        if (error && error.code === "CLIENT_UPDATE_REQUIRED") {
+          const blocker = maintenanceBlocker(this._workState(), this._state.availableVersion, this.version, false);
+          if (this._state.maintenance && this._state.maintenance.phase === "preparing" && blocker && blocker.code === "old-client") {
+            this._replaceState({ blocker: blocker.message, blockerCode: blocker.code });
+          }
+          return this.getState();
+        }
+        if (this._state.maintenance && this._state.maintenance.phase === "installing" && isOfflineError(error, workState)) {
+          this._replaceState({ waitingForHost: true, error: null, paused: true });
+          return this.getState();
+        }
+        if (isOfflineError(error, workState)) return this.getState();
+        const message = errorMessage(error);
+        this._reportOnce(`heartbeat:${message}`, error);
+        this._replaceState({ error: message });
+        return this.getState();
+      }
+    }
+
+    _applyMaintenance(maintenance, expectedGeneration) {
+      this._reported.delete("waiting-installing");
+      if (!maintenance) {
+        this._maintenanceReadyId = null;
+        this._replaceState({
+          maintenance: null,
+          paused: false,
+          blocker: null,
+          blockerCode: null,
+          waitingForHost: false,
+          error: null,
+        });
+        return;
+      }
+
+      if (maintenance.phase === "expired") {
+        this._maintenanceReadyId = null;
+        this._replaceState({
+          maintenance,
+          paused: this._state.paused,
+          blocker: maintenance.message || "更新准备超时，正在等待主机取消维护；已保存工作保持原样。",
+          blockerCode: "waiting",
+          waitingForHost: false,
+        });
+        return;
+      }
+
+      if (maintenance.phase === "installing") {
+        this._replaceState({
+          maintenance,
+          paused: true,
+          blocker: null,
+          blockerCode: null,
+          waitingForHost: false,
+          error: null,
+        });
+        return;
+      }
+
+      const previous = this._state.maintenance;
+      if (!previous || previous.id !== maintenance.id || previous.phase !== maintenance.phase) {
+        this._maintenanceReadyId = null;
+        this._reported.clear();
+      }
+
+      this._replaceState({
+        maintenance,
+        waitingForHost: false,
+        error: null,
+      });
+
+      if (this._savePromise) return;
+      const workState = this._workState();
+      const blocker = maintenanceBlocker(workState, this._state.availableVersion, this.version, false);
+      if (blocker) {
+        this._replaceState({
+          paused: false,
+          blocker: blocker.message,
+          blockerCode: blocker.code,
+        });
+        return;
+      }
+      if (this._maintenanceReadyId === maintenance.id && this._state.paused && !workState.editorDirty) {
+        this._replaceState({ blocker: null, blockerCode: null });
+        return;
+      }
+      this._replaceState({ blocker: null, blockerCode: null });
+      this._startMaintenanceSave(maintenance.id, expectedGeneration);
+    }
+
+    _startMaintenanceSave(maintenanceId, expectedGeneration) {
+      if (this._savePromise) return this._savePromise;
+      const epoch = this._epoch;
+      this._replaceState({ paused: true, blocker: null, blockerCode: null });
+      const run = Promise.resolve()
+        .then(() => this._saveDraft())
+        .then(() => {
+          if (!this._isCurrentGeneration(expectedGeneration, epoch)) return false;
+          const activeMaintenance = this._state.maintenance;
+          const workState = this._workState();
+          const blocker = maintenanceBlocker(workState, this._state.availableVersion, this.version, true);
+          if (blocker) {
+            this._maintenanceReadyId = null;
+            this._replaceState({
+              paused: false,
+              blocker: blocker.message,
+              blockerCode: blocker.code,
+            });
+            return false;
+          }
+          if (!activeMaintenance || activeMaintenance.phase !== "preparing" || activeMaintenance.id !== maintenanceId) {
+            this._maintenanceReadyId = null;
+            this._replaceState({
+              paused: !!activeMaintenance && ["installing", "expired"].includes(activeMaintenance.phase),
+              blocker: null,
+              blockerCode: null,
+            });
+            return false;
+          }
+          this._maintenanceReadyId = maintenanceId;
+          this._replaceState({
+            paused: true,
+            blocker: null,
+            blockerCode: null,
+            error: null,
+          });
+          return true;
+        })
+        .catch(error => {
+          if (!this._isCurrentGeneration(expectedGeneration, epoch)) return false;
+          const message = errorMessage(error);
+          this._maintenanceReadyId = null;
+          this._reportOnce(`maintenance:${maintenanceId}:${message}`, error);
+          this._replaceState({
+            paused: false,
+            blocker: "草稿未能保存，暂不确认主机更新。",
+            blockerCode: "storage",
+            error: message,
+          });
+          return false;
+        })
+        .finally(() => {
+          if (this._savePromise === run) this._savePromise = null;
+        });
+      this._savePromise = run;
+      return run;
+    }
+
+    async _runSafeReload() {
+      const workState = this._workState();
+      if (!workState.authenticated) {
+        this._replaceState({
+          blocker: "当前工作区已切换，请重新打开更新提示后再刷新页面。",
+          blockerCode: "waiting",
+        });
+        return false;
+      }
+      const initialBlocker = reloadBlocker(workState, false);
+      if (initialBlocker) {
+        this._replaceState({ blocker: initialBlocker.message, blockerCode: initialBlocker.code });
+        return false;
+      }
+      const expectedGeneration = workState.generation;
+      const epoch = this._epoch;
+      const restorePaused = !!this._state.paused;
+      this._replaceState({
+        paused: true,
+        blocker: null,
+        blockerCode: null,
+        error: null,
+      });
+      try {
+        await this._saveDraft();
+        if (!this._isCurrentGeneration(expectedGeneration, epoch)) return false;
+        let latest = this._workState();
+        let blocker = reloadBlocker(latest, true);
+        if (blocker) {
+          this._replaceState({ blocker: blocker.message, blockerCode: blocker.code, paused: restorePaused });
+          return false;
+        }
+        await this._prepareReload();
+        if (!this._isCurrentGeneration(expectedGeneration, epoch)) return false;
+        latest = this._workState();
+        blocker = reloadBlocker(latest, true);
+        if (blocker) {
+          this._replaceState({ blocker: blocker.message, blockerCode: blocker.code, paused: restorePaused });
+          return false;
+        }
+        await this._reload();
+        return true;
+      } catch (error) {
+        if (!this._isCurrentGeneration(expectedGeneration, epoch)) return false;
+        const message = errorMessage(error);
+        this._reportOnce(`reload:${message}`, error);
+        this._replaceState({
+          paused: restorePaused,
+          blocker: "草稿未能安全保存并刷新，请先处理提示后重试。",
+          blockerCode: "storage",
+          error: message,
+        });
+        return false;
+      }
+    }
+
+    _reportOnce(key, error) {
+      if (this._reported.has(key)) return;
+      this._reported.add(key);
+      this._reportError(error);
+    }
+  }
+
+  return Object.freeze({
+    Controller,
+    POLL_MS,
+    createController,
+    maintenanceBlocker,
+    reloadBlocker,
+  });
+});

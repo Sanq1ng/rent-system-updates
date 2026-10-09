@@ -1,0 +1,274 @@
+"use strict";
+
+const fs = require("node:fs");
+const fsp = require("node:fs/promises");
+const path = require("node:path");
+const crypto = require("node:crypto");
+const { DatabaseSync, backup } = require("node:sqlite");
+const { SCHEMA_VERSION, assertSupportedSchema } = require("./push-schema.cjs");
+
+const active = new WeakSet();
+const FORMAT = "industrial-rent-backup";
+const RESTORE_GUARD_VERSION = 1;
+
+function fail(message) {
+  const error = new Error(message);
+  error.code = "BACKUP";
+  throw error;
+}
+
+function sameOrInside(parent, child) {
+  const relative = path.relative(path.resolve(parent), path.resolve(child));
+  return relative === "" || (!relative.startsWith(`..${path.sep}`) && relative !== ".." && !path.isAbsolute(relative));
+}
+
+function safeAssetId(value) {
+  if (typeof value !== "string" || !/^[A-Za-z0-9_-]{1,160}$/.test(value) || /^(con|prn|aux|nul|com[1-9]|lpt[1-9])$/i.test(value)) {
+    fail("附件标识无效，不能备份或恢复。");
+  }
+  return value;
+}
+
+async function hashFile(file) {
+  const hash = crypto.createHash("sha256");
+  for await (const chunk of fs.createReadStream(file)) hash.update(chunk);
+  return hash.digest("hex");
+}
+
+function assertRegularFile(file) {
+  const stat = fs.lstatSync(file);
+  if (!stat.isFile() || stat.isSymbolicLink()) fail(`不是可备份的普通文件：${file}`);
+  return stat;
+}
+
+function writeDurableJSON(file, value) {
+  const handle = fs.openSync(file, "wx", 0o600);
+  try {
+    fs.writeFileSync(handle, `${JSON.stringify(value, null, 2)}\n`, "utf8");
+    fs.fsyncSync(handle);
+  } finally {
+    fs.closeSync(handle);
+  }
+}
+
+function inspectDatabase(databasePath) {
+  const db = new DatabaseSync(path.toNamespacedPath(databasePath), { readOnly: true });
+  try {
+    const schemaVersion = db.prepare("PRAGMA user_version").get().user_version;
+    if (schemaVersion < 1) fail("备份没有受支持的正式账本格式。");
+    assertSupportedSchema(db, schemaVersion);
+    const integrity = db.prepare("PRAGMA integrity_check").all();
+    if (integrity.length !== 1 || integrity[0].integrity_check !== "ok") fail("数据库完整性检查未通过，不能将该副本作为可恢复备份。");
+    if (db.prepare("PRAGMA foreign_key_check").all().length) fail("数据库关联记录不完整，不能恢复。");
+    const table = db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='attachments'").get();
+    if (!table) fail("数据库缺少正式版附件目录，不能当作本系统备份。");
+    const attachments = db.prepare("SELECT id, sha256 FROM attachments ORDER BY id").all();
+    for (const attachment of attachments) {
+      safeAssetId(attachment.id);
+      if (!/^[a-f0-9]{64}$/.test(attachment.sha256)) fail("数据库内的原件校验值无效。");
+    }
+    return {
+      schemaVersion,
+      sqliteVersion: db.prepare("SELECT sqlite_version() AS version").get().version,
+      attachments,
+    };
+  } finally {
+    db.close();
+  }
+}
+
+async function createBackup(db, config, destination) {
+  if (active.has(db)) fail("已有备份正在进行，请等待完成后再试。");
+  const dataDir = path.resolve(config.dataDir);
+  const backupDir = path.resolve(config.backupDir);
+  const createdAt = new Date().toISOString();
+  const name = `backup-${createdAt.replace(/[-:.]/g, "")}-${crypto.randomBytes(4).toString("hex")}`;
+  const target = path.resolve(destination || path.join(backupDir, name));
+  if (sameOrInside(target, dataDir) || sameOrInside(path.join(dataDir, "attachments"), target)) {
+    fail("备份目标不能是业务数据目录本身、它的上级目录或原件目录。");
+  }
+  if (fs.existsSync(target)) fail("备份目标已经存在，不能覆盖已有文件。");
+  active.add(db);
+  const staging = `${target}.incomplete-${crypto.randomUUID()}`;
+  try {
+    fs.mkdirSync(path.dirname(target), { recursive: true });
+    fs.mkdirSync(staging, { mode: 0o700 });
+    const databasePath = path.join(staging, "rent.sqlite");
+    // SQLite 在线备份同时覆盖尚未 checkpoint 的 WAL，不能用普通文件复制代替。
+    await backup(db, path.toNamespacedPath(databasePath));
+    // A sealed backup must remain a standalone file, including during later read-only inspection.
+    const snapshot = new DatabaseSync(path.toNamespacedPath(databasePath));
+    try {
+      if (snapshot.prepare("PRAGMA journal_mode=DELETE").get().journal_mode !== "delete") {
+        fail("备份快照不能转换为独立归档文件，未完成封存。");
+      }
+    } finally { snapshot.close(); }
+    const info = inspectDatabase(databasePath);
+    if (info.attachments.length >= 100000) fail("附件数量超过当前备份清单上限，需先升级备份格式；不会生成不可恢复的备份。");
+    const files = [{
+      path: "rent.sqlite",
+      bytes: assertRegularFile(databasePath).size,
+      sha256: await hashFile(databasePath),
+    }];
+    fs.mkdirSync(path.join(staging, "attachments"), { mode: 0o700 });
+    for (const attachment of info.attachments) {
+      const source = path.join(dataDir, "attachments", attachment.id);
+      const targetFile = path.join(staging, "attachments", attachment.id);
+      const originalStat = assertRegularFile(source);
+      await fsp.copyFile(source, targetFile, fs.constants.COPYFILE_EXCL);
+      const hash = await hashFile(targetFile);
+      if (hash !== attachment.sha256) fail(`原件 ${attachment.id} 与归档校验值不符，备份未完成；请保留旧备份并排查磁盘或文件变动。`);
+      const handle = fs.openSync(targetFile, "r+");
+      try { fs.fsyncSync(handle); } finally { fs.closeSync(handle); }
+      files.push({ path: `attachments/${attachment.id}`, bytes: originalStat.size, sha256: hash });
+    }
+    const databaseHandle = fs.openSync(databasePath, "r+");
+    try { fs.fsyncSync(databaseHandle); } finally { fs.closeSync(databaseHandle); }
+    const manifest = {
+      format: FORMAT, formatVersion: 1, complete: true, createdAt,
+      schemaVersion: info.schemaVersion, sqliteVersion: info.sqliteVersion,
+      files,
+    };
+    if (Buffer.byteLength(JSON.stringify(manifest, null, 2), "utf8") + 1 > 16 * 1024 * 1024) {
+      fail("备份清单超过当前格式大小上限，需先升级备份工具；此次目录保持未完成状态。");
+    }
+    writeDurableJSON(path.join(staging, "manifest.json"), manifest);
+    fs.renameSync(staging, target);
+    return { name: path.basename(target), createdAt, fileCount: files.length, bytes: files.reduce((sum, file) => sum + file.bytes, 0), path: target };
+  } finally {
+    active.delete(db);
+  }
+}
+
+function readManifest(directory) {
+  const file = path.join(directory, "manifest.json");
+  const stat = assertRegularFile(file);
+  if (stat.size > 16 * 1024 * 1024) fail("备份清单异常过大，不能恢复。");
+  const bytes = fs.readFileSync(file);
+  const manifest = JSON.parse(bytes.toString("utf8"));
+  if (manifest.format !== FORMAT || manifest.formatVersion !== 1 || manifest.complete !== true ||
+      !Array.isArray(manifest.files) || manifest.files.length < 1 || manifest.files.length > 100000) {
+    fail("备份格式不受支持或未完成，不能恢复。");
+  }
+  const seen = new Set();
+  for (const entry of manifest.files) {
+    if (!entry || typeof entry.path !== "string" || seen.has(entry.path) ||
+        !Number.isSafeInteger(entry.bytes) || entry.bytes < 0 || !/^[a-f0-9]{64}$/.test(entry.sha256 || "")) {
+      fail("备份清单记录不完整或重复。");
+    }
+    if (entry.path !== "rent.sqlite") {
+      const parts = entry.path.split("/");
+      if (parts.length !== 2 || parts[0] !== "attachments") fail("备份清单含有不允许的路径。");
+      safeAssetId(parts[1]);
+    }
+    seen.add(entry.path);
+  }
+  if (!seen.has("rent.sqlite")) fail("备份缺少账本文件。");
+  return { manifest, manifestSha256: crypto.createHash("sha256").update(bytes).digest("hex") };
+}
+
+async function verifyBackup(directory) {
+  const root = path.resolve(directory);
+  const rootStat = fs.lstatSync(root);
+  if (!rootStat.isDirectory() || rootStat.isSymbolicLink()) fail("备份路径必须是实际目录，不能是链接。");
+  const { manifest, manifestSha256 } = readManifest(root);
+  const assetDir = path.join(root, "attachments");
+  if (fs.existsSync(assetDir) && fs.lstatSync(assetDir).isSymbolicLink()) fail("备份的附件目录不能是链接。");
+  for (const file of manifest.files) {
+    const resolved = path.join(root, ...file.path.split("/"));
+    if (assertRegularFile(resolved).size !== file.bytes || await hashFile(resolved) !== file.sha256) {
+      fail(`备份文件缺失、损坏或已被修改：${file.path}`);
+    }
+  }
+  const database = inspectDatabase(path.join(root, "rent.sqlite"));
+  if (manifest.schemaVersion !== database.schemaVersion) fail("备份清单与账本的格式版本不一致，不能恢复。");
+  const records = new Map(manifest.files.map(file => [file.path, file]));
+  for (const attachment of database.attachments) {
+    const record = records.get(`attachments/${attachment.id}`);
+    if (!record || record.sha256 !== attachment.sha256) fail(`备份没有完整包含账本引用的原件：${attachment.id}`);
+  }
+  return {
+    name: path.basename(root), path: root, createdAt: manifest.createdAt,
+    fileCount: manifest.files.length, bytes: manifest.files.reduce((sum, file) => sum + file.bytes, 0),
+    manifest, manifestSha256,
+  };
+}
+
+async function restoreBackup(directory, destination, options = {}) {
+  const { invalidateRestoredNotifications } = require("./notification-restore.cjs");
+  const { invalidateRestoredInvitations } = require("./invitation-restore.cjs");
+  const source = path.resolve(directory);
+  const target = path.resolve(destination);
+  if (target === path.parse(target).root || sameOrInside(source, target) || sameOrInside(target, source)) {
+    fail("恢复目标必须是独立的新数据目录，不能使用磁盘根目录或备份目录本身。");
+  }
+  if (fs.existsSync(target)) fail("恢复只允许写入尚不存在的新目录，原账本不会被覆盖。");
+  if (!options || Array.isArray(options) || typeof options !== "object" ||
+      Object.keys(options).some(key => key !== "expectedManifestSha256") ||
+      options.expectedManifestSha256 !== undefined &&
+        (typeof options.expectedManifestSha256 !== "string" || !/^[a-f0-9]{64}$/.test(options.expectedManifestSha256))) {
+    fail("恢复清单约束无效。");
+  }
+  const verified = await verifyBackup(source);
+  if (options.expectedManifestSha256 !== undefined && options.expectedManifestSha256 !== verified.manifestSha256) {
+    fail("恢复时备份清单已改变，未创建目标账本。请重新核对迁移包。");
+  }
+  const staging = `${target}.restore-incomplete-${crypto.randomUUID()}`;
+  fs.mkdirSync(staging, { recursive: true, mode: 0o700 });
+  fs.mkdirSync(path.join(staging, "attachments"), { mode: 0o700 });
+  for (const file of verified.manifest.files) {
+    const relative = file.path.split("/");
+    const copied = path.join(staging, ...relative);
+    await fsp.copyFile(path.join(source, ...relative), copied, fs.constants.COPYFILE_EXCL);
+    if (await hashFile(copied) !== file.sha256) fail(`恢复时文件复制不完整：${file.path}`);
+  }
+  const db = new DatabaseSync(path.toNamespacedPath(path.join(staging, "rent.sqlite")));
+  let pushReset, invitationReset;
+  const sourceSchemaVersion = verified.manifest.schemaVersion;
+  const schemaUpgradeRequired = sourceSchemaVersion < SCHEMA_VERSION;
+  try {
+    assertSupportedSchema(db, sourceSchemaVersion);
+    db.exec("PRAGMA foreign_keys=ON; PRAGMA synchronous=FULL; BEGIN IMMEDIATE");
+    const table = db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='sessions'").get();
+    if (!table) fail("备份缺少正式账号会话表，不能安全恢复。");
+    const at = Date.now();
+    pushReset = invalidateRestoredNotifications(db, at);
+    invitationReset = invalidateRestoredInvitations(db, at);
+    db.exec("DELETE FROM sessions; COMMIT; PRAGMA wal_checkpoint(TRUNCATE)");
+  } catch (error) {
+    if (db.isTransaction) db.exec("ROLLBACK");
+    throw error;
+  } finally {
+    db.close();
+  }
+  writeDurableJSON(path.join(staging, "restore-info.json"), {
+    restoredAt: new Date().toISOString(), backupCreatedAt: verified.createdAt,
+    backupManifestHash: verified.manifestSha256,
+    sessionsInvalidated: true,
+    pushBindingsInvalidated: true,
+    pushReset,
+    invitationsInvalidated: true,
+    invitationReset,
+    sourceSchemaVersion, schemaVersion: sourceSchemaVersion, schemaUpgradeRequired,
+  });
+  fs.renameSync(staging, target);
+  return { path: target, backupCreatedAt: verified.createdAt, files: verified.fileCount,
+    schemaVersion: sourceSchemaVersion, schemaUpgradeRequired };
+}
+
+function listBackups(directory) {
+  if (!fs.existsSync(directory)) return [];
+  return fs.readdirSync(directory, { withFileTypes: true })
+    .filter(entry => entry.isDirectory() && !entry.isSymbolicLink() &&
+      !entry.name.includes(".incomplete-") && fs.existsSync(path.join(directory, entry.name, "manifest.json")))
+    .map(entry => {
+      const root = path.join(directory, entry.name);
+      const { manifest } = readManifest(root);
+      return {
+        name: entry.name, path: root, createdAt: manifest.createdAt,
+        fileCount: manifest.files.length, bytes: manifest.files.reduce((sum, file) => sum + file.bytes, 0),
+      };
+    }).sort((left, right) => right.createdAt.localeCompare(left.createdAt));
+}
+
+module.exports = { createBackup, verifyBackup, restoreBackup, listBackups, hashFile, sameOrInside, RESTORE_GUARD_VERSION };

@@ -1,0 +1,49 @@
+"use strict";
+const fs = require("node:fs");
+const path = require("node:path");
+const crypto = require("node:crypto");
+const { resolveConfig } = require("../config.cjs");
+const { fail, assertDirectory, regularFile, readJSON, writeFile, writeJSON } = require("./files.cjs");
+const { resolveUpdateConfig } = require("./transport.cjs");
+const { sourceFile, readUpdateSource } = require("./source-config.cjs");
+const { TERMINAL, loadState, acquireUpdateLease } = require("./state.cjs");
+const { acquireLock } = require("../host.cjs");
+
+function configureSource(program, configFile, feedUrl, confirmation) {
+  if (confirmation !== "confirmed") fail("UPDATE_REQUEST", "请先停止主机，并明确提供 --source-stopped confirmed。");
+  if (!configFile || !path.isAbsolute(configFile)) fail("UPDATE_REQUEST", "必须提供本机原配置文件的绝对路径。");
+  assertDirectory(path.dirname(configFile));
+  regularFile(configFile, 65536);
+  const original = fs.readFileSync(configFile), previousSource = readUpdateSource(configFile);
+  const config = resolveConfig(configFile, { programDirectory: program });
+  const policy = readJSON(path.join(program, "updates", "trust-public.json"), 65536);
+  if (policy.format !== "industrial-rent-update-trust" || policy.formatVersion !== 1)
+    fail("UPDATE_SIGNATURE", "本机缺少有效的预置发布公钥。");
+  const updates = resolveUpdateConfig({ feedUrl, trustedKeys: policy.trustedKeys, allowPrivateNetwork: false });
+  if (!updates.feedUrl || !Object.keys(updates.trustedKeys).length)
+    fail("UPDATE_CONFIG", "固定 HTTPS 发布地址及预置公钥都不能为空。");
+  regularFile(path.join(config.dataDir, "rent.sqlite"));
+  const releaseUpdate = acquireUpdateLease(config.updateDir || program);
+  let releaseData;
+  try {
+    const state = loadState(config.updateDir || program);
+    if (state.job && !TERMINAL.has(state.job.phase)) fail("UPDATE_BUSY", "更新交接尚未结束，不能更换发布地址。");
+    releaseData = acquireLock(config.dataDir);
+    const backup = path.join(path.dirname(configFile), `config-before-feed-${crypto.randomUUID()}.json`);
+    writeFile(backup, original);
+    const updateSourceBackup = previousSource ? `${backup}.updates.json` : null;
+    if (updateSourceBackup) writeFile(updateSourceBackup, previousSource.bytes);
+    regularFile(configFile, 65536);
+    if (!fs.readFileSync(configFile).equals(original)) fail("UPDATE_CONFIG_CHANGED", "配置在保存前被其他操作修改，未覆盖。");
+    const currentSource = readUpdateSource(configFile);
+    if (Boolean(currentSource) !== Boolean(previousSource) ||
+        currentSource && !currentSource.bytes.equals(previousSource.bytes)) {
+      fail("UPDATE_CONFIG_CHANGED", "更新来源在保存前被其他操作修改，未覆盖。");
+    }
+    const updateSourceFile = sourceFile(configFile);
+    writeJSON(updateSourceFile, { format: "industrial-rent-update-source", formatVersion: 1, updates });
+    return { configured: true, feedUrl, configurationBackup: backup, updateSourceFile, updateSourceBackup, dataUploaded: false,
+      note: "重开主机后自动检查并下载；安装仍需负责人确认。此命令不代表发布网站已上线。" };
+  } finally { try { if (releaseData) releaseData(); } finally { releaseUpdate(); } }
+}
+module.exports = { configureSource };

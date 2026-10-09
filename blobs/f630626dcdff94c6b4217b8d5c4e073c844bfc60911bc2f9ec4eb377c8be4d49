@@ -1,0 +1,270 @@
+"use strict";
+
+const fs = require("node:fs");
+const fsp = require("node:fs/promises");
+const path = require("node:path");
+const { DatabaseSync } = require("node:sqlite");
+const { resolveConfig, assertRuntime } = require(path.join(__dirname, "config.cjs"));
+const { acquireLock } = require(path.join(__dirname, "host.cjs"));
+const { resolveRelease } = require(path.join(__dirname, "updates", "releases.cjs"));
+const { publishUpdate } = require(path.join(__dirname, "updates", "publish.cjs"));
+const { HANDOFF, loadState } = require(path.join(__dirname, "updates", "state.cjs"));
+const { assertDirectory, regularFile } = require(path.join(__dirname, "updates", "files.cjs"));
+const { hashFile, sameOrInside } = require(path.join(__dirname, "server", "backup.cjs"));
+const { newDirectory: newTarget, deploymentSummary, DEPLOYMENT_FILES } = require(path.join(__dirname, "deployment", "layout.cjs"));
+
+function argumentsOf(args) {
+  const command = args[0] || "help";
+  const options = {};
+  for (let index = 1; index < args.length; index += 2) {
+    if (!args[index].startsWith("--") || !args[index + 1] || args[index + 1].startsWith("--")) {
+      throw new Error(`参数不完整：${args[index]}`);
+    }
+    const key = args[index].slice(2);
+    if (!["config", "from", "to", "include-data", "key", "key-id", "sequence", "platform",
+      "target-origin", "offline-work", "source-stopped", "scope", "feed-url"].includes(key) || Object.hasOwn(options, key)) {
+      throw new Error(`不支持或重复的参数：${args[index]}`);
+    }
+    options[key] = args[index + 1];
+  }
+  const accepted = {
+    help: [], check: ["config"], backup: ["config", "to"], verify: ["from", "config"],
+    restore: ["from", "to", "config"], package: ["config", "to", "include-data"],
+    "publish-update": ["from", "to", "key", "key-id", "sequence", "platform", "scope"],
+    "deployment-plan": ["config", "target-origin"],
+    "migration-export": ["config", "to", "target-origin", "offline-work", "source-stopped"],
+    "migration-verify": ["from", "config"],
+    "migration-restore": ["from", "to", "config", "target-origin", "offline-work", "source-stopped"],
+    "migrate-schema": ["config", "to", "offline-work", "source-stopped"],
+    "configure-update-source": ["config", "feed-url", "source-stopped"],
+  };
+  if (Object.hasOwn(accepted, command)) {
+    for (const key of Object.keys(options)) {
+      if (!accepted[command].includes(key)) throw new Error(`${command} 不接受 --${key} 参数。`);
+    }
+  }
+  return { command, options };
+}
+
+function backupTools(configFile) {
+  if (process.platform === "linux" && process.getuid() === 0) {
+    return require(path.join(__dirname, "server", "backup.cjs"));
+  }
+  const config = resolveConfig(configFile);
+  const active = resolveRelease(__dirname, config.updateDir);
+  return require(path.join(active.root, "server", "backup.cjs"));
+}
+
+async function withStoppedDatabase(config, action) {
+  if (process.platform === "linux" && process.getuid() === 0) {
+    throw new Error("请通过 sudo -u industrial-rent 执行业务备份，避免以 root 创建服务账号无法访问的账本租约。");
+  }
+  if (HANDOFF.has(loadState(config.updateDir || __dirname).job?.phase)) {
+    throw new Error("程序更新交接尚未完成；先通过托管主机恢复，再进行账本维护。");
+  }
+  const database = path.join(config.dataDir, "rent.sqlite");
+  if (!fs.existsSync(database)) throw new Error(`未找到正式账本：${database}`);
+  const release = acquireLock(config.dataDir);
+  let db;
+  try {
+    db = new DatabaseSync(path.toNamespacedPath(database));
+    db.exec("PRAGMA foreign_keys=ON; PRAGMA synchronous=FULL");
+    return await action(db);
+  } finally {
+    try { if (db) db.close(); } finally { release(); }
+  }
+}
+
+async function copyTree(source, destination) {
+  fs.mkdirSync(destination, { recursive: true });
+  for (const entry of fs.readdirSync(source, { withFileTypes: true })) {
+    const from = path.join(source, entry.name);
+    const to = path.join(destination, entry.name);
+    if (entry.isSymbolicLink()) throw new Error(`打包目录不允许链接：${from}`);
+    if (entry.isDirectory()) await copyTree(from, to);
+    else if (entry.isFile()) await fsp.copyFile(from, to, fs.constants.COPYFILE_EXCL);
+    else throw new Error(`无法打包特殊文件：${from}`);
+  }
+}
+
+async function buildPackage(options) {
+  const target = newTarget(options.to);
+  if (sameOrInside(__dirname, target)) throw new Error("交付包必须放在程序目录之外，避免将输出递归打包进去。");
+  const runtime = path.resolve(process.execPath);
+  const license = path.join(__dirname, "third_party", "NODE-LICENSE.txt");
+  if (!fs.statSync(runtime).isFile() || !fs.statSync(license).isFile()) throw new Error("运行组件或许可证文件缺失。");
+  if (process.platform !== "win32" || process.arch !== "x64") throw new Error("此打包入口仅生成 Windows x64 交付包，请在对应维护环境执行。");
+  const licenseInfo = JSON.parse(fs.readFileSync(path.join(__dirname, "third_party", "node-license.json"), "utf8"));
+  if (licenseInfo.version !== process.version || licenseInfo.sha256 !== await hashFile(license)) {
+    throw new Error("随包许可证与当前运行组件版本不符。维护人员需先更新匹配版本的官方许可证。");
+  }
+  if (options["include-data"] && options["include-data"] !== "yes") throw new Error("--include-data 仅接受 yes；程序包默认不含任何业务数据。");
+  let desktopTools;
+  try { desktopTools = require(path.join(__dirname, "desktop", "artifact.cjs")); }
+  catch (error) {
+    throw new Error("图形入口校验组件缺失或损坏。请维护人员恢复完整 desktop 目录、运行 desktop\\build.ps1 后重新打包；备份、恢复与诊断命令仍可使用。", { cause: error });
+  }
+  const { EXECUTABLE, PACKAGE_FILES, verifyDesktopArtifact } = desktopTools;
+  const desktop = verifyDesktopArtifact(__dirname);
+  const lanTools = require(path.join(__dirname, "lan-windows", "artifact.cjs"));
+  await lanTools.verifyLanArtifacts(__dirname);
+  const clientTools = require(path.join(__dirname, "client-windows", "artifact.cjs"));
+  clientTools.verifyClientArtifact(__dirname);
+  const config = resolveConfig(options.config);
+  if (HANDOFF.has(loadState(config.updateDir || __dirname).job?.phase)) throw new Error("更新交接中的程序不能打包交付。");
+  const selected = resolveRelease(__dirname, config.updateDir);
+  const deployment = path.join(__dirname, "deployment");
+  assertDirectory(deployment);
+  for (const file of DEPLOYMENT_FILES) regularFile(path.join(deployment, file));
+  const staging = `${target}.incomplete-${process.pid}`;
+  if (fs.existsSync(staging)) throw new Error("存在同名未完成交付目录，请检查后另选目标。");
+  const app = path.join(staging, "程序");
+  fs.mkdirSync(app, { recursive: true });
+  for (const name of ["public", "server", "shared"]) {
+    await copyTree(path.join(selected.root, name), path.join(app, name));
+  }
+  for (const name of ["third_party", "updates"]) await copyTree(path.join(__dirname, name), path.join(app, name));
+  fs.mkdirSync(path.join(app, "deployment"));
+  for (const file of DEPLOYMENT_FILES) {
+    await fsp.copyFile(path.join(deployment, file), path.join(app, "deployment", file), fs.constants.COPYFILE_EXCL);
+  }
+  await fsp.copyFile(path.join(selected.root, "package.json"), path.join(app, "package.json"), fs.constants.COPYFILE_EXCL);
+  for (const name of ["host.cjs", "config.cjs", "logging.cjs", "maintenance.cjs", "config.example.json", "启动主机.cmd", "维护工具.cmd", "设置开机启动.ps1", "操作与部署说明.md", "部署检查表.md"]) {
+    await fsp.copyFile(path.join(__dirname, name), path.join(app, name), fs.constants.COPYFILE_EXCL);
+  }
+  fs.mkdirSync(path.join(app, "desktop"));
+  for (const name of PACKAGE_FILES) {
+    await fsp.copyFile(path.join(__dirname, "desktop", name), path.join(app, "desktop", name), fs.constants.COPYFILE_EXCL);
+  }
+  fs.mkdirSync(path.join(app, "lan-windows"));
+  for (const name of lanTools.PACKAGE_FILES) {
+    if (path.basename(name) !== name) throw new Error("局域网程序库存必须是已核验的单层文件名。");
+    await fsp.copyFile(path.join(__dirname, "lan-windows", name), path.join(app, "lan-windows", name), fs.constants.COPYFILE_EXCL);
+  }
+  await lanTools.verifyLanArtifacts(app);
+  fs.mkdirSync(path.join(app, "client-windows"));
+  for (const name of clientTools.PACKAGE_FILES) {
+    await fsp.copyFile(path.join(__dirname, "client-windows", name), path.join(app, "client-windows", name), fs.constants.COPYFILE_EXCL);
+  }
+  clientTools.verifyClientArtifact(app);
+  await fsp.copyFile(desktop.executable, path.join(app, EXECUTABLE), fs.constants.COPYFILE_EXCL);
+  await fsp.copyFile(desktop.executable, path.join(staging, "启动园区租赁.exe"), fs.constants.COPYFILE_EXCL);
+  const copiedDesktop = verifyDesktopArtifact(app);
+  if (copiedDesktop.executableSha256 !== await hashFile(path.join(app, EXECUTABLE)) ||
+      copiedDesktop.executableSha256 !== await hashFile(path.join(staging, "启动园区租赁.exe"))) {
+    throw new Error("图形入口复制校验失败，交付包尚未完成。");
+  }
+  fs.mkdirSync(path.join(app, "runtime"));
+  await fsp.copyFile(runtime, path.join(app, "runtime", "node.exe"), fs.constants.COPYFILE_EXCL);
+  const copiedRuntime = path.join(app, "runtime", "node.exe");
+  if (await hashFile(runtime) !== await hashFile(copiedRuntime)) throw new Error("运行组件复制校验失败，交付包尚未完成。");
+  if (options["include-data"]) {
+    const backupPath = path.join(staging, "数据备份");
+    await withStoppedDatabase(config, db => backupTools(options.config).createBackup(db, config, backupPath));
+  }
+  const manifest = {
+    format: "industrial-rent-delivery", formatVersion: 1, createdAt: new Date().toISOString(),
+    applicationVersion: selected.version,
+    platform: process.platform, architecture: process.arch, runtimeVersion: process.version,
+    runtimeSha256: await hashFile(copiedRuntime), includesDataBackup: Boolean(options["include-data"]),
+    desktopProtocolVersion: copiedDesktop.protocolVersion, desktopSha256: copiedDesktop.executableSha256,
+    restoreRequired: Boolean(options["include-data"]),
+    networkConfigurationIncluded: false,
+    lanOnboardingIncluded: true,
+    windowsClientIncluded: true,
+    lanHostSha256: await hashFile(path.join(app, "lan-windows", "局域网配置.exe")),
+    lanClientSha256: await hashFile(path.join(app, "lan-windows", "员工电脑接入.exe")),
+    updateBootstrapVersion: 1, updateFeedConfigured: false,
+    note: "默认本机初始化后可用局域网向导，经明确授权配置同网接入。包内不含证书、服务器私钥或业务账号，员工接入资料由目标主机生成。异地入口不随包启用。",
+  };
+  fs.writeFileSync(path.join(staging, "交付清单.json"), `${JSON.stringify(manifest, null, 2)}\n`, { flag: "wx" });
+  fs.renameSync(staging, target);
+  return { path: target, ...manifest };
+}
+
+async function main(args = process.argv.slice(2)) {
+  assertRuntime();
+  const { command, options } = argumentsOf(args);
+  if (command === "help") {
+    console.log([
+      process.platform === "win32" ? "园区租赁维护工具（优先通过随包 维护工具.cmd 调用）" :
+        "园区租赁 Linux 本地维护（使用随包 runtime/node；业务维护请使用专用服务账号）",
+      "backup  [--config 配置.json] [--to 新备份目录]  主机停止后创建完整备份",
+      "verify  --from 备份目录                         核对账本和所有原件",
+      "restore --from 备份目录 --to 新数据目录           不覆盖旧账；恢复后所有人重新登录",
+      "migrate-schema --config 原配置.json [--to 新备份目录] --offline-work confirmed --source-stopped confirmed",
+      "          停止主机后，先核验完整备份再升级原账本格式；保留账套、账号、网络与证书配置，不自动启动",
+      "package --to 新交付目录 [--include-data yes]      内含运行组件；带数据时主机必须停止",
+      "          package 为 Windows 入口；Linux 无数据交付使用 linux/package.cjs",
+      "configure-update-source --config 原配置.json --feed-url https://发布网站/manifest.json --source-stopped confirmed",
+      "          停止主机后，使用安装包预置的公钥接入固定发布地址；不上传业务数据",
+      "deployment-plan [--config 配置.json] [--target-origin https://目标地址]  只读显示部署及迁移边界",
+      "migration-export --to 新迁移包 --offline-work confirmed --source-stopped confirmed [--target-origin https://目标地址]",
+      "migration-verify --from 迁移包                  核对完整账本、原件和账套身份",
+      "migration-restore --from 迁移包 --to 新数据目录 --target-origin https://目标地址 --offline-work confirmed --source-stopped confirmed",
+      "          迁移保留账套与用户，不携带主机凭据或员工离线草稿，不自动启用新主机；旧主机必须保持停止",
+      "publish-update --to 新发布目录 --key 私钥文件 --key-id 密钥名 --sequence 正整数 [--from 程序目录] [--platform win32|linux] [--scope windows-program]",
+      "          签名仅适用于指定平台（默认当前平台）；私钥须在程序/发布目录之外，部署端无需私钥",
+      "check   [--config 配置.json]                    显示部署路径，不启动服务",
+      "注意：业务备份含敏感资料和密码散列，须存放在公司控制的受限目录，不应发送到公开网盘。",
+    ].join("\n"));
+    return;
+  }
+  let result;
+  if (command === "check") result = resolveConfig(options.config);
+  else if (command === "configure-update-source")
+    result = require(path.join(__dirname, "updates", "provision.cjs")).configureSource(
+      __dirname, options.config, options["feed-url"], options["source-stopped"]);
+  else if (command === "deployment-plan") result = deploymentSummary(resolveConfig(options.config), options["target-origin"]);
+  else if (command === "migrate-schema") {
+    result = await require(path.join(__dirname, "deployment", "migration.cjs")).upgradeFromConfig(options);
+  }
+  else if (["migration-export", "migration-verify", "migration-restore"].includes(command)) {
+    const migration = require(path.join(__dirname, "deployment", "migration.cjs"));
+    const tools = backupTools(options.config);
+    if (command === "migration-export") {
+      const config = resolveConfig(options.config);
+      const selected = resolveRelease(__dirname, config.updateDir);
+      result = await withStoppedDatabase(config, db =>
+        migration.exportMigration(db, config, options.to, options, tools, selected.version));
+    } else {
+      if (!options.from) throw new Error("请用 --from 指定完整迁移包。");
+      if (command === "migration-verify") {
+        const checked = await migration.verifyMigration(options.from, tools);
+        result = { path: checked.root, verified: true, serverId: checked.record.source.serverId,
+          schemaVersion: checked.record.source.schemaVersion, files: checked.verified.fileCount,
+          includesOfflineClientWork: false, includesDeploymentCredentials: false };
+      } else {
+        if (process.platform === "linux" && process.getuid() === 0) {
+          throw new Error("请通过 sudo -u industrial-rent 恢复迁移包，不得以 root 创建业务账本。");
+        }
+        result = await migration.restoreMigration(options.from, options.to, options, tools);
+      }
+    }
+  }
+  else if (command === "verify") {
+    if (!options.from) throw new Error("请用 --from 指定备份目录。");
+    const verified = await backupTools(options.config).verifyBackup(options.from);
+    const { manifest, ...summary } = verified;
+    result = { ...summary, verified: true };
+  } else if (command === "restore") {
+    if (process.platform === "linux" && process.getuid() === 0) throw new Error("请通过 sudo -u industrial-rent 恢复到新的业务目录，勿以 root 创建业务账本。");
+    if (!options.from) throw new Error("请用 --from 指定备份目录。");
+    result = await backupTools(options.config).restoreBackup(options.from, newTarget(options.to));
+  } else if (command === "backup") {
+    const config = resolveConfig(options.config);
+    result = await withStoppedDatabase(config, db => backupTools(options.config).createBackup(db, config, options.to ? newTarget(options.to) : undefined));
+  } else if (command === "package") result = await buildPackage(options);
+  else if (command === "publish-update") result = await publishUpdate(__dirname, options);
+  else throw new Error(`未知命令：${command}。运行 help 查看说明。`);
+  console.log(JSON.stringify(result, null, 2));
+}
+
+if (require.main === module) {
+  main().catch(error => {
+    console.error(`维护操作未完成：${error.message}`);
+    process.exitCode = 1;
+  });
+}
+
+module.exports = { argumentsOf, buildPackage, main };

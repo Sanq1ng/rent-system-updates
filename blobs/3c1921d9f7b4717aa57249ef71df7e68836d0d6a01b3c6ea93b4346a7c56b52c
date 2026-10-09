@@ -1,0 +1,238 @@
+(function (root, factory) {
+  "use strict";
+  if (typeof module === "object" && module.exports) {
+    module.exports = factory(require("./domain.js"));
+  } else {
+    root.RentBusiness = factory(root.RentDomain);
+  }
+})(globalThis, function (Domain) {
+  "use strict";
+
+  const kinds = ["property", "water", "electricity", "deposit", "other"];
+  const rentTaxModes = Object.freeze({ inclusive: "含税", exclusive: "不含税" });
+  const lessorEntities = Object.freeze({
+    jiuming: "鸠鸣物业", xunyong: "浔涌公司", hengdong: "恒动公司",
+    shihan: "世瀚公司", debang: "德邦公司", other: "其他",
+  });
+  const rentTaxText = data => typeof data?.rentTaxMode === "string" && Object.hasOwn(rentTaxModes, data.rentTaxMode) ? rentTaxModes[data.rentTaxMode] : "未录入";
+  const lessorText = data => data?.lessorId === "other" ?
+    (typeof data.lessorOtherName === "string" && data.lessorOtherName.trim() ? data.lessorOtherName.trim() : "其他（名称未录入）") :
+    typeof data?.lessorId === "string" && Object.hasOwn(lessorEntities, data.lessorId) ? lessorEntities[data.lessorId] : "未录入";
+  const ownerText = data => typeof data?.propertyOwner === "string" && data.propertyOwner.trim() ? data.propertyOwner.trim() : "未录入";
+  const normalizePark = value => typeof value === "string" ? value.trim().normalize("NFC") : "";
+  const record = value => value !== null && typeof value === "object" && !Array.isArray(value);
+  const rowTitle = row => `${row.label || "费用"}（${row.periodStart} 至 ${row.periodEnd}）`;
+  const text = (value, max, required, label, errors) => {
+    if (typeof value !== "string" || value.length > max || (required && !value.trim())) {
+      errors.push(`${label}须为${required ? "非空" : ""}文本，长度不超过 ${max} 字。`);
+      return "";
+    }
+    return value.trim();
+  };
+  const date = (value, label, errors) => {
+    if (!Domain.isISODate(value)) errors.push(`${label}须为真实有效的 YYYY-MM-DD 日期。`);
+  };
+  const money = (value, label, errors) => {
+    if (typeof value !== "string") {
+      errors.push(`${label}须明确填写十进制金额。`);
+      return null;
+    }
+    try { return Domain.parseMoney(value); }
+    catch (error) { errors.push(`${label}：${error.message}`); return null; }
+  };
+
+  function previewContract(data, { requireMetadata = true, amendment } = {}) {
+    const errors = [];
+    if (!record(data)) return { rows: [], errors: ["请填写完整合同资料。"] };
+    const retainedOpeningIds = new Set();
+    let effectiveDate = null;
+    if (amendment !== undefined) {
+      const contract = amendment?.contract;
+      if (!record(contract?.data) || !Array.isArray(contract.data.openingPayments) || !Array.isArray(amendment.invoices) ||
+          !amendment.invoices.every(record)) {
+        return { rows: [], errors: ["缺少原合同及正式应收资料，请同步后再预览变更。"] };
+      }
+      date(amendment.effectiveDate, "变更生效日", errors);
+      if (Domain.isISODate(amendment.effectiveDate)) {
+        effectiveDate = amendment.effectiveDate;
+        if (effectiveDate < contract.data.managementStartDate) errors.push("生效日不能早于原合同管账起点。");
+      }
+      if (data.startDate !== contract.data.startDate || data.managementStartDate !== contract.data.managementStartDate ||
+          !Array.isArray(data.openingPayments) || data.openingPayments.length !== contract.data.openingPayments.length ||
+          data.openingPayments.some((entry, index) => !record(entry) ||
+            entry.rowId !== contract.data.openingPayments[index].rowId ||
+            entry.paidCents !== contract.data.openingPayments[index].paidCents ||
+            typeof entry.reason !== "string" || entry.reason.trim() !== contract.data.openingPayments[index].reason)) {
+        errors.push("已建立的合同起租日、管账起点及期初已收不可由变更重写；请另行提交明确的账务申请。");
+      }
+      for (const invoice of amendment.invoices) {
+        if (invoice.contractId === contract.id && invoice.status === "active" && effectiveDate &&
+            invoice.periodEnd < effectiveDate && contract.data.openingPayments.some(entry => entry.rowId === invoice.rowId)) {
+          retainedOpeningIds.add(invoice.rowId);
+        }
+      }
+    }
+    text(data.number, 120, true, "合同编号", errors);
+    if ((requireMetadata || data.rentTaxMode !== undefined) &&
+      (typeof data.rentTaxMode !== "string" || !Object.hasOwn(rentTaxModes, data.rentTaxMode))) {
+      errors.push("请选择租金含税口径：含税或不含税；该选项仅作记录，不自动加减税额。");
+    }
+    if ((requireMetadata || data.lessorId !== undefined) &&
+      (typeof data.lessorId !== "string" || !Object.hasOwn(lessorEntities, data.lessorId))) {
+      errors.push("请选择出租方签约主体；不在名单内的请选择“其他”并填写名称。");
+    }
+    if (data.lessorId === "other") text(data.lessorOtherName, 160, true, "其他出租方签约主体名称", errors);
+    else if (data.lessorOtherName !== undefined &&
+      (typeof data.lessorOtherName !== "string" || data.lessorOtherName !== "")) {
+      errors.push("选择固定出租方主体时，其他主体名称须留空。");
+    }
+    if (data.propertyOwner !== undefined) text(data.propertyOwner, 160, false, "产权主体", errors);
+    if (!["company", "person"].includes(data.tenantType)) errors.push("请选择企业或个人承租方。");
+    text(data.tenant, 160, true, "承租方", errors);
+    text(data.contact, 120, false, "联系人", errors);
+    text(data.phone, 80, false, "联系电话", errors);
+    text(data.notes, 10000, false, "合同备注", errors);
+    date(data.startDate, "合同起租日", errors);
+    date(data.endDate, "合同截止日", errors);
+    date(data.managementStartDate, "开始管账日期", errors);
+    if (Domain.isISODate(data.managementStartDate) && Domain.isISODate(data.endDate) && data.managementStartDate > data.endDate) {
+      errors.push("开始管账日期不能晚于合同截止日。");
+    }
+    const amount = money(data.amount, "合同租金", errors);
+    if (!Array.isArray(data.locations) || !data.locations.length || data.locations.length > 100) {
+      errors.push("请填写 1 至 100 个实际出租位置。");
+    } else {
+      let allocated = 0;
+      let any = false;
+      let every = true;
+      const locations = new Set();
+      for (const location of data.locations) {
+        if (!record(location)) { errors.push("出租位置格式无效。"); continue; }
+        text(location.park, 120, true, "园区", errors);
+        for (const field of ["building", "floor", "zone", "area"]) text(location[field], 160, false, "位置字段", errors);
+        const locationText = field => typeof location[field] === "string" ? location[field].trim().normalize("NFC") : "";
+        if (["building", "floor", "zone", "area"].every(field => !locationText(field))) {
+          errors.push("每个出租位置还须注明楼栋、楼层、区域或面积描述，不可只填园区。");
+        }
+        const key = ["park", "building", "floor", "zone", "area"].map(locationText).join("\u0000");
+        if (locations.has(key)) errors.push("同一份合同中不能重复填写完全相同的出租位置。");
+        locations.add(key);
+        const entry = location.allocatedRent;
+        if (entry !== "") {
+          any = true;
+          const cents = money(entry, "位置分配金额", errors);
+          if (cents !== null) allocated += cents;
+        } else every = false;
+      }
+      if (any && (!every || allocated !== amount)) errors.push("按位置分配租金时，每个位置都须填写，合计须与合同租金相等；否则全部留空表示未分配。");
+    }
+    if (!Array.isArray(data.fees) || data.fees.length > 100) errors.push("附加费用须为不超过 100 项的清单。");
+    const fees = Array.isArray(data.fees) ? data.fees.slice(0, 100) : [];
+    const feeIds = new Set();
+    for (const fee of fees) {
+      if (!record(fee)) { errors.push("费用格式无效。"); continue; }
+      const id = text(fee.id, 80, true, "费用标识", errors);
+      if (!/^[a-zA-Z0-9_-]{1,80}$/.test(id) || feeIds.has(id)) errors.push("费用标识必须唯一且只能使用字母、数字、下划线或短横线。");
+      feeIds.add(id);
+      if (!kinds.includes(fee.kind)) errors.push("费用类别无效。");
+      text(fee.label, 120, true, "费用名称", errors);
+      money(fee.amount, "费用金额", errors);
+      if (!["once", "period"].includes(fee.frequency)) errors.push("费用频率须为单次或每期。");
+      if (fee.frequency === "once") date(fee.dueDate, "单次费用到期日", errors);
+      else if (fee.dueDate !== "") errors.push("每期费用到期日随租金期次，须留空。");
+    }
+    if (typeof data.freeEnabled !== "boolean") errors.push("请明确是否免租。");
+    if (data.freeEnabled) {
+      date(data.freeStart, "免租起日", errors);
+      date(data.freeEnd, "免租止日", errors);
+      if (Domain.isISODate(data.freeStart) && Domain.isISODate(data.freeEnd) &&
+          (data.freeStart > data.freeEnd || data.freeStart < data.startDate || data.freeEnd > data.endDate)) {
+        errors.push("免租日期须在合同期间内，且结束日期不早于开始日期。");
+      }
+    } else if (data.freeStart !== "" || data.freeEnd !== "") errors.push("未启用免租时免租日期须留空。");
+    if (!record(data.overrides)) errors.push("人工核定项须为对象。");
+    else if (Object.keys(data.overrides).length > 240) errors.push("人工核定项过多。");
+    else for (const [key, override] of Object.entries(data.overrides)) {
+      if (!Domain.isISODate(key) || !record(override) ||
+        typeof override.reason !== "string" || override.reason.length > 1000) {
+        errors.push("人工核定须使用有效期次日期，并提供长度不超过 1000 字的核定原因。");
+      }
+    }
+    if (!Array.isArray(data.attachments) || data.attachments.length < 1 || data.attachments.length > 100) errors.push("合同须关联至少一份已上传的原始附件。");
+    if (!Array.isArray(data.openingPayments)) errors.push("期初已收记录须为数组。");
+    if (data.renewalOf !== undefined && (typeof data.renewalOf !== "string" || !data.renewalOf.trim())) errors.push("续租合同引用无效。");
+    const calculated = Domain.generateSchedule({
+      startDate: data.startDate, endDate: data.endDate, amount: data.amount,
+      amountBasis: data.amountBasis, cycleMonths: data.cycleMonths,
+      anchor: data.anchor, advanceMonths: data.advanceMonths, dueDay: data.dueDay,
+      freeRent: data.freeEnabled ? { startDate: data.freeStart, endDate: data.freeEnd } : null,
+      overrides: data.overrides,
+    });
+    errors.push(...calculated.errors);
+    let rows = [];
+    for (const source of calculated.rows) {
+      if (source.periodEnd < data.managementStartDate) continue;
+      rows.push({
+        id: `rent:${source.periodStart}`, kind: "rent", label: "租金",
+        periodStart: source.periodStart, periodEnd: source.periodEnd,
+        dueDate: source.dueDate, amountCents: source.rentCents,
+        manual: source.manual, reason: source.reason, issues: source.issues,
+        flags: source.flags, needsOpening: source.dueDate !== null && source.dueDate < data.managementStartDate,
+      });
+    }
+    for (const fee of fees) {
+      if (!record(fee) || !feeIds.has(fee.id) || !kinds.includes(fee.kind) || !["once", "period"].includes(fee.frequency)) continue;
+      const cents = money(fee.amount, "费用金额", []);
+      const periods = fee.frequency === "once"
+        ? [{ periodStart: fee.dueDate, periodEnd: fee.dueDate, dueDate: fee.dueDate }]
+        : rows.filter(row => row.kind === "rent");
+      for (const period of periods) {
+        if (period.periodEnd < data.managementStartDate) continue;
+        const dueDate = fee.frequency === "once" ? fee.dueDate : period.dueDate;
+        rows.push({
+          id: `fee:${fee.id}:${period.periodStart}`, kind: fee.kind, label: fee.label,
+          periodStart: period.periodStart, periodEnd: period.periodEnd, dueDate,
+          amountCents: cents, manual: false, reason: "", issues: [],
+          flags: [], needsOpening: Domain.isISODate(dueDate) && dueDate < data.managementStartDate,
+        });
+      }
+    }
+    if (rows.length > 1200) errors.push("合同应收行过多，请缩短合同期限。");
+    // A change proposes only future rows; approved history is not regenerated at the new price.
+    if (effectiveDate) rows = rows.filter(row => row.periodEnd >= effectiveDate);
+    const opening = new Map();
+    if (Array.isArray(data.openingPayments)) {
+      for (const entry of data.openingPayments) {
+        if (!record(entry) || typeof entry.rowId !== "string" || entry.rowId.length > 180 || opening.has(entry.rowId) ||
+          !Number.isSafeInteger(entry.paidCents) || entry.paidCents < 0 ||
+          entry.paidCents > 1_000_000_000_000 ||
+          typeof entry.reason !== "string" || !entry.reason.trim() || entry.reason.length > 1000) {
+          errors.push("开始记账前的收款资料不完整，请明确已收金额（包括零）并填写核对依据。");
+        } else opening.set(entry.rowId, entry.paidCents);
+      }
+      for (const row of rows) {
+        if (row.needsOpening && !opening.has(row.id)) errors.push(`${rowTitle(row)} 在开始记账前已到缴费日，请确认已经收到多少（没有收到也要确认），并填写依据。`);
+        if (opening.has(row.id) && (!row.needsOpening || row.amountCents === null || opening.get(row.id) > row.amountCents)) {
+          errors.push(`${rowTitle(row)} 的已收金额无效或超过应交金额，请重新核对。`);
+        }
+      }
+      for (const id of opening.keys()) if (!retainedOpeningIds.has(id) && !rows.some(row => row.id === id)) {
+        errors.push("有一项开始记账前的收款不在当前收租计划内，请重新核对。");
+      }
+    }
+    for (const row of rows) {
+      if (row.issues.length || !Domain.isISODate(row.dueDate) || !Number.isSafeInteger(row.amountCents) || row.amountCents < 0 ||
+        row.amountCents > 1_000_000_000_000) {
+        errors.push(`${rowTitle(row)} 的金额或缴费日尚未确认：${row.issues.join("；") || "请按合同填写并说明依据。"}`);
+      }
+    }
+    if (record(data.overrides)) {
+      const used = new Set(calculated.rows.map(row => row.periodStart));
+      for (const key of Object.keys(data.overrides)) if (!used.has(key)) errors.push(`人工核定 ${key} 未对应任何租金期次。`);
+    }
+    return { rows, errors, ...(amendment !== undefined ? { retainedOpeningIds: [...retainedOpeningIds].sort() } : {}) };
+  }
+
+  return Object.freeze({ previewContract, rentTaxModes, lessorEntities, rentTaxText, lessorText,
+    ownerText, normalizePark, rowTitle });
+});

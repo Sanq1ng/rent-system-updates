@@ -1,0 +1,210 @@
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Linq;
+using System.Net;
+using System.Net.NetworkInformation;
+using System.Net.Sockets;
+using System.Security.Cryptography;
+using System.Text;
+using System.Threading;
+using System.Threading.Tasks;
+using RentLan;
+
+namespace RentCentre.Client
+{
+    internal sealed class PairingMaterial
+    {
+        internal byte[] Encryption, Authentication;
+        internal string Code;
+        internal static PairingMaterial Derive(ECDiffieHellmanCng ecdh, string publicKey, string transcript)
+        {
+            byte[] remote = Convert.FromBase64String(publicKey);
+            if (remote.Length != 65 || remote[0] != 4) throw new IOException("主机配对密钥无效。");
+            byte[] peerBlob = new byte[] { 0x45, 0x43, 0x4b, 0x31, 32, 0, 0, 0 }.Concat(remote.Skip(1)).ToArray();
+            using (var key = CngKey.Import(peerBlob, CngKeyBlobFormat.EccPublicBlob)) {
+                byte[] master = ecdh.DeriveKeyMaterial(key);
+                try {
+                    byte[] comparison = PairingSession.Mac(master, "comparison\n" + transcript);
+                    uint number = ((uint)comparison[0] << 24) | ((uint)comparison[1] << 16) | ((uint)comparison[2] << 8) | comparison[3];
+                    return new PairingMaterial { Encryption = PairingSession.Mac(master, "encryption\n" + transcript),
+                        Authentication = PairingSession.Mac(master, "authentication\n" + transcript), Code = (number % 100000000).ToString("D8") };
+                } finally { Array.Clear(master, 0, master.Length); }
+            }
+        }
+    }
+    internal sealed class Offer
+    {
+        internal IPEndPoint Peer;
+        internal string Name, Origin, ServerId;
+        public override string ToString() { return Name + "  " + Origin; }
+    }
+    internal sealed class PairingSession : IDisposable
+    {
+        internal const string Protocol = "rent-pair-v1";
+        internal const int Port = 48765;
+        private readonly UdpClient socket = new UdpClient(AddressFamily.InterNetwork);
+        private readonly ECDiffieHellmanCng ecdh = new ECDiffieHellmanCng(256);
+        private readonly string nonce;
+        private readonly CancellationToken cancellation;
+        private Offer offer;
+        private string requestId;
+        private byte[] encryption, authentication;
+        internal Connection Connection;
+        internal string Code;
+        internal PairingSession(CancellationToken cancellation)
+        {
+            this.cancellation = cancellation;
+            socket.EnableBroadcast = true;
+            socket.Client.ReceiveTimeout = 1000;
+            socket.Client.Bind(new IPEndPoint(IPAddress.Any, 0));
+            ecdh.KeyDerivationFunction = ECDiffieHellmanKeyDerivationFunction.Hash;
+            ecdh.HashAlgorithm = CngAlgorithm.Sha256;
+            nonce = Base64Url(Random(32));
+        }
+        internal static string Base64Url(byte[] value) { return Convert.ToBase64String(value).TrimEnd('=').Replace('+', '-').Replace('/', '_'); }
+        internal static byte[] Random(int count) { var result = new byte[count]; using (var random = RandomNumberGenerator.Create()) random.GetBytes(result); return result; }
+        internal static byte[] Hash(byte[] bytes) { using (var sha = SHA256.Create()) return sha.ComputeHash(bytes); }
+        internal static byte[] Mac(byte[] key, byte[] bytes) { using (var hmac = new HMACSHA256(key)) return hmac.ComputeHash(bytes); }
+        internal static byte[] Mac(byte[] key, string value) { return Mac(key, Product.Utf8.GetBytes(value)); }
+        internal static bool Equal(byte[] one, byte[] two)
+        {
+            if (one == null || two == null || one.Length != two.Length) return false;
+            int different = 0; for (int i = 0; i < one.Length; i++) different |= one[i] ^ two[i]; return different == 0;
+        }
+        private void Send(object value, IPEndPoint peer)
+        {
+            cancellation.ThrowIfCancellationRequested();
+            byte[] bytes = Product.Utf8.GetBytes(Json.Encode(value));
+            if (bytes.Length > 8192) throw new IOException("配对请求超过限制。");
+            socket.Send(bytes, bytes.Length, peer);
+        }
+        private Dictionary<string, object> Receive(out IPEndPoint peer)
+        {
+            cancellation.ThrowIfCancellationRequested();
+            peer = new IPEndPoint(IPAddress.Any, 0);
+            byte[] bytes;
+            try { bytes = socket.Receive(ref peer); }
+            catch (SocketException error) {
+                if (error.SocketErrorCode == SocketError.TimedOut || error.SocketErrorCode == SocketError.WouldBlock) return null;
+                throw;
+            }
+            if (bytes.Length > 8192 || peer.Port != Port) return null;
+            try {
+                var value = Json.Object(Product.Utf8.GetString(bytes));
+                if (Json.String(value, "protocol") != Protocol) return null;
+                return value;
+            } catch (IOException) { return null; } catch (DecoderFallbackException) { return null; }
+        }
+        internal Offer[] Discover()
+        {
+            var destinations = new HashSet<string>();
+            foreach (var adapter in NetworkInterface.GetAllNetworkInterfaces()) {
+                if (adapter.OperationalStatus != OperationalStatus.Up || adapter.NetworkInterfaceType == NetworkInterfaceType.Loopback ||
+                    adapter.NetworkInterfaceType == NetworkInterfaceType.Tunnel) continue;
+                foreach (var unicast in adapter.GetIPProperties().UnicastAddresses) {
+                    if (unicast.Address.AddressFamily != AddressFamily.InterNetwork || unicast.IPv4Mask == null) continue;
+                    byte[] ip;
+                    try { ip = Network.PrivateV4(unicast.Address.ToString()); } catch (IOException) { continue; }
+                    byte[] mask = unicast.IPv4Mask.GetAddressBytes();
+                    destinations.Add(new IPAddress(ip.Select((value, index) => (byte)(value | (255 ^ mask[index]))).ToArray()).ToString());
+                    if (destinations.Count >= 16) break;
+                }
+            }
+            if (destinations.Count == 0) throw new IOException("没有可用的办公网连接。请先连接公司 Wi-Fi 或网线。");
+            var found = new Dictionary<string, Offer>();
+            DateTime end = DateTime.UtcNow.AddSeconds(5), next = DateTime.MinValue;
+            while (DateTime.UtcNow < end) {
+                if (DateTime.UtcNow >= next) {
+                    foreach (string address in destinations) Send(new { protocol = Protocol, kind = "discover", nonce }, new IPEndPoint(IPAddress.Parse(address), Port));
+                    next = DateTime.UtcNow.AddSeconds(2);
+                }
+                IPEndPoint peer; var value = Receive(out peer);
+                if (value == null) continue;
+                try {
+                    if (Json.String(value, "kind") != "offer" || Json.String(value, "nonce") != nonce) continue;
+                    string origin = Json.String(value, "origin"), id = Json.String(value, "serverId"), name = Json.String(value, "name");
+                    int port; Product.Uuid(id);
+                    if (Network.AddressOf(origin, out port) != peer.Address.ToString() || name.Length > 80 || name.Any(Char.IsControl)) continue;
+                    if (found.Count < 30) found[id + origin] = new Offer { Peer = peer, Origin = origin, ServerId = id, Name = name };
+                } catch (IOException) { }
+            }
+            return found.Values.ToArray();
+        }
+        internal void Begin(Offer selected)
+        {
+            offer = selected;
+            byte[] blob = ecdh.Key.Export(CngKeyBlobFormat.EccPublicBlob);
+            string publicKey = Convert.ToBase64String(new byte[] { 4 }.Concat(blob.Skip(8)).ToArray());
+            DateTime end = DateTime.UtcNow.AddSeconds(12);
+            while (DateTime.UtcNow < end) {
+                Send(new { protocol = Protocol, kind = "begin", nonce, publicKey, name = Environment.MachineName }, offer.Peer);
+                IPEndPoint peer; var value = Receive(out peer);
+                if (value == null || !peer.Equals(offer.Peer)) continue;
+                if (Json.String(value, "kind") != "challenge" || Json.String(value, "nonce") != nonce) continue;
+                requestId = Json.String(value, "id"); Product.Uuid(requestId);
+                string serverNonce = Json.String(value, "serverNonce");
+                if (!System.Text.RegularExpressions.Regex.IsMatch(serverNonce, "^[A-Za-z0-9_-]{43}$")) throw new IOException("主机挑战码无效。");
+                string serverPublicKey = Json.String(value, "publicKey");
+                byte[] remote = Convert.FromBase64String(serverPublicKey);
+                if (remote.Length != 65 || remote[0] != 4) throw new IOException("主机配对密钥无效。");
+                byte[] descriptor = Convert.FromBase64String(Json.String(value, "descriptor"));
+                Connection = Json.Decode<Connection>(Product.Utf8.GetString(descriptor)); Connection.Validate(false);
+                if (Connection.serverId != offer.ServerId || Connection.origin != offer.Origin) throw new IOException("搜索结果与配对公司不一致。");
+                string transcript = String.Join("\n", Protocol, requestId, nonce, serverNonce, publicKey, serverPublicKey,
+                    BitConverter.ToString(Hash(descriptor)).Replace("-", "").ToLowerInvariant());
+                var material = PairingMaterial.Derive(ecdh, serverPublicKey, transcript);
+                encryption = material.Encryption; authentication = material.Authentication; Code = material.Code;
+                return;
+            }
+            throw new IOException("主机没有回应。请确认负责人已开启“同事连接”。");
+        }
+        internal string AwaitApproval()
+        {
+            DateTime end = DateTime.UtcNow.AddMinutes(5);
+            while (DateTime.UtcNow < end) {
+                Send(new { protocol = Protocol, kind = "poll", id = requestId, nonce,
+                    mac = Convert.ToBase64String(Mac(authentication, "poll\n" + requestId + "\n" + nonce)) }, offer.Peer);
+                IPEndPoint peer; var value = Receive(out peer);
+                if (value == null || !peer.Equals(offer.Peer) || Json.String(value, "id") != requestId) continue;
+                string kind = Json.String(value, "kind");
+                if (kind == "approved") {
+                    byte[] iv = Convert.FromBase64String(Json.String(value, "iv"));
+                    byte[] ciphertext = Convert.FromBase64String(Json.String(value, "ciphertext"));
+                    byte[] signed = Product.Utf8.GetBytes("approved\n" + requestId + "\n").Concat(iv).Concat(ciphertext).ToArray();
+                    if (iv.Length != 16 || ciphertext.Length == 0 || ciphertext.Length > 6144 ||
+                        !Equal(Mac(authentication, signed), Convert.FromBase64String(Json.String(value, "mac")))) throw new IOException("配对响应校验失败，未安装证书。");
+                    byte[] clear;
+                    using (var aes = Aes.Create()) {
+                        aes.Key = encryption; aes.IV = iv; aes.Mode = CipherMode.CBC; aes.Padding = PaddingMode.PKCS7;
+                        using (var decrypt = aes.CreateDecryptor()) clear = decrypt.TransformFinalBlock(ciphertext, 0, ciphertext.Length);
+                    }
+                    try {
+                        var payload = Json.Object(Product.Utf8.GetString(clear));
+                        if (Json.Encode(Json.Decode<Connection>(Json.Encode(payload["connection"]))) != Json.Encode(Connection))
+                            throw new IOException("获准后的公司证书发生变化，已拒绝连接。");
+                        var invite = payload["invitation"] as Dictionary<string, object>;
+                        if (invite == null) throw new IOException("批准信息缺少邀请。");
+                        string token = Json.String(invite, "token"), id = Json.String(invite, "id");
+                        Product.Uuid(id);
+                        if (!System.Text.RegularExpressions.Regex.IsMatch(token, "^[A-Za-z0-9_-]{43}$")) throw new IOException("邀请凭证无效。");
+                        DateTimeOffset expiry = RentLan.Connection.Time(Json.String(invite, "expiresAt"));
+                        if (expiry <= DateTimeOffset.UtcNow || expiry > DateTimeOffset.UtcNow.AddHours(25)) throw new IOException("邀请已经过期。");
+                        return Connection.origin + "/#join=" + id + "." + token;
+                    } finally { Array.Clear(clear, 0, clear.Length); }
+                }
+                if (kind != "pending" && kind != "rejected") continue;
+                if (!Equal(Mac(authentication, kind + "\n" + requestId), Convert.FromBase64String(Json.String(value, "mac")))) continue;
+                if (kind == "rejected") throw new IOException("负责人拒绝了这次连接，请联系负责人后重新申请。");
+                if (cancellation.WaitHandle.WaitOne(2000)) cancellation.ThrowIfCancellationRequested();
+            }
+            throw new IOException("配对已过期，请重新搜索主机。");
+        }
+        public void Dispose()
+        {
+            socket.Close(); ecdh.Dispose();
+            if (encryption != null) Array.Clear(encryption, 0, encryption.Length);
+            if (authentication != null) Array.Clear(authentication, 0, authentication.Length);
+        }
+    }
+}

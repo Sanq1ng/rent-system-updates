@@ -1,0 +1,168 @@
+{
+  "protocolVersion": 1,
+  "schemaVersion": 7,
+  "authentication": {
+    "session": "Existing same-origin rent_session cookie; active application user",
+    "mutations": ["Origin", "X-CSRF-Token", "X-Rent-Client-Version", "X-Rent-Client-Id"],
+    "workspaceMembership": "Canonical /api/push RPCs never create Workspaces participants. Skip only Workspaces.touch, not authentication, CSRF, current-client-version, maintenance admission or active-request draining. Real WebView/PWA editing pages still participate through normal business/heartbeat routes.",
+    "installationHeader": "X-Rent-Installation-Id",
+    "receiptException": "POST /api/push/receipts uses a single-delivery receipt capability, not an application session. Same-origin and maintenance admission still apply.",
+    "consent": "An explicit user gesture and informed opt-in MUST precede SDK initialization or browser permission/subscription. Do not initialize push on page load.",
+    "accountSwitch": "Revoke the old account's device before changing accounts. Logout must revoke that user's X-Rent-Installation-Id; absent header revokes all of that user's push bindings. Successful proof of the same provider registration atomically revokes the previous binding."
+  },
+  "routes": {
+    "GET /api/push/status": {
+      "response": "{protocolVersion:1,publicOrigin,channels:{jpush:{configured,appKey,vendorChannelsConfigured},webpush:{configured,publicKey}},devices:[Device],paused,backgroundDeliveryGuaranteed:false}"
+    },
+    "GET /api/push/devices": { "response": "{devices:[Device]}" },
+    "POST /api/push/enrollments": {
+      "request": "{requestId:UUID,installationId:UUID,channel:'jpush'|'webpush',label:string,registrationId?:string,subscription?:{endpoint,keys:{p256dh,auth},expirationTime?:number|null}}",
+      "response": "{id:UUID,status:'pending',expiresAt:ISO8601}",
+      "successStatus": 202,
+      "idempotency": "Same user/requestId and same validated body returns the same result without another push. A failed/expired/revoked request requires a NEW requestId."
+    },
+    "POST /api/push/enrollments/:id/confirm": {
+      "request": "{proof:base64url32bytes}",
+      "response": "{device:Device}",
+      "successStatus": 200
+    },
+    "DELETE /api/push/devices/:id": {
+      "request": null,
+      "response": "{ok:true}",
+      "successStatus": 200
+    },
+    "POST /api/push/test": {
+      "request": "{requestId:UUID,deviceId:UUID}",
+      "response": "{deliveryId:UUID,status:string,kind:'test'}",
+      "successStatus": 202
+    },
+    "POST /api/push/receipts": {
+      "request": "{deliveryId:UUID,receiptToken:base64url32bytes,stage:'received'|'opened'}",
+      "response": "{ok:true,stage:'received'|'opened'}",
+      "successStatus": 200,
+      "semantics": "received means the client reported receipt; opened means the client reported notification opening. Neither marks an in-app business notification read."
+    },
+    "GET /api/admin/push": { "response": "Counts, bounded sanitized failure codes and readiness only; never registration IDs, subscription endpoints, keys or receipt/enrollment proofs." }
+  },
+  "device": {
+    "fields": ["id", "installationId", "channel", "label", "status", "createdAt", "updatedAt", "lastAcceptedAt", "lastReceivedAt", "lastOpenedAt", "revokedAt"],
+    "statuses": ["active", "revoked"]
+  },
+  "enrollmentPayload": {
+    "kind": "rent-push-enrollment",
+    "enrollmentId": "<UUID>",
+    "proof": "<base64url32bytes>"
+  },
+  "reminderPayload": {
+    "kind": "rent-reminder",
+    "deliveryId": "<UUID>",
+    "receiptToken": "<base64url32bytes>",
+    "title": "园区租赁",
+    "body": "您有新的待处理提醒，请登录查看。",
+    "url": "/#notifications"
+  },
+  "testPayload": {
+    "kind": "rent-push-test",
+    "deliveryId": "<UUID>",
+    "receiptToken": "<base64url32bytes>",
+    "title": "园区租赁",
+    "body": "这是一条设备通知测试，不含业务信息。",
+    "url": "/#notifications"
+  },
+  "deliveryStates": ["pending", "retry", "sending", "provider-accepted", "received", "opened", "expired", "failed", "revoked"],
+  "deliverySemantics": {
+    "provider-accepted": "Provider accepted the request; NOT proof of device delivery.",
+    "uncertain": "Network/timeout/crash with unknown provider outcome is terminal failed and is NOT automatically resent. A later valid receipt may establish receipt.",
+    "reminders": "At most one new-event generic notification per active opted-in device per Shanghai calendar day. A notification_id already recorded for that binding is not queued again on another day or after restart, even if unread. Select the next unseen visible unread event without globally suppressing another device. The referenced notification and current user role/park scope are rechecked immediately before every attempt.",
+    "retention": "Tests, expired enrollment records and inactive-device histories use the 30-day cleanup. An active binding retains reminder event history so cleanup cannot re-arm old unpaid/unread events; it becomes eligible for ordinary cleanup after revocation. Existing operational row limits remain enforced; capacity is surfaced as PUSH_CAPACITY rather than deleting deduplication history or falsely claiming delivery.",
+    "nativeExtras": "JPush notification.android.channel_id is rent_reminders and notification.android.extras is the exact payload object. Enrollment uses a visible generic device-verification notification; do not display the proof.",
+    "navigation": "Ignore arbitrary payload URLs. Only open the configured application origin with /#notifications.",
+    "ios": "Standard Web Push requires an installed home-screen web app on supported iOS/iPadOS. No native iOS app or Apple developer account is implemented.",
+    "android": "JPush acceptance alone does not guarantee delivery after an OEM kills the app. OEM channel/company/app registrations and real-device acceptance testing remain external prerequisites."
+  },
+  "limits": {
+    "requestBytes": 8192,
+    "labelCharacters": 48,
+    "endpointCharacters": 2048,
+    "devicesPerUser": 8,
+    "enrollmentMinutes": 5,
+    "enrollmentsPerUserHour": 6,
+    "confirmAttempts": 5,
+    "testsPerUserHour": 6,
+    "deliveryAttempts": 4
+  },
+  "serverConfiguration": {
+    "publicOrigin": "An exact HTTPS origin is required for production push.",
+    "stableConfiguration": "Ordinary host config contains only pushCredentialsFile (absolute external path or null) and its derived safe pushCredentialsHash descriptor. Inline push/provider keys are rejected by ordinary config. Never put raw credentials in host --check output, program inventories or update payloads.",
+    "credentialDocument": "The protected external JSON is {formatVersion:1,jpush?:{appKey,masterSecret,production,vendorChannelsConfigured?},webpush?:{publicKey,privateKey,subject}} with at least one configured channel. server/runtime-secrets.cjs privately validates and loads it; missing pointer leaves channels unavailable.",
+    "serviceConfiguration": "The push.jpush / push.webpush shapes below describe the PRIVATE in-memory provider object passed as createPushService({config:pushConfiguration}), NOT an inline push property in ordinary stable config.",
+    "push.jpush": "{appKey,masterSecret,production:true,vendorChannelsConfigured:false}; masterSecret is server-only",
+    "push.webpush": "{publicKey,privateKey,subject}; subject is a configured mailto: or HTTPS VAPID contact",
+    "secrets": "Versioned server code calls loadPushCredentials(config) privately. Operator-provisioned credential files remain outside program/current release/update roots, with restrictive owner/group permissions or Windows ACLs. Path/fingerprint descriptors are not provider credentials. Never log the raw loader result or pass it through host --check.",
+    "keyGeneration": "After the operator creates an external protected secrets directory: node server\\push-keys.cjs <absolute-external-vapid.json>. Exclusive creation, mode0600, never overwrites, rejects paths inside program payloads. Windows additionally requires service-account-only file ACLs. Do not run this automatically on startup or update.",
+    "unconfigured": "Missing provider credentials returns configured:false and PUSH_UNAVAILABLE. No registration, payment, live send or claimed enrollment is performed."
+  },
+  "nativeIntegration": {
+    "schema": "This file is authoritative: protocolVersion=1, database schemaVersion=6. HTTP response fields are case-sensitive. Android APK version is independent of server applicationVersion.",
+    "bootstrap": "GET /api/bootstrap -> {initialized,serverId,version:1,setupAvailable,applicationVersion,maintenance}. applicationVersion is the server package version to use for the existing current-client-version fence, not bootstrap.version and not the APK version.",
+    "identity": "GET /api/me -> {user:{id,username,displayName,roles,allParks,parks,canExport,receiveReminders,active,version},csrfToken,serverId}. There is no separate sessionGeneration field. Use only exact-origin WebView rent_session cookies; do not log or persist a copied password/CSRF/cookie as a push credential.",
+    "nativeMetadataHeaders": "For GET /api/me send X-Rent-Native-Request: session-metadata (or X-Rent-Installation-Id plus equal X-Rent-Client-Id). Current host uses this narrow metadata route and canonical /api/push routes without creating phantom Workspaces pages. Business WebView pages still heartbeat normally.",
+    "authenticatedHeaders": "Cookie: exact-origin rent_session; Origin: exact configured application origin; X-CSRF-Token: current /api/me csrfToken; X-Rent-Client-Version: bootstrap.applicationVersion; X-Rent-Client-Id: installation UUID; X-Rent-Installation-Id: the same UUID. POST bodies use application/json. Never follow redirects with these credentials.",
+    "enrollmentGeneration": "Capture origin, serverId, user.id, csrfToken, rent_session cookie and local generation BEFORE enrollment. Re-read /api/me and compare all captured identity/session values plus the local generation BEFORE confirmation; any change or 401/403 cancels old work. Keep the originally captured cookie/CSRF for that operation, never transplant an old proof onto new-account cookies. Server confirmation is authenticated to the enrollment's same owner; logout/access revocation cancels pending proofs. There is no public cancel-enrollment endpoint; unconfirmed requests expire, and logout with installationId cancels them immediately.",
+    "challengeOrder": "A challenge may arrive before the initiating HTTP response. Hold it only for this local pending generation and enrollmentId; confirm AFTER POST enrollment returned 202/pending. Challenge/proof TTL is 300 seconds from server creation. The response contains id/status/expiresAt, never proof. New requestId required after failed/expired/revoked initiation.",
+    "limits": "Request body <=8192 UTF-8 bytes; label 1..48 visible Unicode characters; registrationId 8..128 ASCII [A-Za-z0-9_-]; UUIDs are canonical 36-character IDs (server normalizes UUID case). Proof and receiptToken are unpadded base64url encoding of exactly32 random bytes (43 characters). Max8 active devices/user,6 enrollment initiations/user/hour,3 initiations/registration/hour,5 proof attempts,6 tests/user/hour.",
+    "jpushExtras": "REST notification.android.extras IS the payload object itself: {kind,enrollmentId,proof} for challenge, or {kind,deliveryId,receiptToken,title,body,url} for reminder/test. No extra payload/data JSON wrapper is added. Challenge notification.android.alert is fixed generic verification text; do not display/log its proof. Use the SDK's notification-extras JSON, not a presumed custom-message-only route.",
+    "receipts": "POST /api/push/receipts with {deliveryId,receiptToken,stage:'received'|'opened'}; same Origin and JSON headers, no app session/CSRF required. A capability expires after24h from server delivery creation and becomes invalid immediately on revocation/restore. Keep retries bounded and drop invalid/expired capabilities (404); do not turn received/opened into business read. Never send these capabilities to arbitrary payload URLs.",
+    "appKeyRecommendation": "Default APK AppKey blank and SDK disabled. Provision the public JPush AppKey at build time using the official SDK manifest configuration. Before consenting/initializing, compare it to authenticated /api/push/status channels.jpush.appKey and require configured:true; blank/mismatch/unconfigured fails closed. Do not invent a runtime AppKey-setting API. Public AppKey is not a secret; JPush MasterSecret is SERVER ONLY. OEM/company/app/signing registrations are external prerequisites; configured vendor metadata is not a delivery guarantee.",
+    "logout": "Manual logout/switch: cancel local enrollment generations and stop SDK locally, then authenticated POST /api/logout with the installation header; server revokes both devices and pending enrollments for that owner+installation and clears that session. Missing installation header revokes all that user's push bindings. Cookie expiry alone does not revoke devices or require stopping an already-enrolled SDK. Offline logout cannot claim server unbinding; restore always invalidates bindings/capabilities and requires fresh enrollment."
+  },
+  "serverIntegration": {
+    "imports": [
+      "const { createPushService } = require('./push.cjs');",
+      "const { createPushHttpAdapter, isPushApiRoute } = require('./push-http.cjs');",
+      "const { loadPushCredentials } = require('./runtime-secrets.cjs');"
+    ],
+    "loadCredentialsPrivatelyOnce": "In versioned server startup only: const pushConfiguration = loadPushCredentials(config); retain only in private process memory. The stable host/check path keeps path+fingerprint descriptors, not this raw object.",
+    "initializeAfterPublicOriginResolved": "push = createPushService({store,config:pushConfiguration,publicOrigin,resolveUser:id=>store.read('users',id),listNotifications:u=>snapshot(store,u).notifications,resolveNotification:(u,id)=>snapshot(store,u).notifications.find(n=>n.id===id),isWritable:()=>gateStatus().phase==='idle'&&!sealedForUpdate&&!quiescing&&!closing&&!backupRunning}); pushHttp = createPushHttpAdapter(push,publicOrigin); push.start();",
+    "receiptBeforeSessionLookup": "After the existing Host/Origin and writeAdmission guards, before rent_session lookup: if (await pushHttp.receipt({req,res,route,writeAdmission,send})) return;",
+    "skipPhantomNativeWorkspaces": "At the existing pageKey assignment use: const pageKey = nativeDownload || isPushApiRoute(req.method,route) ? null : workspaces.touch(sessionKey,user,req.headers['x-rent-client-id'],req.headers['x-rent-client-version'],mutation.has(req.method)&&!control); This classification applies only to exact recognized /api/push routes. Keep real business/WebView page registration unchanged.",
+    "preserveVersionAndMaintenanceFence": "DO NOT add /api/push paths to updateControl and DO NOT exempt session-bound push mutations from the existing X-Rent-Client-Version check or writeAdmission/reauthenticate. Keep them in activeBusinessRequests so maintenance drains accepted bodies. The already-defined receipt capability exception remains before session lookup and is never a business-write bypass.",
+    "authenticatedAfterExistingGuards": "After the existing session, CSRF, current-client-version and maintenance admission checks and the reauthenticate() definition (but without native push Workspaces.touch): if (await pushHttp.authenticated({req,res,route,user,reauthenticate,send})) return;",
+    "manualLogout": "Before deleting the current session: pushHttp.logout(user.id,req). Validate X-Rent-Installation-Id if present; absent revokes all own devices. Manual account switching must also stop the SDK/unsubscribe locally. Offline revocation is not confirmed server-side until an authenticated request succeeds.",
+    "accountInvalidation": "Inside password-reset/deactivation/access-change transactions that delete user sessions, call push.revokeUser(userId). This method can join the existing synchronous store transaction.",
+    "automaticSessionExpiry": "Do not revoke an enrolled device merely because its login session expired or the user closed the app; authenticated active account eligibility is revalidated at each send and receipts use one-delivery capabilities.",
+    "notifications": "Leave createNotifications and snapshot authorization unchanged. The 15-second worker performs reconcile/tick independently; never make a successful financial response depend on a push call. Worker faults appear as sanitized workerError in the admin summary.",
+    "updateQuiescence": "As update quiescence starts, await push.pause('update') before backup/replacement; finishUpdateMaintenance calls push.resume('update'). isWritable must also reject preparing/installing/expired/sealed/closing states.",
+    "backups": "Before starting a backup snapshot, await push.pause('backup'); in the backup finally block call push.resume('backup'). Pause reasons are independent, so finishing a backup cannot reopen update/shutdown sends.",
+    "restoreHook": "const {revokePushAfterRestore}=require('./push-restore.cjs'); call revokePushAfterRestore(db) inside the SAME existing restore transaction as DELETE FROM sessions, before COMMIT and before the NEW restored directory is published. This sync, network-free entry aliases notification-restore.cjs invalidateRestoredNotifications, already wired by the parent; use either entry ONCE, not both. It does not open/commit/rollback the caller transaction. Optional second argument is a safe integer timestamp in milliseconds for isolated tests.",
+    "restoreSemantics": "Restoring does not restore push authorization: all devices are revoked and raw registrations cleared; sending/pending/confirmed enrollments lose proof and registration data; pending/retry/sending deliveries are revoked; interrupted attempts are revoked; ALL delivery and per-attempt receipt hashes are erased. Accepted/received/opened history, attempts, core business records, user password hashes/roles and server_id remain. Old callbacks/capabilities cannot activate a restored device or update receipts. Future sending requires fresh explicit enrollment and new device proof.",
+    "restoreCompatibility": "Schema<4 without any push objects is a zero-count no-op; future, mislabeled or incomplete schemas fail closed within the caller's transaction. Return counts contain only devices/enrollments/deliveries/attempts, not tokens or endpoints. Never run the restore hook against the still-live source ledger.",
+    "shutdownAndStartupFailure": "Before every store.close() that can follow push initialization, await push.close(). It pauses new work and drains bounded transport completions before the DB closes. Declare push/pushHttp nullable for startup error cleanup.",
+    "staticAsset": "Add /push-client.js and /push-worker.js with JavaScript MIME to the existing explicit static-file allowlist; parent owns sw.js/app.js/UI integration.",
+    "schema": "Schema4 introduced the four normalized push tables; schema5 added authorized employee invitations. The user-approved schema6 migration assigns all-park scope to existing business employees, preserves roles/active/export/reminder/password fields and business records, and revokes prior pending invitations instead of widening their grants. Historical invitation scopes remain accurate. Unknown/future/mismatched schemas are refused. Migration is transactional and requires explicit maintenance for an existing LAN host; cross-format online rollback is not supported.",
+    "schemaExport": "Canonical code constant: require('./server/push-schema.cjs').SCHEMA_VERSION (currently6, pure module with no database opening). server/store.cjs re-exports the identical SCHEMA_VERSION with openStore. Use the installed trusted program's version for compatibility; never derive an admission fence from unverified candidate code. Reading this export neither opens a database nor runs a migration."
+  },
+  "runtimeBundle": {
+    "dependencies": { "web-push": "3.6.7", "esbuild": "0.25.9" },
+    "build": "npm ci --ignore-scripts; npm run build:push (development/build environment only)",
+    "inventory": ["server\\vendor\\web-push.cjs", "server\\vendor\\web-push-licenses.json", "server\\vendor\\http_ece-LICENSE.txt"],
+    "runtime": "One reproducible CommonJS bundle, Node built-ins only, no runtime node_modules. Include bundle and license files in signed inventories. Never install dependencies or execute npm lifecycle scripts during production updates.",
+    "logging": "No request bodies, registration tokens, provider response bodies or credentials are logged. Bundling forcibly disables http_ece ECE_KEYLOG."
+  },
+  "browserIntegration": {
+    "module": "public\\push-client.js exports RentPush (also CommonJS for isolated tests)",
+    "construct": "RentPush.createClient({request:json,getIdentity:()=>user&&online&&csrf?{serverId,userId:user.id}:null,isMaintenance:()=>updateMaintenanceActive,getRegistration:readyPushRegistration})",
+    "requestAdapter": "request is the existing guarded JSON response helper. It receives fetch-style options, serialized body, AbortSignal and X-Rent-Installation-Id. Keep existing cookies, CSRF, version and workspace guards.",
+    "enable": "From a direct click only: client.enable({consent:true,status:awaitedEarlierPushStatus,label}). Status must have been loaded before the click; enable calls Notification.requestPermission before its first await.",
+    "disable": "await client.disable() before online account switching/logout; include client.installationId() as X-Rent-Installation-Id on logout. invalidate() on lock/account/workspace change; dispose() on teardown. For an explicit offline logout, await client.disableLocal() before replacing the account context; it cancels waiting enrollment and removes the local subscription without app API calls, but returns serverRevocationConfirmed:false. Never display this as confirmed server unbinding.",
+    "cancel": "client.invalidate() aborts local work and immediately rejects pending permission, registration, subscribe, unsubscribe, request and proof waits even when the underlying browser promise cannot be cancelled. Late results cannot enroll or update another account. It does not revoke an already-active device or roll back a confirmation already committed. Refresh own device state and DELETE the own device when cancellation races confirmation. Server logout revokes both active devices and pending enrollments for this installation.",
+    "timeouts": "Browser/API steps default to 15000ms, permission prompts to 120000ms, and proof waits to the server expiry (at most 300000ms). Permission is invoked synchronously inside the original click, not through a deferred microtask. Every step races the operation AbortSignal and its deadline, removes its listeners/timer on settlement, and checks operation ownership/generation on any successful result including late completion. Parent readyPushRegistration may retain its stricter 2500ms version handshake. Optional timeoutMs/permissionTimeoutMs constructor overrides are bounded positive integers for isolated testing. Browser APIs themselves may continue internally after cancellation, but their late results cannot form an old enrollment or confirmation. Timeouts release local busy state and report uncertainty; they never mean server-side revocation succeeded.",
+    "nativeAccountChange": "The session-changed bridge message accepts optional reason manual-logout or account-switch to persistently stop native SDK delivery locally. An absent reason is ordinary lock/session expiry and MUST NOT revoke prior push consent. Parent web logout uses manual-logout even if offline or server logout fails. After verified online or encrypted offline unlock, parent accountReady compares the origin-local non-secret serverId:userId marker; changed/missing identity emits account-switch, identical identity after relogin/reload does not. The marker never authorizes business or binding. Native callbacks, printing and exports remain generation-bound in all cases. Server logout with native installationId or DELETE is still required before claiming server unbinding; local SDK stop is not server revocation.",
+    "nativeWorkspaceReady": "Parent accountReady first requires hello capabilities workspaceIdentity:true and lifecycleReasons:true, then sends one-way workspace-ready with the unlocked workspace's public serverId/userId before showing its business actions. Same-account unlock still sends workspace-ready because session-changed cleared the ephemeral native workspace. No cookie, password or authority is supplied. Native historical-file access separately requires fresh authenticated identity to match. Older shells fail visibly with an update instruction, never an uninstall/data-clear instruction.",
+    "worker": "sw.js imports both version-matched /push-client.js and /push-worker.js. push-worker.js automatically attaches its push/notificationclick handlers and also exports RentPushWorker.attach for isolated tests. EVERY push, including enrollment, malformed payload and duplicates, must first call registration.showNotification with fixed generic text; never use a silent challenge. Then forward a valid enrollment only to same-origin app windows as {type:'rent-push',payload}. Never display proof. Enrollment confirmation waits for initiating POST to finish.",
+    "workerReceipt": "Use RentPush.postReceipt(payload,'received'|'opened') only for reminder/test payloads. Report failure honestly; receipt does not mark a business reminder read.",
+    "workerNavigation": "On every notification click, focus an existing app window and post {type:'RENT_OPEN_NOTIFICATIONS'} for its existing dirty-form/maintenance-aware navigation. Enrollment clicks additionally forward their validated challenge. Do not navigate/reload an existing form. Only when no app window exists may the worker open self.location.origin + RentPush.OPEN_PATH; parent retains the requested view until authentication. Never follow arbitrary payload URLs. Legacy data:{kind:'rent-local-reminder',url:'/#notifications'} takes this same safe open path but has no delivery capability and MUST NOT emit received/opened receipts.",
+    "foregroundFallback": "When new Notification is unsupported (including iOS), the parent may call the active registration.showNotification with fixed generic text and data:{kind:'rent-local-reminder',url:RentPush.OPEN_PATH}. This is local foreground fallback, not proof of background delivery; it has no provider receipt capability.",
+    "workerVersioning": "Serve push-client.js from the same controlled app origin and include it in the existing versioned program/cache inventory. Do not remove or replace existing offline/update maintenance protections."
+  }
+}

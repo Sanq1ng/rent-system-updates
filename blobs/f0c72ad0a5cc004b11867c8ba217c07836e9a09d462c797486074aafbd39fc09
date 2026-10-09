@@ -1,0 +1,27 @@
+@echo off
+setlocal DisableDelayedExpansion
+"%SystemRoot%\System32\chcp.com" 65001 >nul
+if errorlevel 1 exit /b 1
+if not "%~1"=="" goto diagnostic
+if not exist "%~dp0园区租赁主机.exe" (
+    echo 未找到图形主机管理窗口。请维护人员重新生成完整交付包。
+    echo 诊断检查可使用：启动主机.cmd --check
+    pause
+    exit /b 1
+)
+start "" "%~dp0园区租赁主机.exe"
+exit /b 0
+
+:diagnostic
+set "RENT_NODE=%~dp0runtime\node.exe"
+if not exist "%RENT_NODE%" (
+    echo 未找到随包运行组件。请使用完整交付包，不要只复制启动脚本。
+    if /i not "%~1"=="--check" pause
+    exit /b 1
+)
+pushd "%~dp0"
+"%RENT_NODE%" --disable-warning=ExperimentalWarning "%~dp0host.cjs" %*
+set "RENT_EXIT=%ERRORLEVEL%"
+popd
+if not "%RENT_EXIT%"=="0" if /i not "%~1"=="--check" pause
+exit /b %RENT_EXIT%

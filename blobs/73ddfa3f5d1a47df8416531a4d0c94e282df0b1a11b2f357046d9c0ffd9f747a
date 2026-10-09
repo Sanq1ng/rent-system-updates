@@ -1,0 +1,79 @@
+"use strict";
+
+const crypto = require("node:crypto");
+
+const ROLES = new Set(["admin", "operator", "reviewer", "viewer"]);
+const SYSTEM_ACTOR = "system:employee-park-policy";
+
+function employeeRecords(db) {
+  const users = [];
+  for (const row of db.prepare("SELECT id,username,json FROM users ORDER BY id").all()) {
+    let user;
+    try { user = JSON.parse(row.json); }
+    catch { throw new Error("员工账号记录不是有效 JSON，不能调整园区授权。"); }
+    if (!user || typeof user !== "object" || Array.isArray(user) ||
+        typeof user.id !== "string" || !user.id || typeof user.username !== "string" || !user.username.trim() ||
+        user.id !== row.id || user.username !== row.username ||
+        !Array.isArray(user.roles) || !user.roles.length || user.roles.length > 4 ||
+        new Set(user.roles).size !== user.roles.length || !user.roles.every(role => ROLES.has(role)) ||
+        typeof user.allParks !== "boolean" || !Array.isArray(user.parks) || user.parks.length > 200 ||
+        !user.parks.every(park => typeof park === "string" && park.trim().length && park.length <= 120) ||
+        !["active", "canExport", "receiveReminders"].every(key => typeof user[key] === "boolean") ||
+        !Number.isSafeInteger(user.version) || user.version < 1) {
+      throw new Error("员工账号身份、岗位或授权记录不一致，不能猜测或扩大权限。");
+    }
+    if (user.roles.some(role => role !== "admin")) users.push(user);
+  }
+  return users;
+}
+
+function applyEmployeeParkPolicy(db, { source, fromSchemaVersion, at = Date.now() }) {
+  const validSource = source === "schema-upgrade" &&
+    Number.isInteger(fromSchemaVersion) && fromSchemaVersion >= 1 && fromSchemaVersion < 6;
+  if (!db.isTransaction || !validSource ||
+      !Number.isSafeInteger(at) || at < 0 || at > 8640000000000000) {
+    throw new Error("统一员工园区授权仅能在旧格式升级至版本 6 的有效事务中执行。");
+  }
+  if (db.prepare("PRAGMA user_version").get().user_version !== fromSchemaVersion) {
+    throw new Error("园区授权策略与实际账本版本不一致，不能执行。");
+  }
+  const users = employeeRecords(db);
+  const invitations = db.prepare(`SELECT id,creator_id,roles_json,parks_json,
+    can_export,receive_reminders,created_at,expires_at FROM account_invitations
+    WHERE status='pending' AND all_parks=0 ORDER BY id`).all();
+  const result = { employees: 0, sessions: 0, invitations: invitations.length };
+  const counter = db.prepare("SELECT value FROM meta WHERE key='changes'").get()?.value;
+  const changes = Number(counter);
+  if (typeof counter !== "string" || !/^\d+$/.test(counter) || !Number.isSafeInteger(changes) ||
+      !Number.isSafeInteger(changes + 1)) {
+    throw new Error("账本变更计数无效，不能完成园区授权审计。");
+  }
+  const revokeSessions = db.prepare("DELETE FROM sessions WHERE user_id=?");
+  for (const user of users.filter(user => !user.allParks || user.parks.length)) {
+    result.sessions += Number(revokeSessions.run(user.id).changes);
+  }
+  if (invitations.length) {
+    db.prepare(`UPDATE account_invitations SET status='revoked',revoked_at=MAX(created_at,?),
+      revoked_reason='park-policy' WHERE status='pending' AND all_parks=0`).run(at);
+  }
+  const entry = {
+    id: crypto.randomUUID(),
+    action: "system.park-policy.migrate",
+    actor: SYSTEM_ACTOR, actorType: "system", at: new Date(at).toISOString(),
+    detail: "保留旧员工的明确园区授权、版本及凭据；相关旧会话须重新登录，全部园区仅作新账号默认值。旧待用邀请撤销后须由负责人重新签发。",
+    source, fromSchemaVersion, toSchemaVersion: 6,
+    employees: [],
+    preservedScopes: users.map(user => ({ id: user.id, allParks: user.allParks, parks: user.parks, version: user.version })),
+    revokedInvitations: invitations.map(row => ({ id: row.id, creatorId: row.creator_id,
+      roles: JSON.parse(row.roles_json), allParks: false, parks: JSON.parse(row.parks_json),
+      canExport: Boolean(row.can_export), receiveReminders: Boolean(row.receive_reminders),
+      createdAt: row.created_at, expiresAt: row.expires_at, revokedAt: Math.max(row.created_at, at), reason: "park-policy" })),
+    sessionsInvalidated: result.sessions,
+  };
+  db.prepare("INSERT INTO audit(id,action,actor,at,json) VALUES(?,?,?,?,?)")
+    .run(entry.id, entry.action, entry.actor, entry.at, JSON.stringify(entry));
+  db.prepare("UPDATE meta SET value=? WHERE key='changes'").run(String(changes + 1));
+  return result;
+}
+
+module.exports = { applyEmployeeParkPolicy };

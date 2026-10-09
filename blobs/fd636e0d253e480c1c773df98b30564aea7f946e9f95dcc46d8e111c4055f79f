@@ -1,0 +1,165 @@
+"use strict";
+
+const fs = require("node:fs");
+const path = require("node:path");
+const { assertDirectory, regularFile, sameOrInside, versionParts } = require("../updates/files.cjs");
+
+const INSTALLATION_FILE = "installation.json";
+const INSTALLATION_FORMAT = "industrial-rent-installation";
+const DEPLOYMENT_FILES = Object.freeze(["layout.cjs", "migration.cjs", "lan.cjs", "employee-package.cjs", "README.md"]);
+const UUID = /^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/i;
+
+function fail(message) {
+  const error = new Error(message);
+  error.code = "DEPLOYMENT";
+  throw error;
+}
+
+function readRecord(file) {
+  regularFile(file, 32768);
+  try { return JSON.parse(fs.readFileSync(file, "utf8")); }
+  catch (error) {
+    if (!(error instanceof SyntaxError)) throw error;
+    fail("安装或迁移记录损坏。请保留原程序与账本，不会自动建立另一套空账。");
+  }
+}
+
+function relativePath(root, value) {
+  if (typeof value !== "string" || !value || value.length > 240 ||
+      /[\\\u0000-\u001f<>:"|?*]/.test(value)) fail("安装目录记录含有不安全的相对路径。");
+  const parts = value.split("/");
+  if (parts.some(part => !part || part === "." || part === ".." || /[. ]$/.test(part) ||
+      /^(con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\.|$)/i.test(part))) {
+    fail("安装目录记录不能包含上级目录、空路径或保留文件名。");
+  }
+  const result = path.resolve(root, ...parts);
+  if (result === root || !sameOrInside(root, result)) fail("安装目录记录越出了本次安装范围。");
+  let current = root;
+  for (const part of parts) {
+    current = path.join(current, part);
+    const stat = fs.lstatSync(current, { throwIfNoEntry: false });
+    if (stat?.isSymbolicLink()) fail("安装目录记录不能指向符号链接或目录联接。");
+  }
+  return result;
+}
+
+function readInstallation(root) {
+  root = path.resolve(root);
+  assertDirectory(root);
+  const file = path.join(root, INSTALLATION_FILE);
+  const record = readRecord(file);
+  if (!record || record.format !== INSTALLATION_FORMAT || record.formatVersion !== 1 ||
+      !UUID.test(record.installationId || "") || record.platform !== "win32" ||
+      record.architecture !== "x64" || !["manual", "user-logon"].includes(record.startupMode) ||
+      typeof record.createdAt !== "string" || !Number.isFinite(Date.parse(record.createdAt)) ||
+      typeof record.ownerSid !== "string" || !/^S-1-(?:\d+-)*\d+$/.test(record.ownerSid) ||
+      !record.paths || Array.isArray(record.paths) ||
+      Object.keys(record.paths).sort().join(",") !== "backups,config,data,program,updates") {
+    fail("安装记录的格式或版本不受支持。不会猜测数据目录或重新初始化账本。");
+  }
+  versionParts(record.applicationVersion);
+  const locations = Object.fromEntries(Object.entries(record.paths).map(([key, value]) =>
+    [key, relativePath(root, value)]));
+  const separated = [locations.program, path.dirname(locations.config),
+    locations.data, locations.backups, locations.updates];
+  if (separated.some((left, index) => separated.slice(index + 1).some(right =>
+    sameOrInside(left, right) || sameOrInside(right, left)))) {
+    fail("程序、配置、账本、备份和更新目录必须分开，不能互相覆盖。");
+  }
+  return { root, file, record, ...locations };
+}
+
+function defaultConfigFile(programDirectory) {
+  const program = path.resolve(programDirectory);
+  const local = path.join(program, "config.json");
+  const root = path.dirname(program);
+  const requiredFile = path.join(program, "deployment", "installation-required.json");
+  let required;
+  if (fs.lstatSync(requiredFile, { throwIfNoEntry: false })) {
+    required = readRecord(requiredFile);
+    if (required?.format !== "industrial-rent-managed-installation" || required.formatVersion !== 1 ||
+        !UUID.test(required.installationId || "")) fail("程序内的安装归属标记损坏，不能回退成便携空账。");
+  }
+  if (!fs.lstatSync(path.join(root, INSTALLATION_FILE), { throwIfNoEntry: false })) {
+    if (required) fail("安装归属记录丢失。请恢复本次 installation.json，不会自动建立另一套空账。");
+    return { file: local, required: false };
+  }
+  const installation = readInstallation(root);
+  if (required && required.installationId !== installation.record.installationId) {
+    fail("程序和外部安装记录不属于同一次安装，不能接入另一套账本。");
+  }
+  if (path.relative(installation.program, program) !== "") {
+    fail("当前程序目录与安装记录不一致，不能使用其他安装的配置。");
+  }
+  if (fs.lstatSync(local, { throwIfNoEntry: false })) {
+    fail("安装程序同时发现外部配置和程序内 config.json。请维护人员核对，不能猜测使用哪一套账。");
+  }
+  assertDirectory(path.dirname(installation.config));
+  regularFile(installation.config, 65536);
+  return { file: installation.config, required: true };
+}
+
+function newDirectory(value) {
+  if (!value) throw new Error("请用 --to 指定一个尚不存在的新目录。");
+  const target = path.resolve(value);
+  if (target === path.parse(target).root || fs.lstatSync(target, { throwIfNoEntry: false })) {
+    throw new Error("目标必须是尚不存在的新目录，不能是磁盘根目录或链接。");
+  }
+  let parent = path.dirname(target);
+  for (;;) {
+    const stat = fs.lstatSync(parent, { throwIfNoEntry: false });
+    if (stat && (!stat.isDirectory() || stat.isSymbolicLink())) {
+      throw new Error("维护输出路径的父目录不得是链接或特殊文件。");
+    }
+    const next = path.dirname(parent);
+    if (next === parent) break;
+    parent = next;
+  }
+  return target;
+}
+
+function normalizeOrigin(value) {
+  if (typeof value !== "string" || !value || value.length > 2048 || /[\s\\]/.test(value)) {
+    fail("请填写固定的完整访问来源地址，不含空格或反斜杠。");
+  }
+  let origin;
+  try { origin = new URL(value); }
+  catch (error) {
+    if (!(error instanceof TypeError)) throw error;
+    fail("访问来源地址不是有效的 URL。");
+  }
+  const local = ["127.0.0.1", "localhost", "[::1]"].includes(origin.hostname);
+  if (!["http:", "https:"].includes(origin.protocol) || origin.username || origin.password ||
+      origin.pathname !== "/" || origin.search || origin.hash || (origin.protocol === "http:" && !local)) {
+    fail("异地或局域网访问必须使用固定 HTTPS 来源；地址不能含账号、路径、查询串或片段。");
+  }
+  return origin.origin;
+}
+
+function deploymentSummary(config, targetOrigin) {
+  const sourceOrigin = normalizeOrigin(config.publicOrigin);
+  const destinationOrigin = targetOrigin === undefined ? null : normalizeOrigin(targetOrigin);
+  return {
+    format: "industrial-rent-deployment-plan", formatVersion: 1,
+    networkMode: config.lan ? "lan-https" : config.reverseProxy ? "reverse-proxy" : config.tls ? "https-direct" : "local",
+    publicOrigin: sourceOrigin, targetOrigin: destinationOrigin,
+    originChanges: destinationOrigin !== null && sourceOrigin !== destinationOrigin,
+    dataDir: config.dataDir, backupDir: config.backupDir, updateDir: config.updateDir || null,
+    networkProvider: null, networkProviderSelected: false,
+    transportConfigured: Boolean(config.reverseProxy || config.tls), remoteReachabilityConfirmed: false,
+    backupIndependenceConfirmed: false,
+    externalPushCredentialsConfigured: Boolean(config.pushCredentialsFile),
+    precautions: [
+      "组网成员身份不能代替业务登录、园区权限和异人复核。",
+      "配置了 HTTPS 不等于实际网络已连通，也不等于证书、反向代理已部署。",
+      "完整业务备份不包含各台员工设备尚未同步的加密草稿。",
+      "切换来源地址前，须在原地址同步或导出本机工作；保留账套和用户身份。",
+      "恢复后须重新登录和绑定通知；主机、证书、推送及更新发布凭据另行配置。",
+      "迁移只在新目录恢复，启用新主机前必须停止旧主机，不能双边记账。",
+      "不同目录不代表不同硬盘；独立备份介质需要部署负责人确认。",
+    ],
+  };
+}
+
+module.exports = { INSTALLATION_FILE, INSTALLATION_FORMAT, DEPLOYMENT_FILES, UUID, readRecord, readInstallation,
+  defaultConfigFile, newDirectory, normalizeOrigin, deploymentSummary };

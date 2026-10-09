@@ -1,0 +1,37 @@
+"use strict";
+const crypto = require("node:crypto");
+const path = require("node:path");
+const { DatabaseSync } = require("node:sqlite");
+const { SCHEMA_VERSION, assertSupportedSchema, migrateSchema } = require("./push-schema.cjs");
+const SUPPORTED_FROM = Object.freeze([6, 7]);
+const FINANCIAL_TABLES = ["contracts", "invoices", "payments", "refunds", "applications", "operations", "attachments", "settings"];
+
+function financialDigest(db) {
+  const hash = crypto.createHash("sha256");
+  for (const table of FINANCIAL_TABLES) {
+    hash.update(`${table}\n`);
+    const order = table === "operations" ? "actor,id" : "id";
+    for (const row of db.prepare(`SELECT * FROM ${table} ORDER BY ${order}`).iterate()) hash.update(`${JSON.stringify(row)}\n`);
+  }
+  return hash.digest("hex");
+}
+
+function migrateForUpdate(databaseFile, identity) {
+  const db = new DatabaseSync(path.toNamespacedPath(databaseFile));
+  try {
+    db.exec("PRAGMA foreign_keys=ON; PRAGMA synchronous=FULL; PRAGMA busy_timeout=0");
+    const version = db.prepare("PRAGMA user_version").get().user_version;
+    assertSupportedSchema(db, version);
+    if (!SUPPORTED_FROM.includes(version) || identity.serverId !== db.prepare("SELECT value FROM meta WHERE key='server_id'").get()?.value ||
+        ![identity.schemaVersion, SCHEMA_VERSION].includes(version)) throw new Error("账套身份或数据库迁移起点不符，未升级。");
+    const before = financialDigest(db), dataVersion = db.prepare("PRAGMA data_version").get().data_version;
+    const result = migrateSchema(db, Date.now(), dataVersion, () => {
+      if (financialDigest(db) !== before) throw new Error("本次格式升级不能改变合同、应收、流水、申请、原件或业务设置，事务已撤销。");
+    });
+    if (db.prepare("PRAGMA integrity_check").get().integrity_check !== "ok" || db.prepare("PRAGMA foreign_key_check").all().length)
+      throw new Error("升级后的账本检查未通过，未开放业务；请保留原备份。");
+    db.exec("PRAGMA wal_checkpoint(TRUNCATE)");
+    return { ...result, financialDigest: before };
+  } finally { db.close(); }
+}
+module.exports = { SCHEMA_VERSION, SUPPORTED_FROM, financialDigest, migrateForUpdate };

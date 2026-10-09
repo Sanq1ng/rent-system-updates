@@ -1,0 +1,203 @@
+"use strict";
+
+const crypto = require("node:crypto");
+const dns = require("node:dns");
+const https = require("node:https");
+const { PushError, requirePush, base64url, publicPoint, endpoint, registration, payload, isPublicAddress, sha } = require("./push-validation.cjs");
+
+const JPUSH_URL = "https://api.jpush.cn/v3/push";
+const REQUEST_TIMEOUT_MS = 8000;
+const RESPONSE_LIMIT = 16 * 1024;
+
+class ProviderError extends Error {
+  constructor(code, { status = null, retryable = false, retryAfterMs = null, unregistered = false, uncertain = false } = {}) {
+    super("通知服务商未确认接受本次请求。");
+    this.name = "ProviderError";
+    Object.assign(this, { code, status, retryable, retryAfterMs, unregistered, uncertain });
+  }
+}
+
+function retryAfter(headers, clock = Date.now()) {
+  const raw = headers?.["retry-after"] ?? headers?.["x-rate-limit-reset"];
+  if (typeof raw !== "string" || raw.length > 100) return null;
+  const milliseconds = /^\d+$/.test(raw) ? Number(raw) * 1000 : Date.parse(raw) - clock;
+  return Number.isFinite(milliseconds) && milliseconds >= 0 ? Math.min(milliseconds, 24 * 3600_000) : null;
+}
+
+function checkedLookup(lookup = dns.lookup) {
+  return (hostname, options, callback) => {
+    lookup(hostname, { all: true, verbatim: true }, (error, addresses) => {
+      if (error || !Array.isArray(addresses) || !addresses.length ||
+        addresses.some(item => !isPublicAddress(item.address) || ![4, 6].includes(item.family))) {
+        return callback(new ProviderError("PUSH_DNS_BLOCKED"));
+      }
+      if (options?.all) callback(null, addresses);
+      else {
+        const selected = addresses.find(item => !options?.family || item.family === options.family);
+        if (!selected) return callback(new ProviderError("PUSH_DNS_BLOCKED"));
+        callback(null, selected.address, selected.family);
+      }
+    });
+  };
+}
+
+function requestProvider({ url, headers, body, signal, timeoutMs = REQUEST_TIMEOUT_MS, lookup = dns.lookup }) {
+  const address = url === JPUSH_URL ? new URL(JPUSH_URL) : endpoint(url);
+  requirePush(Buffer.byteLength(body) <= 16 * 1024, "设备通知内容超过上限。");
+  return new Promise((resolve, reject) => {
+    const controller = new AbortController();
+    const abort = () => controller.abort();
+    let timer;
+    let request;
+    let settled = false;
+    const finish = (error, result) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      signal?.removeEventListener("abort", abort);
+      if (error) reject(error instanceof ProviderError ? error : new ProviderError("TRANSPORT_UNCERTAIN", { uncertain: true }));
+      else resolve(result);
+    };
+    signal?.addEventListener("abort", abort, { once: true });
+    if (signal?.aborted) abort();
+    timer = setTimeout(abort, Math.min(REQUEST_TIMEOUT_MS, Math.max(1, timeoutMs)));
+    request = https.request(address, {
+      method: "POST",
+      headers: { ...headers, "Content-Length": Buffer.byteLength(body) },
+      agent: false,
+      lookup: checkedLookup(lookup),
+      maxHeaderSize: 8192,
+      signal: controller.signal,
+      rejectUnauthorized: true,
+    }, response => {
+      let size = 0;
+      const chunks = [];
+      response.on("data", chunk => {
+        size += chunk.length;
+        if (size > RESPONSE_LIMIT) {
+          response.destroy();
+          request.destroy();
+          finish(new ProviderError("PROVIDER_RESPONSE_LIMIT", { uncertain: true }));
+        } else chunks.push(chunk);
+      });
+      response.once("end", () => finish(null, {
+        status: response.statusCode,
+        headers: response.headers,
+        body: Buffer.concat(chunks).toString("utf8"),
+      }));
+      response.once("error", error => finish(error));
+    });
+    request.once("error", error => finish(error));
+    request.end(body);
+  });
+}
+
+function rejected(response, { jpushCode = null, channel = "webpush", clock = Date.now() } = {}) {
+  const status = Number.isInteger(response?.status) ? response.status : null;
+  if (channel === "webpush" && (status === 404 || status === 410) || channel === "jpush" && jpushCode === 1011) {
+    return new ProviderError("REGISTRATION_GONE", { status, unregistered: true });
+  }
+  if (status === 429 || jpushCode === 2002) {
+    return new ProviderError("PROVIDER_RATE_LIMIT", { status, retryable: true, retryAfterMs: retryAfter(response.headers, clock) });
+  }
+  if (status >= 500 && status <= 599) {
+    return new ProviderError("PROVIDER_UNAVAILABLE", { status, retryable: true, retryAfterMs: retryAfter(response.headers, clock) });
+  }
+  if (status === 401 || status === 403) return new ProviderError("PROVIDER_AUTH", { status });
+  if (status >= 300 && status < 400) return new ProviderError("PROVIDER_REDIRECT", { status });
+  return new ProviderError("PROVIDER_REJECTED", { status });
+}
+
+function configError() { throw new PushError(503, "PUSH_CONFIG", "设备通知服务端配置格式不正确，请管理员检查外部密钥配置。"); }
+
+function createTransports(config = {}, publicOrigin, { request = requestProvider, clock = Date.now } = {}) {
+  const origin = new URL(publicOrigin);
+  const secure = origin.protocol === "https:" && !origin.username && !origin.password &&
+    origin.pathname === "/" && !origin.search && !origin.hash;
+  const jpush = config.jpush || {};
+  const webpush = config.webpush || {};
+  let jpushConfigured = false;
+  let webpushConfigured = false;
+  if (jpush.appKey && jpush.masterSecret) {
+    if (typeof jpush.appKey !== "string" || !/^[a-f0-9]{24}$/i.test(jpush.appKey) ||
+      typeof jpush.masterSecret !== "string" || !/^[a-f0-9]{24}$/i.test(jpush.masterSecret)) configError();
+    jpushConfigured = secure && jpush.production === true;
+  }
+  if (webpush.publicKey && webpush.privateKey && webpush.subject) {
+    try {
+      publicPoint(webpush.publicKey);
+      const privateKey = base64url(webpush.privateKey, 32);
+      const pair = crypto.createECDH("prime256v1");
+      pair.setPrivateKey(privateKey);
+      if (pair.getPublicKey().toString("base64url") !== webpush.publicKey) configError();
+      if (typeof webpush.subject !== "string" || webpush.subject.length > 254 ||
+        !(/^(mailto:[^@\s]+@[^@\s]+\.[^@\s]+)$/.test(webpush.subject) ||
+          (() => { const address = new URL(webpush.subject); return address.protocol === "https:" &&
+            !address.username && !address.password && !address.hash; })())) configError();
+    } catch (error) {
+      if (error instanceof PushError && error.code === "PUSH_CONFIG") throw error;
+      configError();
+    }
+    webpushConfigured = secure;
+  }
+  const unavailable = () => { throw new PushError(503, "PUSH_UNAVAILABLE", "此通知通道尚未配置，不能启用设备通知。"); };
+  return {
+    jpush: {
+      configured: jpushConfigured,
+      appKey: jpushConfigured ? jpush.appKey : null,
+      vendorChannelsConfigured: jpushConfigured && jpush.vendorChannelsConfigured === true,
+      async send({ registration: target, payload: content, ttl, signal }) {
+        if (!jpushConfigured) unavailable();
+        registration("jpush", target, clock());
+        payload(content);
+        const enrollment = content.kind === "rent-push-enrollment";
+        const body = JSON.stringify({
+          platform: ["android"],
+          audience: { registration_id: [target.registrationId] },
+          notification: { android: {
+            channel_id: "rent_reminders",
+            title: "园区租赁",
+            alert: enrollment ? "请在应用内确认开启设备通知。" : content.body,
+            extras: content,
+          } },
+          options: { time_to_live: Math.max(0, Math.min(86400, Math.floor(ttl))) },
+        });
+        const response = await request({ url: JPUSH_URL, body, signal, headers: {
+          "Content-Type": "application/json",
+          Authorization: `Basic ${Buffer.from(`${jpush.appKey}:${jpush.masterSecret}`).toString("base64")}`,
+        } });
+        let result;
+        try { result = JSON.parse(response.body); }
+        catch { throw rejected(response, { channel: "jpush", clock: clock() }); }
+        if (response.status !== 200 || result?.error ||
+          !["string", "number"].includes(typeof result?.msg_id) || !/^\d{1,40}$/.test(String(result.msg_id))) {
+          throw rejected(response, { jpushCode: result?.error?.code, channel: "jpush", clock: clock() });
+        }
+        return { accepted: true, providerStatus: response.status };
+      },
+    },
+    webpush: {
+      configured: webpushConfigured,
+      publicKey: webpushConfigured ? webpush.publicKey : null,
+      async send({ registration: target, payload: content, ttl, signal }) {
+        if (!webpushConfigured) unavailable();
+        registration("webpush", target, clock());
+        payload(content);
+        const webPushLibrary = require("./vendor/web-push.cjs");
+        const details = webPushLibrary.generateRequestDetails(target, JSON.stringify(content), {
+          vapidDetails: { subject: webpush.subject, publicKey: webpush.publicKey, privateKey: webpush.privateKey },
+          TTL: Math.max(0, Math.min(86400, Math.floor(ttl))),
+          contentEncoding: "aes128gcm",
+          urgency: "normal",
+          topic: sha(content.deliveryId || content.enrollmentId).slice(0, 32),
+        });
+        requirePush(details.method === "POST" && details.endpoint === target.endpoint, "推送订阅签名地址不匹配。");
+        const response = await request({ url: details.endpoint, body: details.body, headers: details.headers, signal });
+        if (response.status < 200 || response.status >= 300) throw rejected(response, { clock: clock() });
+        return { accepted: true, providerStatus: response.status };
+      },
+    },
+  };
+}
+
+module.exports = { ProviderError, createTransports, requestProvider, checkedLookup, retryAfter, rejected, JPUSH_URL, REQUEST_TIMEOUT_MS };

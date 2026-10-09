@@ -1,0 +1,187 @@
+"use strict";
+
+const crypto = require("node:crypto");
+const dgram = require("node:dgram");
+const { peerAllowed } = require("../shared/lan-policy.cjs");
+const PROTOCOL = "rent-pair-v1";
+const PORT = 48765;
+const MAX_BYTES = 8192;
+const NONCE = /^[A-Za-z0-9_-]{43}$/;
+const UUID = /^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/;
+const PRESETS = Object.freeze({
+  business: { roles: ["operator", "viewer"], canExport: false, receiveReminders: false },
+  finance: { roles: ["reviewer", "viewer"], canExport: true, receiveReminders: true },
+  viewer: { roles: ["viewer"], canExport: false, receiveReminders: true },
+});
+const sha = value => crypto.createHash("sha256").update(value).digest();
+const mac = (key, value) => crypto.createHmac("sha256", key).update(value).digest();
+
+class PairingError extends Error {
+  constructor(message, status = 400) { super(message); this.status = status; this.code = "LAN_PAIRING"; }
+}
+
+function keysFor(secret, transcript) {
+  const master = sha(secret);
+  return {
+    encryption: mac(master, `encryption\n${transcript}`),
+    authentication: mac(master, `authentication\n${transcript}`),
+    code: String(mac(master, `comparison\n${transcript}`).readUInt32BE(0) % 100000000).padStart(8, "0"),
+  };
+}
+
+function equal(value, expected) {
+  if (typeof value !== "string" || value.length > 100) return false;
+  const bytes = Buffer.from(value, "base64");
+  return bytes.length === expected.length && crypto.timingSafeEqual(bytes, expected);
+}
+
+function seal(value, key, id) {
+  const iv = crypto.randomBytes(16);
+  const cipher = crypto.createCipheriv("aes-256-cbc", key.encryption, iv);
+  const ciphertext = Buffer.concat([cipher.update(JSON.stringify(value), "utf8"), cipher.final()]);
+  const signature = mac(key.authentication, Buffer.concat([Buffer.from(`approved\n${id}\n`), iv, ciphertext]));
+  return { iv: iv.toString("base64"), ciphertext: ciphertext.toString("base64"), mac: signature.toString("base64") };
+}
+
+function createPairingRegistry({ connection, createInvitation, writable = () => true, clock = Date.now }) {
+  const pending = new Map(), rates = new Map();
+  const descriptor = Buffer.from(JSON.stringify(connection)).toString("base64");
+  function expire() {
+    for (const [id, item] of pending) if (item.expiresAt <= clock()) {
+      item.key.encryption.fill(0); item.key.authentication.fill(0); pending.delete(id);
+    }
+    for (const [address, value] of rates) if (value.until <= clock()) rates.delete(address);
+  }
+  function record(id) {
+    expire();
+    const entry = pending.get(id);
+    if (!entry) throw new PairingError("配对已过期，请让员工重新搜索。", 410);
+    return entry;
+  }
+  function reply(kind, value) { return { protocol: PROTOCOL, kind, ...value }; }
+  function packet(input, peer) {
+    expire();
+    if (!input || typeof input !== "object" || input.protocol !== PROTOCOL || !writable()) return null;
+    let rate = rates.get(peer.address);
+    if (!rate) {
+      if (rates.size >= 256) return null;
+      rates.set(peer.address, rate = { count: 0, until: clock() + 60_000 });
+    }
+    if (++rate.count > 90) return null;
+    if (input.kind === "discover" && NONCE.test(input.nonce || "")) {
+      return reply("offer", { nonce: input.nonce, serverId: connection.serverId, origin: connection.origin,
+        name: `公司主机 · ${connection.serverId.slice(0, 8)}` });
+    }
+    if (input.kind === "begin") {
+      if (!NONCE.test(input.nonce || "") || typeof input.publicKey !== "string" || input.publicKey.length !== 88 ||
+          typeof input.name !== "string" || !input.name.trim() || input.name.length > 64 || /[\u0000-\u001f\u007f]/.test(input.name)) {
+        throw new PairingError("配对请求不完整。");
+      }
+      const existing = [...pending.values()].find(item => item.peer.address === peer.address &&
+        item.peer.port === peer.port && item.nonce === input.nonce && item.clientPublicKey === input.publicKey);
+      if (existing) return existing.challenge;
+      if (pending.size >= 20 || [...pending.values()].filter(item => item.peer.address === peer.address).length >= 3) {
+        throw new PairingError("待确认连接较多，请稍后再试。", 429);
+      }
+      const publicKey = Buffer.from(input.publicKey, "base64");
+      if (publicKey.length !== 65 || publicKey[0] !== 4 || publicKey.toString("base64") !== input.publicKey) {
+        throw new PairingError("配对密钥格式无效。");
+      }
+      const ecdh = crypto.createECDH("prime256v1");
+      ecdh.generateKeys();
+      let secret;
+      try { secret = ecdh.computeSecret(publicKey); }
+      catch (error) {
+        if (error.code !== "ERR_CRYPTO_ECDH_INVALID_PUBLIC_KEY") throw error;
+        throw new PairingError("配对密钥无法核验。");
+      }
+      const id = crypto.randomUUID(), serverNonce = crypto.randomBytes(32).toString("base64url");
+      const serverPublicKey = ecdh.getPublicKey().toString("base64");
+      const transcript = [PROTOCOL, id, input.nonce, serverNonce, input.publicKey, serverPublicKey,
+        sha(Buffer.from(descriptor, "base64")).toString("hex")].join("\n");
+      const key = keysFor(secret, transcript);
+      secret.fill(0);
+      const challenge = reply("challenge", { id, nonce: input.nonce, serverNonce, publicKey: serverPublicKey, descriptor });
+      pending.set(id, { id, key, name: input.name.trim(), peer: { ...peer }, nonce: input.nonce,
+        clientPublicKey: input.publicKey, challenge, expiresAt: clock() + 5 * 60_000, status: "pending", approved: null });
+      return challenge;
+    }
+    if (input.kind === "poll" && UUID.test(input.id || "")) {
+      const entry = record(input.id);
+      if (entry.peer.address !== peer.address || entry.peer.port !== peer.port || entry.nonce !== input.nonce ||
+          !equal(input.mac, mac(entry.key.authentication, `poll\n${entry.id}\n${entry.nonce}`))) return null;
+      if (entry.status === "approved") return reply("approved", { id: entry.id, ...entry.approved });
+      return reply(entry.status, { id: entry.id,
+        mac: mac(entry.key.authentication, `${entry.status}\n${entry.id}`).toString("base64") });
+    }
+    return null;
+  }
+  function list() {
+    expire();
+    return [...pending.values()].map(item => ({ id: item.id, name: item.name, address: item.peer.address,
+      code: item.key.code, expiresAt: item.expiresAt, status: item.status }));
+  }
+  function approve(actorId, id, input) {
+    const entry = record(id);
+    if (!writable()) throw new PairingError("主机正在维护，请稍后配对。", 503);
+    if (!input || Object.keys(input).sort().join(",") !== "code,role" ||
+        !Object.hasOwn(PRESETS, input.role) || input.code !== entry.key.code) {
+      throw new PairingError("配对码不一致。请核对员工电脑，不能直接放行。");
+    }
+    if (entry.status === "approved") return { ok: true, status: entry.status };
+    if (entry.status !== "pending") throw new PairingError("这次配对已拒绝，请重新申请。", 409);
+    const result = createInvitation(actorId, PRESETS[input.role]);
+    entry.approved = seal({ connection, invitation: { id: result.invitation.id, token: result.token,
+      expiresAt: result.invitation.expiresAt } }, entry.key, id);
+    entry.status = "approved";
+    return { ok: true, status: entry.status };
+  }
+  function reject(id) {
+    const entry = record(id);
+    if (entry.status !== "pending") throw new PairingError("该连接已经处理。", 409);
+    entry.status = "rejected";
+    return { ok: true };
+  }
+  return { packet, list, approve, reject,
+    close() { for (const entry of pending.values()) { entry.key.encryption.fill(0); entry.key.authentication.fill(0); } pending.clear(); rates.clear(); } };
+}
+
+async function startPairing({ config, connection, createInvitation, writable }) {
+  if (!config.lan || !connection) return null;
+  const registry = createPairingRegistry({ connection, createInvitation, writable });
+  const socket = dgram.createSocket("udp4");
+  let errorText = "", listening = false;
+  socket.on("message", (bytes, peer) => {
+    if (!peerAllowed(peer.address, config.lan) || bytes.length > MAX_BYTES || bytes.length < 20) return;
+    try {
+      const response = registry.packet(JSON.parse(bytes.toString("utf8")), peer);
+      if (!response) return;
+      const data = Buffer.from(JSON.stringify(response));
+      if (data.length > MAX_BYTES) throw new Error("配对响应超过限制。");
+      socket.send(data, peer.port, peer.address, error => {
+        if (error) { errorText = "同网配对响应发送失败，请检查网络。"; console.error("LAN 配对发送失败：", error.code); }
+      });
+    } catch (error) {
+      if (error instanceof SyntaxError || error instanceof PairingError) return;
+      errorText = "同网配对处理失败，请联系维护人员。";
+      console.error("LAN 配对处理失败：", error.code || error.name);
+    }
+  });
+  await new Promise(resolve => {
+    socket.once("listening", () => { listening = true; resolve(); });
+    socket.once("error", error => { errorText = `同网发现未启动（${error.code}），请联系维护人员。`; resolve(); });
+    socket.bind(PORT, "0.0.0.0");
+  });
+  socket.on("error", error => {
+    errorText = "同网发现连接异常，请联系维护人员。";
+    console.error("LAN 配对监听异常：", error.code);
+  });
+  if (errorText) console.error(errorText);
+  return {
+    status: () => ({ available: listening && !errorText, error: errorText, requests: registry.list() }),
+    approve: registry.approve, reject: registry.reject,
+    async close() { registry.close(); if (listening) await new Promise(resolve => socket.close(resolve)); },
+  };
+}
+
+module.exports = { PROTOCOL, PORT, MAX_BYTES, PRESETS, PairingError, keysFor, seal, createPairingRegistry, startPairing };

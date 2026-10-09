@@ -1,0 +1,56 @@
+"use strict";
+
+const crypto = require("node:crypto");
+const Domain = require("../public/domain.js");
+
+class SetupError extends Error {
+  constructor(message, status = 400, code = "VALIDATION") {
+    super(message);
+    this.status = status;
+    this.code = code;
+  }
+}
+
+function requireSetup(condition, message, status, code) {
+  if (!condition) throw new SetupError(message, status, code);
+}
+
+function text(value, label, maximum) {
+  requireSetup(typeof value === "string" && value.length <= maximum && value.trim(),
+    `${label}不能为空，且不能超过 ${maximum} 字。`);
+  return value.trim();
+}
+
+function hashPassword(value, salt) {
+  return crypto.scryptSync(value, salt, 64, { N: 16384, r: 8, p: 1, maxmem: 32 * 1024 * 1024 }).toString("hex");
+}
+
+function initializeAdmin(store, input) {
+  requireSetup(input !== null && typeof input === "object" && !Array.isArray(input), "初始化资料格式无效。");
+  const username = text(input.username, "管理员账号", 80);
+  const displayName = text(input.displayName, "管理员姓名", 120);
+  text(input.password, "密码", 128);
+  requireSetup(input.password.length >= 10, "密码至少需要 10 个字符。");
+  requireSetup(Domain.isISODate(input.accountingStartDate), "开始管账日期须为真实有效的 YYYY-MM-DD 日期。");
+  return store.transaction(() => {
+    requireSetup(!store.db.prepare("SELECT id FROM users LIMIT 1").get(),
+      "初始化已经完成；不会重新注册、替换账号或修改现有账本。", 409, "CONFLICT");
+    const id = crypto.randomUUID();
+    const salt = crypto.randomBytes(24).toString("hex");
+    const user = { id, username, displayName, roles: ["admin", "viewer"], allParks: true, parks: [],
+      canExport: true, receiveReminders: true, active: true, version: 1 };
+    store.db.prepare("INSERT INTO users(id,username,json,salt,password_hash) VALUES(?,?,?,?,?)")
+      .run(id, username, JSON.stringify(user), salt, hashPassword(input.password, salt));
+    const settings = { accountingStartDate: input.accountingStartDate, dueReminderTime: "09:00",
+      monthlyReminderTime: "09:00", offlineDays: 7, version: 1 };
+    store.db.prepare("INSERT INTO settings(id,json) VALUES(1,?)").run(JSON.stringify(settings));
+    const entry = { id: crypto.randomUUID(), action: "admin.setup", actor: id, at: new Date().toISOString(),
+      detail: "首次初始化", after: user };
+    store.db.prepare("INSERT INTO audit(id,action,actor,at,json) VALUES(?,?,?,?,?)")
+      .run(entry.id, entry.action, id, entry.at, JSON.stringify(entry));
+    store.changed();
+    return user;
+  });
+}
+
+module.exports = { initializeAdmin, hashPassword, SetupError };
