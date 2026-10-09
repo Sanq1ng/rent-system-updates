@@ -1,0 +1,169 @@
+# Signed updates
+
+## Windows 0.4.0 and later
+
+The managed Windows installation now supports signed **whole-program** updates:
+business code, the host launcher, the independent Windows client, notification
+code, the bundled Node runtime and reviewed database migrations. Configuration,
+certificates, ledger, originals, backups, account credentials and the persistent
+`电脑端资料` workspace are not update payloads.
+
+The host checks automatically after startup and periodically thereafter. It
+downloads and verifies an available release without stopping business work.
+The owner confirms installation in System Management. Observed pages must save
+and acknowledge the exact maintenance window. Unresponsive or busy pages block
+installation; drafts are never cleared or forcibly reloaded.
+
+Before replacement, the host verifies a complete backup and tries the declared
+migration on a private database copy, checking company identity and financial
+records. A separate native helper waits for the old processes to exit, copies
+only the signed allowlist with atomic per-file replacement, then verifies the
+whole result. The new host must pass identity/version/schema checks before
+opening business writes. Journaled interruptions resume through the original
+launcher. A same-schema, uncommitted failure can select the prior program.
+**After a schema change, incompatible old code is not restarted, and a backup
+is never automatically restored over the current ledger.**
+
+Employee installations follow only their paired host's committed release and
+still verify it against their own preinstalled publishing key. They download
+changed files automatically. An open window displays an update button; a hidden
+idle window can apply the host-approved release after its save handshake. No
+employee-side ledger is created. Unchanged large files are reused only after
+hash verification. Both sides retain the same profile path and company origin.
+
+The older business-only format remains supported for compatible releases.
+The Linux supervisor supports that format, not the Windows native replacement
+protocol. Platform, API, workspace and supervisor compatibility remain explicit.
+Windows 0.3.3 and earlier do not gain this native updater by receiving a new
+web page: their initial transition requires stopped, backed-up maintenance.
+Existing browser drafts must first be synchronized or exported and imported;
+they do not automatically become a WebView2 profile.
+
+## Initial trust and publishing identity
+
+`config.example.json` has no feed or publisher key. Release builds include only
+`updates\trust-public.json`, containing an Ed25519 **public** key. The private key
+belongs on the developer's machine outside the program and delivery trees, in a
+directory restricted to the current Windows user and SYSTEM. Keep an independent
+encrypted backup. Do not send the key to employees or upload it with the website.
+
+The official policy may also contain `feedUrl`. The first-install wizard validates
+this public HTTPS URL and the Ed25519 keys before publication, then creates the
+external update configuration automatically. It does not enable company LAN
+access or override an existing installation's configuration or source sidecar.
+An absent default remains explicitly unconfigured; malformed defaults fail.
+
+Create a publishing identity once on the development computer:
+
+```powershell
+.\scripts\New-UpdatePublisher.ps1 `
+  -PrivateDirectory 'E:\租赁维护私密\发布身份' `
+  -NodePath 'D:\nodejs\node.exe'
+```
+
+The intended parent directory must already exist. This command refuses existing
+keys or public policy files instead of silently replacing the publishing identity.
+It reports paths and the public fingerprint, never the private key contents.
+
+## Preparing a release
+
+After changing and validating the code:
+
+```powershell
+.\scripts\Publish-WindowsRelease.ps1 `
+  -Version 0.4.1 -Sequence 2 `
+  -PrivateKey 'E:\租赁维护私密\发布身份\publisher-private.pem' `
+  -OutputDirectory 'E:\租赁发布\0.4.1' `
+  -NodePath 'D:\nodejs\node.exe'
+```
+
+For the dedicated public GitHub Pages repository, authenticate with the official
+GitHub CLI on the maintenance computer and run:
+
+```powershell
+node .\scripts\publish-github-pages.cjs `
+  'E:\租赁发布\0.4.6\website' 'Sanq1ng/rent-system-updates' `
+  'E:\租赁发布\github-pages-0.4.6' --confirm-public
+```
+
+The worktree must be new and outside the program and sealed website. The tool
+accepts only the signed manifest, verified hash-named blobs, installer and public
+download information. It refuses unapproved entries, validates the installer
+digest, enforces Git's 100 MiB file limit and Pages' 1 GB site limit, and preserves
+previous immutable blobs. Binary Git attributes prevent line-ending and filter
+rewrites. Publishing is one commit, so the site cannot promote a manifest before
+its files. No ledger, credential or private key is uploaded.
+
+The result means **pushed**, not verified live. Wait for Pages to finish building,
+then verify the real HTTPS manifest, signature, installer and every blob download:
+
+```powershell
+node .\scripts\publish-github-pages.cjs --verify-live 'E:\租赁发布\0.4.6\website'
+```
+
+This uses the product's public-only HTTPS transport and compares every published
+file with the sealed site, including the installer and download page. It neither
+uploads business information nor changes the release. A different signed release,
+damaged download, redirect, compressed response or TLS error fails verification.
+Do not assume mainland reachability from one development-network check. A hosting
+failure delays updates, not local accounting. The first installer is still not
+Authenticode-signed: verify its origin and digest through a trusted channel.
+
+Use a new output directory and a strictly increasing sequence. This prepares
+version declarations, rebuilds all three Windows components, packages a data-free
+installer, signs a whole-program manifest, and creates a simple download page.
+The chosen signing key must match the public policy included in the program.
+It does **not** upload anything or provision a hosting account.
+
+Only publish the resulting `website` directory. Upload immutable `blobs` first,
+then the installer and page, and switch `manifest.json` last. Keep old blobs
+available during downloads. The fixed HTTPS location must serve complete files
+directly, without redirects, authentication cookies, query strings or content
+compression. SHA-256 checks do not replace HTTPS or the release signature.
+The initial installer currently has no Authenticode signature; the Ed25519 update
+signature must not be advertised as a Windows publisher certificate.
+
+## Connecting the office host once
+
+After the publishing site is selected, deployed and reachable, stop the office
+host and run its bundled maintenance tool locally:
+
+```powershell
+.\runtime\node.exe .\maintenance.cjs configure-update-source `
+  --config 'C:\公司的软件\配置\config.json' `
+  --feed-url 'https://实际发布网站/rent/manifest.json' `
+  --source-stopped confirmed
+```
+
+This retains the exact previous configuration, uses the preinstalled public key,
+checks lifecycle leases and changes only update settings. It does not upload
+business data, start a host, create a new ledger, or prove the website is online.
+In 0.4.4 and later, these settings are saved beside the selected configuration as
+`config.json.updates.json`, not written into the network configuration. The exact
+LAN configuration, original snapshot and recovery hashes therefore remain valid.
+An existing separate source is backed up before replacement; malformed or linked
+records fail explicitly instead of falling back to another feed. Older embedded
+`updates` settings remain readable when no separate source exists. Preserve the
+separate source with the rest of the configuration when backing up or moving an
+installation; signed program updates never replace it. Network disable/restore
+does not revert the publishing source.
+Restart the original host and verify a real release end to end. Normal transport
+requires publicly routed HTTPS; explicit trusted private-network feeds remain
+available for controlled testing, not as a shortcut around TLS validation.
+
+Publishing storage is not a remote-control service. Automatic updates do not
+allow the developer to browse the office ledger or operate the office computer.
+The client can export a deliberately limited diagnostic file; further access
+requires a separately authorized support channel.
+
+## Recovery and retention
+
+Keep `更新\releases`, `更新\update-state`, `更新\client-runtime`, and the complete
+pre-update backups. Do not delete a journal to "unlock" installation. The native
+helper will refuse changed identities, damaged signatures, changed originals,
+invalid migration declarations and unsafe paths. Failed copies can be retried;
+failed schema compatibility requires maintenance, not an automatic downgrade.
+
+Online server backups do not contain employees' unsynchronized local work.
+Keep an independent backup device and a retention policy. The software does not
+delete old releases or backups without an explicit maintenance policy.
