@@ -1,0 +1,140 @@
+using System;
+using System.IO;
+using System.Linq;
+using System.Runtime.Versioning;
+using System.Windows.Forms;
+
+[assembly: TargetFramework(".NETFramework,Version=v4.8", FrameworkDisplayName = ".NET Framework 4.8")]
+[assembly: System.Reflection.AssemblyVersion("0.4.8.0")]
+[assembly: System.Reflection.AssemblyFileVersion("0.4.8.0")]
+[assembly: System.Reflection.AssemblyProduct("园区租赁 Windows 局域网工具")]
+
+namespace RentLan
+{
+    internal static class Startup
+    {
+        internal static void Gui() { Application.EnableVisualStyles(); Application.SetCompatibleTextRenderingDefault(false); }
+        internal static int Failure(Exception error, bool gui)
+        {
+            if (gui) MessageBox.Show(error.Message, "园区租赁 · 操作未完成", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            Console.Error.WriteLine(Json.Encode(new { status = "failed", message = error.Message, automaticRollback = false }));
+            return 1;
+        }
+        internal static string ConnectionFile(System.Collections.Generic.Dictionary<string, string> args)
+        {
+            string explicitFile;
+            return args.TryGetValue("--connection", out explicitFile) ? Paths.Absolute(explicitFile, false) :
+                Path.Combine(Path.GetDirectoryName(Application.ExecutablePath), "connection.rent-lan");
+        }
+        internal static int Validate(string file)
+        {
+            var connection = Connection.Read(file, false);
+            Console.WriteLine(Json.Encode(new { status = "validated", connection = connection, osChanges = false, connected = false, loggedIn = false }));
+            return 0;
+        }
+    }
+    internal static class HostProgram
+    {
+        [STAThread]
+        private static int Main(string[] args)
+        {
+            Arguments.Streams();
+            bool gui = args.Length == 0;
+            try
+            {
+                var values = Arguments.Parse(args, "--make-certificate", "--validate-connection", "--plan-firewall", "--firewall-apply", "--firewall-remove",
+                    "--office-network-apply", "--advanced", "--first-setup", "--help");
+                if (values.ContainsKey("--make-certificate"))
+                {
+                    gui = false;
+                    Arguments.Only(values, "--make-certificate", "--to", "--address", "--port", "--server-id");
+                    string path = Arguments.Need(values, "--to");
+                    var connection = Certificates.Make(path, Arguments.Need(values, "--address"), Arguments.Number(values, "--port"), Arguments.Need(values, "--server-id"));
+                    Console.WriteLine(Json.Encode(new {
+                        status = "certificate-material-created", directory = path, connectionFile = Path.Combine(path, "connection.rent-lan"),
+                        connection = connection, osChanges = false, caPrivateKeyRetained = false, needsReenrollmentAtExpiry = true
+                    }));
+                    return 0;
+                }
+                if (values.ContainsKey("--validate-connection"))
+                {
+                    gui = false; Arguments.Only(values, "--validate-connection", "--connection");
+                    return Startup.Validate(Startup.ConnectionFile(values));
+                }
+                foreach (string mode in new[] { "--plan-firewall", "--firewall-apply", "--firewall-remove", "--office-network-apply" })
+                    if (values.ContainsKey(mode))
+                    {
+                        gui = mode != "--plan-firewall";
+                        var plan = FirewallElevation.Parse(values, mode);
+                        if (mode == "--plan-firewall")
+                        {
+                            Console.WriteLine(Json.Encode(new { status = "plan-only", rule = plan.Expected(), osChanges = false, networkCategoryChecked = false }));
+                            return 0;
+                        }
+                        return FirewallElevation.Run(plan, mode == "--firewall-remove", mode == "--office-network-apply");
+                    }
+                if (values.ContainsKey("--help"))
+                {
+                    Arguments.Only(values, "--help");
+                    Console.WriteLine("局域网配置.exe --program <绝对程序目录> [--config <绝对配置文件>]\r\n隔离材料：--make-certificate --to <不存在的新目录> --address <RFC1918 IPv4> --port <1..65535> --server-id <UUID>\r\n只读校验：--validate-connection --connection <绝对接入文件>");
+                    return 0;
+                }
+                Arguments.Only(values, "--program", "--config", "--advanced", "--first-setup");
+                string program, config; values.TryGetValue("--program", out program); values.TryGetValue("--config", out config);
+                gui = true; Startup.Gui();
+                using (var form = new HostForm(new NodeCore(NodeCore.Discover(program), config), !values.ContainsKey("--advanced"), values.ContainsKey("--first-setup")))
+                {
+                    Application.Run(form);
+                    return form.ExitCode;
+                }
+            }
+            catch (Exception error) { return Startup.Failure(error, gui); }
+        }
+    }
+    internal static class ClientProgram
+    {
+        [STAThread]
+        private static int Main(string[] args)
+        {
+            Arguments.Streams();
+            bool gui = args.Length == 0;
+            try
+            {
+                var values = Arguments.Parse(args, "--validate-connection", "--validate-invitation", "--help");
+                if (values.ContainsKey("--help"))
+                {
+                    Arguments.Only(values, "--help");
+                    Console.WriteLine("个人邀请文件：直接运行负责人单独发来的 EXE，无需填写网络参数。\r\n维护模式：员工电脑接入.exe [--connection <绝对接入文件>]\r\n加载不会添加信任或创建入口。\r\n只读连接校验：--validate-connection --connection <绝对接入文件>\r\n只读邀请校验：--validate-invitation --invitation-file <绝对个人邀请EXE>");
+                    return 0;
+                }
+                if (values.ContainsKey("--validate-connection"))
+                {
+                    gui = false; Arguments.Only(values, "--validate-connection", "--connection");
+                    return Startup.Validate(Startup.ConnectionFile(values));
+                }
+                if (values.ContainsKey("--validate-invitation"))
+                {
+                    gui = false; Arguments.Only(values, "--validate-invitation", "--invitation-file");
+                    InvitationPacket packet = InvitationPacket.TryRead(Arguments.Need(values, "--invitation-file"));
+                    if (packet == null) throw new IOException("这只是通用接入组件，没有个人邀请。请向负责人领取专属邀请。");
+                    Console.WriteLine(Json.Encode(packet.SafeReport()));
+                    return 0;
+                }
+                Arguments.Only(values, "--connection");
+                if (!values.ContainsKey("--connection"))
+                {
+                    InvitationPacket packet = InvitationPacket.TryRead(Application.ExecutablePath);
+                    if (packet != null)
+                    {
+                        gui = true; Startup.Gui();
+                        Application.Run(new InvitationForm(packet));
+                        return 0;
+                    }
+                }
+                Connection connection = Connection.Read(Startup.ConnectionFile(values), true);
+                gui = true; Startup.Gui(); Application.Run(new ClientForm(connection)); return 0;
+            }
+            catch (Exception error) { return Startup.Failure(error, gui); }
+        }
+    }
+}

@@ -1,0 +1,2921 @@
+(function () {
+  "use strict";
+  const Domain = RentDomain, Business = RentBusiness, Reporting = RentReporting, Offline = RentOffline;
+  const UI = RentUI, Navigation = RentNavigation, ContractForm = RentContractForm, UpdatePanel = RentUpdatePanel;
+  const Invitations = RentInvitations, InvitationPanel = RentInvitationPanel;
+  const CLIENT_VERSION = new URL(document.currentScript.src).searchParams.get("v");
+  const CLIENT_ID = Offline.id();
+  const main = document.getElementById("main"), auth = document.getElementById("auth-screen");
+  const modal = document.getElementById("modal");
+  const invitationGuard = document.getElementById("invitation-guard");
+  const mobile = RentMobile.createController({ window, document });
+  const nativeMode = RentNativeClient.isNative(navigator.userAgent);
+  const nativeClient = RentNativeClient.createClient({ environment: window });
+  const desktopClient = RentDesktopClient.create(window, {
+    request: (path, body) => post(path, body), onTarget: () => openDesktopTarget().catch(showError),
+    onError: showError, workState: () => updateWorkState(), saveWork: () => saveBeforeUpdate(),
+  });
+  const { html, money, yuan, button, link, note, field, select, heading, empty, table, cell, passwordField } = UI;
+  const clone = value => structuredClone(value);
+  const roleNames = { admin: "系统管理", operator: "业务经办", reviewer: "财务复核", viewer: "业务查看" };
+  const kindNames = { contract: "新建合同", "contract-change": "合同变更", "contract-void": "合同作废",
+    termination: "提前终止", payment: "登记收款", "payment-void": "收款撤销", refund: "退款",
+    "invoice-adjustment": "应收调整", "opening-balance": "补登历史欠款" };
+  const feeNames = { rent: "租金", property: "物业费", water: "水费", electricity: "电费", deposit: "押金", other: "其他" };
+  const appStates = { pending: "待审核", approved: "已通过", returned: "已退回" };
+  const auditNames = { "application.submit": "提交申请", "application.resubmit": "修改后重提",
+    "application.approve": "复核通过", "application.return": "退回修改" };
+  const contractStates = { active: "执行中", terminated: "已终止", void: "已作废" };
+  const invoiceStates = { active: "执行中", superseded: "被新版本替代", void: "已作废" };
+  const now = () => new Date().toISOString();
+  const localToday = () => new Intl.DateTimeFormat("en-CA", { timeZone: "Asia/Shanghai", year: "numeric", month: "2-digit", day: "2-digit" }).format(new Date());
+  const permitted = role => !!user?.roles.includes(role);
+  let user = null, csrf = null, vault = null, snapshot = null, serverId = null, bootstrap = null;
+  let online = false, busy = false, lastError = "", syncTimer = null, retryCount = 0, pendingSave = null;
+  let offlineObservedAt = 0;
+  let sourceUrl = null, report = null, view = "dashboard";
+  let workspaceEpoch = 0, authenticating = false;
+  let lastLoginName = "", navigating = false;
+  let updateClient = null, fileWork = 0, actionWork = 0, savingWork = 0, updatePaused = false;
+  let updateState = { maintenance: { phase: "idle" }, paused: false };
+  let updateStatusRequest = null, lastUpdateStatusAt = 0;
+  let shellUpdateAvailable = false;
+  let notificationRequested = location.hash === "#notifications";
+  let pushClient = null, pushStatusRequest = null;
+  let inspectingInvitation = false, claimingInvitation = false;
+  let invitationListVersion = 0;
+  const trail = new Navigation.Trail();
+  const pendingActions = new Set();
+  const draftRecovery = new Offline.DraftRecovery();
+  const invitationActivity = new Map();
+  const invitationBusyLabels = { "invitation-create": "正在读取……", "invitation-issue": "正在生成……",
+    "invitation-download": "正在下载……", "invitation-copy": "正在复制……",
+    "invitation-revoke": "正在撤销……", "invitation-refresh": "正在刷新……" };
+  const guardedActions = new Set(["submit-contract", "submit-action", "review-decision", "save-user",
+    "save-settings", "manual-backup", "change-password", "download-local-work", "apply-local-work", "apply-opening-batch",
+    "update-check", "update-stage", "update-install", "update-cancel", "update-reload",
+    "push-enable", "push-disable", "push-test", "push-revoke", "push-refresh", "push-admin-refresh", "save-reminders",
+    "pairing-approve", "pairing-reject", "pairing-refresh"]);
+  for (const action of ["invitation-create", "invitation-issue", "invitation-download", "invitation-copy", "invitation-revoke", "invitation-refresh"]) guardedActions.add(action);
+  const ui = { month: "", basis: "due", kind: "rent", status: "all", q: "", reviewStatus: "pending",
+    contractStatus: "active", invoiceStatus: "all", editor: null, step: 0, editorDirty: false,
+    editorSequence: 0, action: null, appId: null, mode: "", preview: null, opening: {},
+    selectedContract: null, importBundle: null, importPlan: null, importRevision: null,
+    push: {}, pushTest: null, installationId: "", invitationFeedback: {}, invitationAdminMessage: "",
+    invitationIssueUnconfirmed: false, invitationRefreshError: "" };
+
+  function toast(message) {
+    const el = document.createElement("div");
+    el.className = "toast";
+    el.textContent = message;
+    document.getElementById("toast-container").append(el);
+    setTimeout(() => el.remove(), 6000);
+  }
+  function showError(error) {
+    if (error.code === "MAINTENANCE" || error.code === "CLIENT_UPDATE_REQUIRED") {
+      if (lastError !== error.message) { lastError = error.message; toast(lastError); }
+      renderUpdateStatus();
+      return;
+    }
+    lastError = error.name === "QuotaExceededError" ?
+      "本机加密存储空间不足，草稿/请求未保存；当前输入仍在本窗口，请释放浏览器存储空间后重试，切勿关闭页面。" :
+      error.message || String(error);
+    const el = document.getElementById("error-banner");
+    el.hidden = !user;
+    el.textContent = lastError;
+    toast(lastError);
+    if (user) chrome();
+  }
+  function clearError() { lastError = ""; document.getElementById("error-banner").hidden = true; }
+  function serverError(body, status) {
+    const error = new Error(body?.error?.message || `主机返回 HTTP ${status}，请稍后重试。`);
+    error.status = status;
+    error.code = body?.error?.code || "";
+    error.retryable = status >= 500 || status === 408 || status === 429;
+    error.details = body?.error?.details || [];
+    if (error.details.length) error.message += `：${error.details.map(value => typeof value === "string" ? value : JSON.stringify(value)).join("；")}`;
+    return error;
+  }
+  function assertWorkspace(epoch) {
+    if (epoch !== workspaceEpoch) throw new DOMException("工作区已切换，旧请求结果不会写入当前账号。", "AbortError");
+  }
+  async function request(path, options = {}) {
+    const startedIn = workspaceEpoch;
+    let response;
+    let receivedHttpResponse = false;
+    const controller = new AbortController();
+    const externalSignal = options.signal;
+    const abortExternally = () => controller.abort(externalSignal.reason);
+    if (externalSignal?.aborted) abortExternally();
+    else externalSignal?.addEventListener("abort", abortExternally, { once: true });
+    let timedOut = false;
+    const transfer = options.body instanceof Blob || /^\/api\/attachments\//.test(path) || path.startsWith("/api/reports.xlsx") ||
+      path === "/api/admin/invitations/package";
+    const deadline = transfer ? 180000 : 15000;
+    const timeout = setTimeout(() => {
+      if (!controller.signal.aborted) { timedOut = true; controller.abort(); }
+    }, deadline);
+    try {
+      const incoming = await fetch(path, { credentials: "same-origin", cache: "no-store",
+        ...options, signal: controller.signal,
+        headers: { ...(options.body && !(options.body instanceof Blob) ? { "Content-Type": "application/json" } : {}),
+          "X-Rent-Client-Version": CLIENT_VERSION, "X-Rent-Client-Id": CLIENT_ID,
+          ...((options.method || "GET") !== "GET" && csrf ? { "X-CSRF-Token": csrf } : {}), ...options.headers } });
+      receivedHttpResponse = true;
+      const body = [204, 205, 304].includes(incoming.status) ? null : await incoming.arrayBuffer();
+      response = new Response(body, { status: incoming.status, statusText: incoming.statusText, headers: incoming.headers });
+    } catch (error) {
+      assertWorkspace(startedIn);
+      if (timedOut || (error instanceof TypeError && !externalSignal?.aborted)) {
+        online = false;
+        retryCount = Math.min(retryCount + 1, 6);
+        const failure = new Error(timedOut ? `连接 ${location.host} 超过 ${deadline / 1000} 秒，请检查主机或网络；原始工作不会因此被删除。` :
+          `无法连接 ${location.host}：${error.message}`);
+        failure.network = true;
+        failure.reachable = receivedHttpResponse;
+        throw failure;
+      }
+      throw error;
+    } finally {
+      clearTimeout(timeout);
+      externalSignal?.removeEventListener("abort", abortExternally);
+    }
+    assertWorkspace(startedIn);
+    updateClient?.observeVersion(response.headers.get("X-Rent-Application-Version"));
+    online = true;
+    retryCount = 0;
+    if (response.status === 401 || (response.status === 403 && user)) {
+      const body = await response.json().catch(() => ({}));
+      assertWorkspace(startedIn);
+      const error = serverError(body, response.status);
+      lock(error.message);
+      throw error;
+    }
+    if (!response.ok) {
+      const body = await response.json().catch(() => ({}));
+      assertWorkspace(startedIn);
+      throw serverError(body, response.status);
+    }
+    return response;
+  }
+  async function json(path, options = {}) {
+    const startedIn = workspaceEpoch;
+    const value = await (await request(path, options)).json();
+    assertWorkspace(startedIn);
+    return value;
+  }
+  const post = (path, data) => json(path, { method: "POST", body: JSON.stringify(data) });
+  function lock(message = "", nativeReason) {
+    const recovery = ui.editorDirty && ui.editor && vault?.value && vault.key
+      ? draftRecovery.capture(vault, ui.editor) : null;
+    if (desktopClient.enabled && ["manual-logout", "account-switch"].includes(nativeReason)) desktopClient.clear();
+    Invitations.clearAll();
+    if (invitationGuard.open) invitationGuard.close();
+    pushClient?.invalidate();
+    pushStatusRequest = null;
+    if (nativeMode) {
+      try { nativeClient.sessionChanged(nativeReason); }
+      catch (error) { message = `${message} 安卓本机操作的取消状态暂无法确认：${error.message}`; }
+    }
+    mobile.reset();
+    workspaceEpoch++;
+    updateClient?.stop();
+    vault?.lock();
+    vault = null; user = null; csrf = null; snapshot = null;
+    offlineObservedAt = 0;
+    report = null;
+    trail.reset();
+    ui.editor = null; ui.action = null; ui.preview = null; ui.opening = {};
+    ui.importBundle = null; ui.importPlan = null; ui.importRevision = null;
+    ui.selectedContract = null; ui.appId = null; ui.adminUsers = null; ui.storage = null;
+    ui.updates = null; ui.pairings = null;
+    ui.adminPush = null;
+    ui.invitationAdmin = null;
+    ui.invitationDownloadError = "";
+    ui.invitationCopyError = "";
+    ui.invitationFeedback = {};
+    ui.invitationAdminMessage = "";
+    ui.invitationIssueUnconfirmed = false;
+    ui.invitationRefreshError = "";
+    invitationListVersion++;
+    invitationActivity.clear();
+    ui.push = {}; ui.pushTest = null; ui.installationId = "";
+    ui.updateCommand = null;
+    fileWork = 0; actionWork = 0; savingWork = 0;
+    pendingActions.clear();
+    updateStatusRequest = null;
+    lastUpdateStatusAt = 0;
+    ui.q = ""; ui.editorDirty = false; ui.reviewStatus = "pending"; ui.contractStatus = "active";
+    ui.invoiceStatus = "all"; ui.basis = "due"; ui.kind = "rent"; ui.status = "all"; ui.month = "";
+    clearTimeout(pendingSave); pendingSave = null;
+    if (sourceUrl) URL.revokeObjectURL(sourceUrl);
+    sourceUrl = null;
+    if (modal.open) modal.close();
+    main.replaceChildren();
+    document.getElementById("modal-body").replaceChildren();
+    document.getElementById("print-area").replaceChildren();
+    document.getElementById("toast-container").replaceChildren();
+    for (const id of ["identity", "scope", "role-avatar", "mobile-identity", "connection-button", "status-ribbon", "nav-list", "update-notice"]) {
+      document.getElementById(id).replaceChildren();
+    }
+    document.getElementById("global-search").value = "";
+    document.getElementById("error-banner").textContent = "";
+    document.getElementById("update-notice").hidden = true;
+    lastError = "";
+    document.getElementById("app-shell").hidden = true;
+    auth.hidden = false;
+    renderAuth(message);
+    if (recovery) {
+      const lockedIn = workspaceEpoch;
+      recovery.then(() => {
+        if (lockedIn === workspaceEpoch && !user) {
+          formFeedback(document.getElementById("auth-form"), `${message} 最新草稿已加密保留，重新登录后会找回。`);
+        }
+      }).catch(error => {
+        if (lockedIn === workspaceEpoch && !user && document.getElementById("auth-form")) {
+          formFeedback(document.getElementById("auth-form"),
+            `${message} 恢复副本尚未保存：${error.message}。本窗口仍保留待恢复输入，请勿关闭或刷新；重新登录后可重试。`);
+        } else showError(error);
+      });
+    }
+  }
+  function openRequestedNotifications() {
+    notificationRequested = true;
+    if (!user || !snapshot || authenticating) return;
+    if (updatePaused || modal.open || mobile.isBusy() || hasUnsavedSettings() || hasReviewWork() || fileWork || savingWork || actionWork || busy || navigating) {
+      toast("有新的提醒。请先完成当前操作，再点击右上角的提醒按钮查看。");
+      return;
+    }
+    mobile.close();
+    handleAction(document.querySelector(".notification-button")).catch(showError);
+  }
+  function offlineAccess() {
+    if (!user || online) return true;
+    const check = Offline.offlineValidity(vault?.value?.syncedAt, snapshot?.settings?.offlineDays ?? 7,
+      Date.now(), Math.max(vault?.value?.lastLocalClock || 0, offlineObservedAt));
+    if (!check.valid) {
+      lock(check.reason);
+      return false;
+    }
+    offlineObservedAt = check.checkedAt;
+    return true;
+  }
+  async function saveVault(change) {
+    if (!offlineAccess()) throw new Error("离线期限已到；请联网重新验证，已加密保存的工作不会丢失。");
+    const startedIn = workspaceEpoch;
+    savingWork++;
+    try {
+      return await vault.update(value => {
+        assertWorkspace(startedIn);
+        if (!offlineAccess()) throw new Error("离线期限已到；请联网重新验证，已加密保存的工作不会丢失。");
+        change(value);
+        if (!online) value.lastLocalClock = offlineObservedAt;
+      });
+    } finally {
+      if (startedIn === workspaceEpoch) { savingWork--; renderUpdateStatus(); }
+    }
+  }
+  function scoped() {
+    if (!snapshot) return "尚未取得授权数据";
+    if (!canViewBusiness()) return "系统管理";
+    return user.allParks ? "授权范围：全部园区" : `授权范围：${user.parks.join("、") || "无业务园区"}`;
+  }
+  function canViewBusiness() { return ["operator", "reviewer", "viewer"].some(permitted); }
+  function chrome() {
+    if (!snapshot || !user || !offlineAccess()) return;
+    const activeRoute = ({ wizard: "contracts", "my-work": "dashboard", "contract-detail": "contracts",
+      "application-detail": "review" })[view] || view;
+    const routes = [["dashboard", "我的工作台", "home"], ["contracts", "合同台账", "file"],
+      ["review", permitted("reviewer") ? "财务审核" : "申请记录", "review"], ["reports", "收租报表", "chart"], ["devices", "通知设置", "bell"],
+      ...(permitted("admin") ? [["admin", "系统管理", "shield"]] : [])];
+    document.getElementById("nav-list").innerHTML = routes.map(([route, title, icon]) =>
+      `<button type="button" class="nav-item ${activeRoute === route ? "active" : ""}" data-action="navigate" data-route="${route}"><svg class="icon"><use href="#i-${icon}"/></svg><span>${title}</span>${route === "review" && permitted("reviewer") ?
+        `<b class="nav-count">${pendingReviews().length}</b>` : ""}</button>`).join("");
+    document.getElementById("identity").textContent = user.displayName;
+    document.getElementById("mobile-identity").textContent = `${user.displayName} · ${user.roles.map(role => roleNames[role]).join(" / ")}`;
+    document.getElementById("role-avatar").textContent = user.displayName.slice(0, 1);
+    document.getElementById("scope").textContent = user.roles.map(role => roleNames[role]).join(" / ");
+    document.getElementById("connection-button").innerHTML = `${online ? "● 主机在线" : "○ 离线（本机资料）"} · 待同步 ${vault?.value?.queue.length || 0}`;
+    document.getElementById("status-ribbon").innerHTML = `<span><svg class="icon"><use href="#i-info"/></svg><strong>${online ? "主机已连接" : "离线工作区"}</strong>${html(scoped())} · 最近成功同步 ${html(vault?.value?.syncedAt ? new Date(vault.value.syncedAt).toLocaleString("zh-CN") : "暂无")} · ${html(location.origin)}</span>`;
+    document.getElementById("notification-dot").hidden = !snapshot.notifications.some(n => !n.read);
+    document.getElementById("page-title").textContent = Navigation.titles[view] || "工作区";
+    document.getElementById("global-search").value = ui.q;
+    const previous = trail.peek();
+    const back = document.getElementById("page-back");
+    back.hidden = !previous && view === "dashboard";
+    back.textContent = `← 返回${previous ? Navigation.titles[previous.view] || "上一页" : "工作台"}`;
+  }
+  async function hydrate(data, time = now()) {
+    const startedIn = workspaceEpoch;
+    if (data.serverId !== serverId || data.user.id !== user.id || data.protocolVersion !== 1) {
+      throw new Error("主机或账号标识发生变化，已停止同步，防止混用不同工作区。");
+    }
+    await vault.update(value => { value.snapshot = data; value.syncedAt = time; value.lastLocalClock = Date.parse(time); });
+    assertWorkspace(startedIn);
+    snapshot = data;
+    user = data.user;
+    online = true;
+    offlineObservedAt = Date.parse(time);
+    await showNotifications();
+    if (desktopClient.enabled) {
+      try { await desktopClient.account(user, serverId); }
+      catch (error) { assertWorkspace(startedIn); toast(`电脑通知未就绪：${error.message}`); }
+    }
+  }
+  async function showNotifications() {
+    if (nativeMode || desktopClient.enabled || vault.value.pagePopupEnabled === false) return;
+    if (!("Notification" in window) || Notification.permission !== "granted") return;
+    const startedIn = workspaceEpoch;
+    const unseen = snapshot.notifications.filter(item => !item.read && !vault.value.seenNotifications.includes(item.id));
+    if (!unseen.length) return;
+    const registration = "serviceWorker" in navigator ? await navigator.serviceWorker.getRegistration() : null;
+    assertWorkspace(startedIn);
+    const options = { body: "您有新的待处理提醒，请登录查看。", tag: `rent-local-${user.id}`,
+      icon: "/icons/icon-192.png", data: { kind: "rent-local-reminder", url: "/#notifications" } };
+    try {
+      if (registration?.active) await registration.showNotification("园区租赁", options);
+      else new Notification("园区租赁", options);
+    } catch (error) {
+      if (error.name !== "NotAllowedError" && error.name !== "TypeError") throw error;
+      toast("系统暂不能显示网页弹窗，请在站内查看未读提醒，并检查通知权限。");
+      return;
+    }
+    assertWorkspace(startedIn);
+    await saveVault(value => { value.seenNotifications.push(...unseen.map(item => item.id)); });
+  }
+  async function restoreSession() {
+    const me = await json("/api/me");
+    if (me.serverId !== serverId || me.user.id !== user.id) {
+      lock("主机或当前登录账号不同，请重新登录对应工作区。");
+      throw new Error("主机或当前登录账号不同，未读取其他账号数据。");
+    }
+    csrf = me.csrfToken;
+  }
+  async function refresh() {
+    await restoreSession();
+    await hydrate(await json("/api/state"));
+    chrome();
+    if (view !== "wizard" && !modal.open && !hasUnsavedSettings() && !hasReviewWork()) render();
+  }
+  async function synchronize(force = false) {
+    if (!vault || busy || updatePaused || updateState.availableVersion || (!navigator.onLine && !force)) return;
+    const startedIn = workspaceEpoch;
+    busy = true;
+    try {
+      await refresh();
+      if (vault.value.importAwaitingReview && !force) return;
+      if (!permitted("operator") && !permitted("reviewer")) return;
+      if (vault.value.importAwaitingReview) await saveVault(state => { state.importAwaitingReview = false; });
+      for (const item of [...vault.value.queue]) {
+        if (item.error) break;
+        for (const id of Offline.attachmentIds(item.operation.payload)) {
+          if (vault.value.uploaded[id]) continue;
+          const file = vault.value.files[id];
+          if (!file) throw new Error(`待同步附件 ${id} 在本机丢失；原请求仍在队列中，请恢复附件。`);
+          let result;
+          try {
+            result = await json(`/api/attachments?name=${encodeURIComponent(file.name)}`, {
+              method: "POST", body: Offline.asBlob(file), headers: { "X-Upload-Id": id.slice(6) } });
+          } catch (error) {
+            if (!error.network && !error.retryable && error.status && error.status !== 401 && error.status !== 403) {
+              await saveVault(value => { value.queue.find(entry => entry.operation.operationId === item.operation.operationId).error = error.message; });
+            }
+            throw error;
+          }
+          await saveVault(value => { value.uploaded[id] = result; });
+        }
+        if (!item.prepared) {
+          const prepared = Offline.replaceLocalAttachments(item.operation, vault.value.uploaded);
+          await saveVault(value => { value.queue.find(entry => entry.operation.operationId === item.operation.operationId).prepared = prepared; });
+        }
+        let result;
+        try {
+          result = await json(`/api/operations/${encodeURIComponent(item.operation.operationId)}`);
+        } catch (error) {
+          if (error.status !== 404) throw error;
+        }
+        if (!result) {
+          try { result = await post("/api/operations", vault.value.queue.find(entry => entry.operation.operationId === item.operation.operationId).prepared); }
+          catch (error) {
+            assertWorkspace(startedIn);
+            if (error.network) throw error;
+            if (error.retryable) throw error;
+            if (error.name === "AbortError") throw error;
+            if (error.status === 401 || error.status === 403) throw error;
+            await saveVault(value => { value.queue.find(entry => entry.operation.operationId === item.operation.operationId).error = error.message; });
+            showError(error);
+            break;
+          }
+        }
+        const data = await json("/api/state");
+        if (data.serverId !== serverId || data.user.id !== user.id || data.protocolVersion !== 1)
+          throw new Error("同步所得快照不属于当前账号或协议，原请求仍保留。");
+        await saveVault(value => {
+          value.snapshot = data; value.syncedAt = now(); value.lastLocalClock = Date.parse(value.syncedAt);
+          value.queue = value.queue.filter(entry => entry.operation.operationId !== item.operation.operationId);
+        });
+        snapshot = data; user = data.user;
+        offlineObservedAt = Date.parse(vault.value.syncedAt);
+        const accepted = data.applications.find(app => app.id === result.applicationId);
+        toast(`${accepted?.number || result.applicationId} · ${appStates[result.status] || result.status}（主机已确认）`);
+        await showNotifications();
+      }
+      if (!vault.value.queue.some(entry => entry.error)) clearError();
+      chrome(); if (view !== "wizard" && !modal.open && !hasUnsavedSettings() && !hasReviewWork()) render();
+    } catch (error) {
+      if (user && startedIn === workspaceEpoch && !(error.network && updateState.maintenance)) showError(error);
+    } finally { busy = false; renderUpdateStatus(); }
+  }
+  async function enqueue(type, payload) {
+    const startedIn = workspaceEpoch;
+    const operation = { operationId: Offline.id(), clientTime: now(), type, payload };
+    await saveVault(value => { value.queue.push({ operation, prepared: null, error: "" }); });
+    assertWorkspace(startedIn);
+    chrome();
+    toast(online && !vault.value.importAwaitingReview ? "操作已保存，正在提交主机；财务审核后才会改变正式金额。" :
+      "请求已加密排队；待人工核对迁入队列或恢复连接后才可同步，未复核且未生效。");
+    if (online) await synchronize();
+    else render();
+  }
+  function renderAuth(message = "") {
+    const invitation = Invitations.status();
+    document.getElementById("join-form")?.reset();
+    if (invitation.phase !== "none") {
+      if (!message && invitation.phase === "expired" && claimingInvitation) message = "刚才的创建结果尚未确认，请先返回登录，使用刚才填写的用户名和密码。";
+      auth.innerHTML = InvitationPanel.join(invitation, message);
+      return;
+    }
+    const initial = bootstrap && !bootstrap.initialized;
+    const people = serverId ? (window.__profiles || []) : [];
+    if (initial && !bootstrap.setupAvailable) {
+      auth.innerHTML = `<div class="card auth-card"><div class="eyebrow">园区租赁 · ${html(location.host)}</div>
+        <h1>主机尚未启用</h1>${note("请联系管理员完成主机首次设置，再回来登录。", "warning")}
+        ${message ? note(message, "danger") : ""}
+        <div class="button-row top-gap"><a href="/" class="button">设置完成后重新打开</a>
+          ${desktopClient.enabled ? "" : '<button type="button" class="button" data-mobile-action="install-help">桌面入口说明</button>'}</div>
+        <details class="top-gap"><summary>说明</summary><p class="hint">Windows 版在主机管理窗口完成首次设置；云端使用部署维护入口。此网址不能创建首个管理员。</p></details></div>`;
+      return;
+    }
+    auth.innerHTML = `<div class="card auth-card"><div class="eyebrow">园区租赁 · ${html(location.host)}</div><h1>${initial ? "首次设置" : "登录工作账号"}</h1>
+      ${initial ? '<p class="muted">管理员负责管理、查看账目和接收提醒，不负责录入或审核。</p>' : ""}
+      <div id="auth-feedback" class="notice" role="status" ${message ? "" : "hidden"}>${html(message)}</div>
+      <form id="auth-form" class="form-grid">
+      ${initial ? `${field("一次性初始化口令", "setupToken", "", "text", "required autocomplete=off")}
+        ${field("管理员用户名", "username", "", "text", "required autocomplete=username")}
+        ${field("姓名", "displayName", "", "text", "required")}
+        ${field("开始管账日期", "accountingStartDate", localToday(), "date", "required")}` :
+        `<div class="field full"><label for="manualUsername">用户名</label><input id="manualUsername" name="manualUsername"
+          value="${html(lastLoginName)}" autocomplete="username" list="known-logins" required>
+          <datalist id="known-logins">${people.map(person => `<option value="${html(person.username)}"></option>`).join("")}</datalist>
+          <small>${people.length ? "可选择本机用过的账号，也可输入用户名。" : "填写开通账号时设置的用户名。"}</small></div>`}
+      ${passwordField(initial ? "密码（至少 10 位）" : "密码", "password", `required minlength="10" autocomplete="${initial ? "new-password" : "current-password"}"`)}
+      ${initial ? passwordField("确认密码", "confirmPassword", 'required minlength="10" autocomplete="new-password"') : ""}
+      <p id="caps-lock-hint" class="hint full" hidden>大写锁定已开启，请留意密码中的大小写。</p>
+      <button class="button primary" type="submit">${initial ? "建立管理员账号" : "在线登录"}</button>
+      ${!initial && people.length ? button("离线打开本机资料", "offline-unlock") : ""}
+      <div class="field full"><details><summary>${initial ? "说明" : "遇到问题"}</summary>
+        ${initial ? '<p class="hint">Windows 版请在主机管理窗口复制初始化口令；云端请使用部署维护入口。</p>' :
+          `<p class="hint">改过密码且旧资料无法解锁？请填写旧本机密码后再登录。</p>
+          ${field("旧本机密码", "cachePassword", "", "password", "autocomplete=off")}
+          <p class="hint">旧密码只用于恢复本机加密资料，不会发送给主机。</p>
+          ${people.length ? '<p class="hint">离线使用本机已保存的资料，联网后再同步。未审核的操作不会改变正式账目。</p>' : ""}`}
+        <p class="hint">${desktopClient.enabled ? "公共电脑用完请退出账号。" : `主机地址：${html(location.origin)}。请使用管理员提供的网址，公共设备用完请退出。`}</p>
+      </details></div></form>
+      ${!initial ? '<p class="hint">没有账号？请联系管理员开通。</p>' : ""}
+      ${location.protocol === "http:" && location.hostname !== "localhost" && location.hostname !== "127.0.0.1" ?
+        note("当前网址不支持离线与加密资料，请联系管理员使用 HTTPS 入口。", "warning") : ""}
+      ${desktopClient.enabled ? "" : '<button type="button" class="text-button" data-mobile-action="install-help">桌面入口说明</button>'}</div>`;
+  }
+  function formFeedback(form, message, input = null) {
+    if (!form?.isConnected) return;
+    const id = form.id === "join-form" ? "join-feedback" : form.id === "invitation-form" ? "invitation-feedback" : "auth-feedback";
+    const feedback = document.getElementById(id);
+    if (!feedback) return;
+    feedback.textContent = message;
+    feedback.hidden = !message;
+    feedback.setAttribute("role", message ? "alert" : "status");
+    for (const field of form.querySelectorAll('[aria-invalid="true"]')) field.removeAttribute("aria-invalid");
+    if (input) {
+      input.setAttribute("aria-invalid", "true");
+      input.setAttribute("aria-describedby", id);
+      input.focus();
+    }
+  }
+  function joinBusy(form, value) {
+    form.setAttribute("aria-busy", String(value));
+    for (const input of form.querySelectorAll("input, button")) input.disabled = value;
+    form.querySelector('button[type="submit"]').textContent = value ? "正在创建……" : "创建我的账号";
+  }
+  async function inspectInvitation() {
+    if (user) {
+      if (!invitationGuard.open) invitationGuard.showModal();
+      return;
+    }
+    if (inspectingInvitation || claimingInvitation || authenticating || Invitations.status().phase !== "active") return;
+    inspectingInvitation = true;
+    const revision = Invitations.status().revision;
+    const form = document.getElementById("join-form");
+    try {
+      const state = await Invitations.inspect(post);
+      if (!user) {
+        if (form?.isConnected && state.phase === "active" && !state.signedIn) formFeedback(form, "");
+        else renderAuth();
+      }
+    } catch (error) {
+      if (error.name !== "AbortError" && !user) {
+        const state = Invitations.status();
+        if (form?.isConnected && state.phase === "active" && !state.signedIn) formFeedback(form, error.message);
+        else renderAuth(state.phase === "unavailable" ? "" : error.message);
+      }
+    } finally {
+      inspectingInvitation = false;
+      const current = Invitations.status();
+      if (!user && current.phase === "active" && current.revision !== revision) inspectInvitation().catch(showError);
+    }
+  }
+  function invitationArrived() {
+    if (Invitations.status().phase === "none") {
+      if (!user) renderAuth();
+      return;
+    }
+    if (user) {
+      if (!invitationGuard.open) invitationGuard.showModal();
+      return;
+    }
+    if (authenticating) return;
+    renderAuth();
+    inspectInvitation().catch(showError);
+  }
+  async function joinSubmit(form) {
+    if (claimingInvitation || !form.isConnected) return;
+    if (user || authenticating || inspectingInvitation) {
+      formFeedback(form, "正在核对账号或邀请，请稍候。");
+      return;
+    }
+    const state = Invitations.status();
+    if (state.phase !== "active" || state.signedIn || !state.invitation) {
+      form.reset();
+      renderAuth();
+      return;
+    }
+    const usernameInput = form.elements.namedItem("join-username"), passwordInput = form.elements.namedItem("join-password");
+    const confirmation = form.elements.namedItem("join-confirm-password");
+    const username = usernameInput.value.trim(), password = passwordInput.value;
+    if (!username || username.length > 80 || /[\u0000-\u001f\u007f]/.test(username)) {
+      formFeedback(form, !username ? "请填写用户名，可用中文。" : username.length > 80 ?
+        "用户名不能超过 80 字，请简短些。" : "用户名中有不可见字符，请重新输入。", usernameInput);
+      return;
+    }
+    if (password.length < 10 || password.length > 128 || !password.trim()) {
+      formFeedback(form, "密码须为 10 至 128 位，不能全为空格。", passwordInput);
+      return;
+    }
+    if (password !== confirmation.value) {
+      formFeedback(form, "两次密码不一致，请重新确认。", confirmation);
+      return;
+    }
+    formFeedback(form, "");
+    claimingInvitation = true;
+    joinBusy(form, true);
+    lastLoginName = username;
+    try {
+      const result = await Invitations.claim(post, username, password);
+      form.reset();
+      Invitations.clearJoin("none", false);
+      lastLoginName = result.username;
+      renderAuth("账号已创建，请登录。");
+      document.getElementById("password")?.focus();
+    } catch (error) {
+      if (error.name === "AbortError") return;
+      const current = Invitations.status();
+      if (current.phase !== "active" || current.signedIn) {
+        form.reset();
+        renderAuth(current.signedIn || current.phase === "unavailable" ? "" : error.message);
+      } else {
+        joinBusy(form, false);
+        const message = error.code === "USERNAME_TAKEN" ? "这个用户名已有人使用，请换一个。" :
+          error.network ? "连接中断，创建结果尚未确认。可先返回登录核对；未创建成功时再重试。" : error.message;
+        formFeedback(form, message,
+          error.code === "USERNAME_TAKEN" ? usernameInput : null);
+      }
+    } finally {
+      claimingInvitation = false;
+      joinBusy(form, false);
+      const current = Invitations.status();
+      if (!user && current.phase === "active" && current.revision !== state.revision) inspectInvitation().catch(showError);
+    }
+  }
+  async function authSubmit(offline = false) {
+    if (Invitations.status().phase !== "none") throw new Error("请先完成或关闭个人邀请，不会在邀请页面切换已有账号。");
+    const form = document.getElementById("auth-form");
+    if (!form.reportValidity()) return;
+    const data = Object.fromEntries(new FormData(form));
+    const name = (data.manualUsername || data.username || "").trim();
+    if (!name) { formFeedback(form, "请填写用户名。", form.elements.namedItem("manualUsername") || form.elements.namedItem("username")); return; }
+    pushClient?.invalidate();
+    if (desktopClient.enabled) desktopClient.clear();
+    if (nativeMode) nativeClient.sessionChanged();
+    lastLoginName = name;
+    if (bootstrap && !bootstrap.initialized) {
+      if (data.password !== data.confirmPassword) {
+        formFeedback(form, "两次密码不一致，请重新确认。", form.elements.namedItem("confirmPassword"));
+        return;
+      }
+      await post("/api/setup", { setupToken: data.setupToken, username: name, displayName: data.displayName,
+        password: data.password, accountingStartDate: data.accountingStartDate });
+      bootstrap = await json("/api/bootstrap");
+      renderAuth("管理员账号已创建，请登录。");
+      return;
+    }
+    if (offline) {
+      try {
+        await json("/api/bootstrap");
+        throw new Error("主机可以连接，请使用“在线登录”核对账号和权限。");
+      } catch (error) {
+        if (!error.network || error.reachable) throw error;
+      }
+      const profile = window.__profiles?.find(p => p.username === name);
+      if (!profile) throw new Error("这台电脑还没有保存过该账号的资料，需要先联网登录一次。");
+      const unlocked = new Offline.Vault(serverId, profile.userId);
+      await unlocked.unlock(data.password);
+      const cached = unlocked.value;
+      const check = Offline.offlineValidity(cached.syncedAt, cached.snapshot?.settings?.offlineDays ?? 7,
+        Date.now(), cached.lastLocalClock || 0);
+      if (!cached.snapshot || !check.valid) {
+        unlocked.lock();
+        throw new Error(check.reason || "没有可用的本机资料，请连接主机重新登录。");
+      }
+      const recovered = await draftRecovery.restore(unlocked, [data.password]);
+      if (recovered.restored) toast(`已找回 ${recovered.restored} 份未保存草稿${recovered.conflicts ? "；同时修改的原稿和恢复副本均已保留" : ""}。`);
+      vault = unlocked; snapshot = cached.snapshot; user = snapshot.user; csrf = null;
+      online = false;
+      offlineObservedAt = check.checkedAt;
+      if (!user.active || snapshot.serverId !== serverId) { lock("账号或主机不匹配，请联网登录。"); return; }
+    } else {
+      const startedIn = workspaceEpoch;
+      const installationId = await currentInstallation();
+      assertWorkspace(startedIn);
+      const result = await json("/api/login", { method: "POST",
+        headers: { "X-Rent-Installation-Id": installationId },
+        body: JSON.stringify({ username: name, password: data.password }) });
+      csrf = result.csrfToken; serverId = result.serverId;
+      const unlocked = new Offline.Vault(serverId, result.user.id);
+      try {
+        try { await unlocked.unlock(data.password, true); }
+        catch (error) {
+          if (error.code !== "OFFLINE_PASSWORD_MISMATCH" || !data.cachePassword) throw error;
+          await unlocked.unlock(data.cachePassword);
+        }
+        const recovered = await draftRecovery.restore(unlocked, [data.password, data.cachePassword]);
+        if (recovered.restored) toast(`已找回 ${recovered.restored} 份未保存草稿${recovered.conflicts ? "；同时修改的原稿和恢复副本均已保留" : ""}。`);
+        if (data.cachePassword && data.cachePassword !== data.password) await unlocked.rekey(data.password);
+      } catch (error) {
+        try {
+          await json("/api/logout", { method: "POST",
+            headers: { "X-Rent-Installation-Id": installationId }, body: "{}" });
+        } catch (logoutError) {
+          csrf = null;
+          throw new AggregateError([error, logoutError], "本机工作区未能解锁，且主机退出尚未确认。请重新在线登录核对，不要清理旧草稿。");
+        }
+        csrf = null;
+        if (error.message?.includes("本机加密密码不匹配")) {
+          error.message = "旧资料仍由原密码保护。请填写“旧本机密码”，再登录。";
+          error.field = "cachePassword";
+        }
+        throw error;
+      }
+      vault = unlocked; user = result.user; online = true;
+      try {
+        await hydrate(await json("/api/state"));
+        await Offline.rememberServer(location.origin, serverId);
+        await Offline.remember(serverId, user);
+        window.__profiles = await Offline.profiles(serverId);
+      } catch (error) {
+        lock(`登录后未能安全保存工作区：${error.message}。请重新登录。`);
+        throw error;
+      }
+    }
+    if (nativeMode) {
+      const startedIn = workspaceEpoch;
+      try {
+        await nativeClient.accountReady({ serverId, userId: user.id });
+        assertWorkspace(startedIn);
+      }
+      catch (error) {
+        if (startedIn !== workspaceEpoch) throw error;
+        lock("安卓账号状态未能安全确认，请重新登录，不要清理本机草稿。", "account-switch");
+        throw error;
+      }
+    }
+    form.reset();
+    auth.hidden = true;
+    document.getElementById("app-shell").hidden = false;
+    ui.month = snapshot.today.slice(0, 7);
+    trail.reset();
+    view = "dashboard";
+    chrome(); render();
+    updateClient.start();
+    await openDesktopTarget();
+    if (!offline && vault.value.queue.length) await synchronize();
+  }
+  async function initialize() {
+    const openedWithInvitation = Invitations.status().phase !== "none";
+    try {
+      bootstrap = await json("/api/bootstrap");
+      serverId = bootstrap.serverId;
+      if (!openedWithInvitation) await Offline.rememberServer(location.origin, serverId);
+    } catch (error) {
+      if (!error.network) throw error;
+      serverId = await Offline.lastServer(location.origin);
+      if (!serverId) throw new Error("首次使用须连接主机登录；本机没有可解锁的账号。");
+    }
+    window.__profiles = await Offline.profiles(serverId);
+    renderAuth();
+    if (Invitations.status().phase === "active") await inspectInvitation();
+    if ("serviceWorker" in navigator && (location.protocol === "https:" || ["localhost", "127.0.0.1"].includes(location.hostname))) {
+      navigator.serviceWorker.register("/sw.js", { updateViaCache: "none" })
+        .then(watchShellUpdates).catch(error => toast(`无法安装离线网页：${error.message}`));
+    }
+  }
+
+  function invoiceSearch(invoice) {
+    const contract = snapshot.contracts.find(c => c.id === invoice.contractId);
+    return `${invoice.tenant} ${contract?.data.number || ""} ${Reporting.locationsText(invoice.locations)} ${invoice.label} ${Business.lessorText(invoice)} ${Business.ownerText(invoice)}`
+      .toLocaleLowerCase().includes(ui.q.toLocaleLowerCase());
+  }
+  function pendingReviews() {
+    if (!permitted("reviewer") || !snapshot) return [];
+    const queued = new Set((vault?.value?.queue || []).filter(entry => entry.operation.type === "review")
+      .map(entry => entry.operation.payload.applicationId));
+    return snapshot.applications.filter(app => app.status === "pending" &&
+      app.creator !== user.id && !queued.has(app.id));
+  }
+  function myWorkItems() {
+    const drafts = vault.value.drafts;
+    const represented = new Set(drafts.map(draft => draft.sourceApplicationId).filter(Boolean));
+    const returned = snapshot.applications.filter(app => app.creator === user.id &&
+      app.status === "returned" && !represented.has(app.id));
+    return { drafts, returned };
+  }
+  function monthRentInvoices() {
+    return snapshot.invoices.filter(invoice => invoice.status === "active" &&
+      invoice.dueDate.startsWith(ui.month) && invoice.kind === "rent");
+  }
+  function filteredInvoices() {
+    return monthRentInvoices().filter(invoice => invoiceSearch(invoice) &&
+      (ui.invoiceStatus === "collected" ? invoice.paidCents > 0 :
+        ui.invoiceStatus === "outstanding" ? invoice.amountCents > invoice.paidCents :
+          ui.invoiceStatus === "settled" ? invoice.amountCents === invoice.paidCents :
+            ui.invoiceStatus === "overdue" ? invoice.amountCents > invoice.paidCents && invoice.dueDate < snapshot.today :
+              ui.invoiceStatus === "today" ? invoice.amountCents > invoice.paidCents && invoice.dueDate === snapshot.today : true));
+  }
+  function metric(title, cents, detail, target, status = "all", count = false) {
+    return `<button type="button" class="card metric metric-link" data-action="metric" data-target="${target}" data-status="${status}"><span class="metric-label">${html(title)}<span class="metric-icon green">●</span></span><span class="metric-number">${count ? cents : `¥ ${money(cents)}`}</span><span class="metric-foot">${html(detail)} →</span></button>`;
+  }
+  function illustration() {
+    return `<svg class="hero-illustration" viewBox="0 0 260 130" fill="none" aria-hidden="true">
+      <ellipse cx="136" cy="113" rx="107" ry="11" fill="#dce9df"/>
+      <path d="m34 90 71-33 104 35-64 28Z" fill="#c0d8cb"/>
+      <path d="m56 82 33 11V46L56 35Z" fill="#7aa993"/><path d="m89 93 66-30V17L89 46Z" fill="#9fc0ac"/><path d="m56 35 66-30 33 12-66 29Z" fill="#dcece1"/>
+      <path d="m111 97 36 12V68l-36-12Z" fill="#7da995"/><path d="m147 109 63-29V40l-63 28Z" fill="#b1ccbb"/><path d="m111 56 63-28 36 12-63 28Z" fill="#e7f1e7"/>
+      <path d="m96 51 8-4v7l-8 4Zm16-7 8-4v7l-8 4Zm16-7 8-4v7l-8 4Zm16-7 6-3v7l-6 3ZM96 65l8-4v7l-8 4Zm16-7 8-4v7l-8 4Zm16-7 8-4v7l-8 4Zm16-7 6-3v7l-6 3Z" fill="#6d9d89"/>
+      <path d="m154 74 8-4v8l-8 4Zm16-7 8-4v8l-8 4Zm16-7 8-4v8l-8 4ZM154 89l8-4v8l-8 4Zm16-7 8-4v8l-8 4Zm16-7 8-4v8l-8 4Z" fill="#82ab93"/>
+      <path d="M43 108V88m179 12V80" stroke="#7e9d7f" stroke-width="3"/><ellipse cx="43" cy="82" rx="10" ry="16" fill="#a8c59f"/><ellipse cx="222" cy="73" rx="12" ry="19" fill="#b4cca7"/>
+      <path d="m70 48 11 4v6l-11-4Zm0 13 11 4v6l-11-4Zm50 8 14 5v8l-14-5Zm0 15 14 5v8l-14-5Z" fill="#588c77"/>
+      <rect x="175" y="5" width="52" height="23" rx="7" fill="white" opacity=".8"/><circle cx="186" cy="16" r="5" fill="#deeee4"/><path d="m183 16 2 2 4-4" stroke="#75a38c" stroke-width="1.4"/><path d="M197 13h19m-19 6h13" stroke="#bccfc4" stroke-width="2" stroke-linecap="round"/>
+    </svg>`;
+  }
+  function invoiceRows(items) {
+    return table(["承租方 / 位置", "应缴日 / 租期", "应收 / 已收 / 未收", "状态 / 操作"], items.map(inv =>
+      `<tr data-invoice-id="${html(inv.id)}"><td>${link(inv.tenant, "contract-detail", `data-id="${html(inv.contractId)}"`)}<small>${html(Reporting.locationsText(inv.locations))}</small></td>
+        <td>${html(inv.dueDate)}<small>${html(inv.periodStart)} — ${html(inv.periodEnd)} · ${html(inv.label)}</small></td>
+        <td>¥ ${money(inv.amountCents)}<small>已收 ¥ ${money(inv.paidCents)} / 未收 ¥ ${money(inv.amountCents - inv.paidCents)}</small></td>
+        <td>${html(inv.amountCents === inv.paidCents ? "已收齐" : inv.dueDate < snapshot.today ? "到期未收齐" : "尚未收齐")}
+          ${permitted("operator") && inv.amountCents > inv.paidCents ? button("登记收款", "start-action", `data-kind="payment" data-id="${html(inv.id)}"`, "small") : ""}
+          ${button("明细", "invoice-detail", `data-id="${html(inv.id)}"`, "small")}</td></tr>`));
+  }
+  function dashboard() {
+    const month = monthRentInvoices(), invoices = filteredInvoices();
+    const total = month.reduce((sum, item) => sum + item.amountCents, 0);
+    const paid = month.reduce((sum, item) => sum + item.paidCents, 0);
+    const review = pendingReviews(), { drafts, returned } = myWorkItems();
+    const settled = month.filter(item => item.amountCents === item.paidCents).length;
+    const overdue = month.filter(item => item.amountCents > item.paidCents && item.dueDate < snapshot.today).length;
+    const rate = total ? Math.min(100, Math.round(paid / total * 100)) : 0;
+    const actions = permitted("operator") ? button("录入新合同", "new-contract", "", "primary") : "";
+    return `${heading("我的工作台", `${ui.month} · 租金按实际应缴日统计；只有已审批的数据计入金额。`, actions)}
+      <section class="hero"><div><div class="eyebrow">租赁工作空间</div><h2>每笔应收，都有明确的租期与依据</h2>
+        <p>${html(user.displayName)}，${html(scoped())}。审核前的草稿、请求和排队任务不改变正式账目。</p>
+        <p class="hero-date">主机业务日期 ${html(snapshot.today)} ${online ? "" : "· 离线数据可能已过时"}</p></div>
+        ${illustration()}</section>
+      ${!canViewBusiness() ? `<section class="card card-pad">
+        ${note("请先邀请经办和另一名复核。员工按岗位处理全部园区，不能审批自己的申请；系统管理员不自动获得业务权限。", "warning")}
+        ${permitted("admin") && online ? button("立即创建经办 / 复核账号", "navigate", 'data-route="admin"', "primary") : ""}
+        </section>` :
+        `<div class="metrics-grid">
+          ${metric("本月租金应收", total, "点击查看本月应收", "invoices")}
+          ${metric("本月租金已收", paid, "已收含经复核期初已收和提前收款", "reports", "collected")}
+          ${metric("本月租金未收", total - paid, "点击直达未收清单", "invoices", "outstanding")}
+          ${permitted("reviewer") ? metric("待我复核", review.length, "仅他人提交、且未在本机排队决定", "review", "pending", true) :
+            permitted("operator") ? metric("我的待处理", drafts.length + returned.length,
+              `${drafts.length} 份草稿 · ${returned.length} 份退回待改`, "my-work", "all", true) : ""}
+        </div>
+        <div class="dashboard-grid"><section class="card"><div class="card-header"><div><h3>${html(ui.month)} 应缴租金</h3><p>本月完整汇总不受下方筛选或搜索影响；整笔期次只计一次。</p></div>${link("查看完整报表", "navigate", 'data-route="reports"')}</div>
+          <div class="collection-toolbar"><div class="segmented">${[
+            ["all", "全部"], ["today", "今日应收"], ["overdue", "到期未收"], ["settled", "已收齐"], ["outstanding", "尚未收齐"],
+          ].map(([key, label]) => `<button type="button" data-action="invoice-filter" data-value="${key}"
+            class="${ui.invoiceStatus === key ? "active" : ""}">${label}</button>`).join("")}</div>
+            <span class="compact-total">匹配 ${invoices.length} 笔 · 全月 ${month.length} 笔</span></div>
+          ${invoiceRows(invoices.slice(0, 7))}
+          <div class="table-footer"><span>仅正式已审批应收与已收；期初已收不计入现金到账月。</span>
+            <span>${invoices.length > 7 ? `只显示前 7 / ${invoices.length} 笔 · 完整列表见报表` : `共 ${invoices.length} 笔`}</span></div>
+        </section><aside class="side-stack"><section class="card card-pad"><h3>我的任务</h3>
+          <div class="stack top-gap">
+            ${permitted("operator") ? link(`我的待处理 ${drafts.length + returned.length} 件（草稿 ${drafts.length} · 退回 ${returned.length}）`,
+              "navigate", 'data-route="my-work"') : ""}
+            ${permitted("reviewer") ? link(`待我复核 ${review.length} 件`, "navigate", 'data-route="review" data-review-filter="pending"') : ""}
+            ${link(`待同步 ${vault.value.queue.length} 件`, "navigate", 'data-route="sync"')}
+          </div><hr><p class="hint">合同 → 审核 → 应收 → 收款登记 → 异人复核。点击租户进入合同详情及版本历史。</p></section>
+          <section class="card card-pad"><h3>本月收租进度</h3>
+            <button type="button" class="progress-ring" data-progress="${rate}" data-action="metric"
+              data-target="invoices" data-status="all" aria-label="查看本月全部应缴租金"><span><strong>${rate}%</strong><small>已收 / 应收</small></span></button>
+            <div class="progress-legend"><button type="button" data-action="metric" data-target="invoices" data-status="settled">已收齐<strong>${settled} 笔 →</strong></button>
+              <button type="button" data-action="metric" data-target="invoices" data-status="outstanding">尚未收齐<strong>${month.length - settled} 笔 →</strong></button></div>
+            <p class="hint top-gap">${overdue} 笔已过应缴日；点击分组进入本月明细。</p></section>
+        </aside></div>`}`;
+  }
+  function myWork() {
+    const { drafts, returned } = myWorkItems();
+    return `${heading("我的待处理", "继续填写本机草稿和修改退回申请；已由草稿承接的退回申请只算一次。")}
+      <div class="stack">
+        <section class="card card-pad"><h3>继续填写 · ${drafts.length} 份</h3>${drafts.length ?
+          drafts.map(draft => `<div class="list-row"><div><strong>${html(draft.data.tenant || "承租方待填")}</strong>
+            <small>${html(draft.data.number || "未编号合同")} · ${html(draft.updatedAt)} · 本机加密草稿</small></div>
+            ${button("继续填写", "edit-draft", `data-id="${html(draft.id)}"`, "small")}</div>`).join("") :
+            `<p class="hint">暂无草稿；可从合同台账录入新合同。</p>`}</section>
+        <section class="card card-pad"><h3>退回待改 · ${returned.length} 件</h3>${returned.length ?
+          returned.map(app => `<div class="list-row"><div><strong>${html(applicationTitle(app))}</strong>
+            <small>${html(kindNames[app.kind] || app.kind)} · ${html(app.reviewReason || "请核对退回意见。")}</small></div>
+            ${button("查看并修改", "application-detail", `data-id="${html(app.id)}"`, "small")}</div>`).join("") :
+            `<p class="hint">暂无未由草稿承接的退回申请。</p>`}</section></div>`;
+  }
+  function contracts() {
+    const contracts = snapshot.contracts.filter(c => (ui.contractStatus === "all" || c.status === ui.contractStatus) &&
+      `${c.data.number} ${c.data.tenant} ${Reporting.locationsText(c.data.locations)} ${Business.lessorText(c.data)} ${Business.ownerText(c.data)}`.toLocaleLowerCase().includes(ui.q.toLocaleLowerCase()));
+    const drafts = vault.value.drafts;
+    return `${heading("合同台账", "查看已审批合同；草稿和审批中的申请单独列出。",
+      permitted("operator") ? button("录入新合同", "new-contract", "", "primary") : "")}
+      ${permitted("operator") ? `<section class="card card-pad"><h3>我的草稿 · ${drafts.length}</h3>${drafts.length ?
+        drafts.map(d => `<div class="list-row"><div><strong>${html(d.data.number || "未编号合同")}</strong><small>${html(d.data.tenant || "承租方待填")} · ${html(d.updatedAt)}</small></div>${button("继续录入", "edit-draft", `data-id="${html(d.id)}"`, "small")}</div>`).join("") :
+        `<p class="hint">还没有草稿；从右上方开始录入真实合同。</p>`}</section>` : ""}
+      <section class="card card-pad"><div class="toolbar">${select("合同状态", "contract-filter",
+        [["active", "执行中"], ["terminated", "已终止"], ["void", "已作废"], ["all", "全部"]], ui.contractStatus, 'data-filter="contractStatus"')}
+        ${button("查看审批申请", "navigate", 'data-route="review"')}</div>
+      ${contracts.length ? table(["合同 / 承租方", "出租方 / 租金口径", "出租位置", "原租期 / 开始管账", "状态 / 操作"], contracts.map(c =>
+        `<tr data-contract-id="${html(c.id)}"><td>${link(c.data.number, "contract-detail", `data-id="${html(c.id)}"`)}<small>${html(c.data.tenant)}</small></td>
+         <td>${html(Business.lessorText(c.data))}<small>租金：${html(Business.rentTaxText(c.data))}</small></td>
+         <td>${html(Reporting.locationsText(c.data.locations))}</td><td>${html(c.data.startDate)} — ${html(c.data.endDate)}
+         <small>管账 ${html(c.data.managementStartDate)}</small></td><td>${html(contractStates[c.status] || c.status)}
+         ${button("详情与历史", "contract-detail", `data-id="${html(c.id)}"`, "small")}</td></tr>`)) :
+        empty("尚无正式合同", permitted("admin") ? "先邀请经办和复核，再录入合同。" : "经办人员录入原件，异人复核通过后才会进入台账。")}</section>`;
+  }
+  function attachmentLink(file) {
+    return `<button type="button" class="text-button" data-action="view-file" data-id="${html(file.id)}" data-name="${html(file.name)}">${html(file.name)} · ${Math.ceil(file.size / 1024)} 千字节 →</button>`;
+  }
+  function metadataFacts(data, invoice = false) {
+    const tax = invoice && data.kind !== "rent" ? "不适用（非租金）" : Business.rentTaxText(data);
+    return `<dl class="contract-metadata"><div><dt>出租方签约主体</dt><dd>${html(Business.lessorText(data))}</dd></div>
+      <div><dt>租金含税口径</dt><dd>${html(tax)}</dd></div>
+      <div><dt>产权主体</dt><dd>${html(Business.ownerText(data))}</dd></div></dl>
+      ${!data.lessorId || !data.rentTaxMode ? `<p class="hint">未录入的内容不会自动推断；提交新申请或合同变更时须明确补齐。</p>` : ""}`;
+  }
+  function contractDetail(id) {
+    const c = snapshot.contracts.find(value => value.id === id);
+    if (!c) return empty("找不到该合同", "权限或合同状态可能已更新，请同步主机。");
+    const d = c.data;
+    const invoices = snapshot.invoices.filter(inv => inv.contractId === id);
+    return `${heading(d.number, `${d.tenant} · ${d.startDate} — ${d.endDate} · 从 ${d.managementStartDate} 开始记账`)}
+      <div class="split"><section class="card card-pad"><h3>合同事实与原始文件</h3>
+        ${metadataFacts(d)}
+        <p>${html(d.tenantType === "company" ? "企业" : "个人")} · 联系人 ${html(d.contact)} · 电话 ${html(d.phone)}</p>
+        <p>${html(Reporting.locationsText(d.locations))}</p><p>租金 ¥ ${html(d.amount)} / ${d.amountBasis === "month" ? "月" : "期"} · ${d.cycleMonths} 月一缴 · ${html(d.anchor === "calendar" ? "自然周期" : "起租日滚动")}</p>
+        <p>提前 ${d.advanceMonths} 月 · 每月 ${d.dueDay} 日应缴 · ${d.freeEnabled ? `${html(d.freeStart)} — ${html(d.freeEnd)} 免租` : "无免租"}</p>
+        <p>${html(d.notes)}</p><h4 class="section-title">上传原件</h4>${d.attachments.map(attachmentLink).join("<br>") || "无"}
+        <h4 class="section-title">版本记录（原版不覆盖）</h4>${c.versions.map(v =>
+          `<div class="mini-card">版本 ${v.version} · ${html(v.at)} · ${html(snapshot.people[v.actor]?.name || v.actor)} · ${html(v.reason)}
+           ${button("查看版本资料", "version-detail", `data-id="${html(id)}" data-version="${v.version}"`, "small")}</div>`).join("")}
+      </section><section class="card card-pad"><h3>正式应收 · 包括历史欠款</h3>
+        ${invoices.map(inv => `<div class="mini-card">${html(inv.label)} ${html(inv.periodStart)} — ${html(inv.periodEnd)}
+          <p>应缴 ${html(inv.dueDate)} · 应收 ¥ ${money(inv.amountCents)} · 已收 ¥ ${money(inv.paidCents)}
+          （期初已收 ¥ ${money(inv.openingPaidCents)}）· ${html(invoiceStates[inv.status] || inv.status)}</p>
+          ${button("应收及收款明细", "invoice-detail", `data-id="${html(inv.id)}"`, "small")}</div>`).join("") || empty("暂无正式应收", "请查看审核结果。")}
+      </section></div>${permitted("operator") ? `<section class="card card-pad"><h3>发起后续业务 · 均须异人复核</h3><div class="button-row">
+        ${button("续租新合同", "renew", `data-id="${html(id)}"`)}
+        ${button("合同变更", "change-contract", `data-id="${html(id)}"`)}
+        ${button("提前终止", "start-action", `data-kind="termination" data-id="${html(id)}"`)}
+        ${button("作废合同", "start-action", `data-kind="contract-void" data-id="${html(id)}"`)}
+        ${button("补登历史欠款", "start-action", `data-kind="opening-balance" data-id="${html(id)}"`)}</div></section>` : ""}`;
+  }
+  function invoiceDetail(id) {
+    const inv = snapshot.invoices.find(item => item.id === id);
+    if (!inv) throw new Error("应收项目不可见或已撤销。");
+    const payments = snapshot.payments.filter(p => p.invoiceId === id);
+    const refunds = snapshot.refunds.filter(r => r.invoiceId === id);
+    openModal(`应收详情 · ${inv.tenant}`, `<p>${html(inv.label)} · ${html(inv.periodStart)} — ${html(inv.periodEnd)}</p>
+      ${metadataFacts(inv, true)}
+      <p>实际应缴 ${html(inv.dueDate)} · 正式应收 ¥ ${money(inv.amountCents)} · 已收 ¥ ${money(inv.paidCents)} · 未收 ¥ ${money(inv.amountCents - inv.paidCents)}</p>
+      <p>经复核的期初已收 ¥ ${money(inv.openingPaidCents)}；这不是当月现金到账记录。</p>
+      <p>状态 ${html(invoiceStates[inv.status] || inv.status)} ${inv.manual ? "· 人工核定" : ""} · ${html(inv.reason)}</p>
+      <h3>已审核收款与退款</h3>${payments.map(p => `<div class="mini-card">${html(p.payDate)} 收款 ¥ ${money(p.amountCents)} · ${html(p.method)} · ${html(p.status === "active" ? "有效" : "已撤销")}
+        ${p.attachments.map(attachmentLink).join(" ")} ${permitted("operator") && p.status === "active" ?
+          button("撤销此收款", "start-action", `data-kind="payment-void" data-id="${html(p.id)}"`, "small") : ""}</div>`).join("")}
+      ${refunds.map(r => `<div class="mini-card">${html(r.refundDate)} 退款 ¥ ${money(r.amountCents)} · ${html(r.effect === "reopen" ? "重开未收" : "减少应收")} · ${html(r.reason)}</div>`).join("")}
+      <div class="button-row">${permitted("operator") ? [
+        button("登记收款", "start-action", `data-kind="payment" data-id="${html(id)}"`),
+        button("退款", "start-action", `data-kind="refund" data-id="${html(id)}"`),
+        button("调整应收", "start-action", `data-kind="invoice-adjustment" data-id="${html(id)}"`),
+      ].join("") : ""}</div>`, button("关闭", "close-modal"));
+  }
+
+  function contractParks() {
+    return snapshot.parkDirectory?.filter(entry => user.allParks || user.parks.includes(entry.name)) ||
+      [...new Set([...snapshot.parks, ...user.parks])].map(name => ({ name, legacy: true }));
+  }
+  function blankContract(source = null) {
+    const choices = contractParks();
+    return source ? { rentTaxMode: "", lessorId: "", lessorOtherName: "", propertyOwner: "", ...clone(source) } : {
+      number: "", tenantType: "company", tenant: "", contact: "", phone: "",
+      rentTaxMode: "", lessorId: "", lessorOtherName: "", propertyOwner: "",
+      startDate: "", endDate: "", managementStartDate: snapshot.settings.accountingStartDate,
+      locations: [{ park: choices.length === 1 ? choices[0].name : "",
+        building: "", floor: "", zone: "", area: "", allocatedRent: "" }],
+      amount: "", amountBasis: "month", cycleMonths: 1, anchor: "anniversary",
+      advanceMonths: 0, dueDay: 1, fees: [], freeEnabled: false, freeStart: "", freeEnd: "",
+      notes: "", overrides: {}, attachments: [], openingPayments: [],
+    };
+  }
+  async function editContract(source = null, details = {}) {
+    const editor = { id: Offline.id(), data: blankContract(source),
+      opening: Object.fromEntries((source?.openingPayments || []).map(entry =>
+        [entry.rowId, { paid: yuan(entry.paidCents), reason: entry.reason }])), updatedAt: now(), ...details };
+    await navigate("wizard", { editor, step: 0, preview: null, editorDirty: true });
+    await saveEditor();
+  }
+  function amendmentContext(contractId, effectiveDate) {
+    const contract = snapshot.contracts.find(item => item.id === contractId);
+    return { contract, effectiveDate,
+      invoices: snapshot.invoices.filter(item => item.contractId === contractId && item.status === "active") };
+  }
+  function schedule() {
+    if (!ui.editor) return null;
+    const d = ui.editor.data;
+    const invalid = [];
+    d.openingPayments = [];
+    for (const [rowId, entry] of Object.entries(ui.editor.opening)) {
+      if (entry.paid === "" || !entry.reason.trim()) continue;
+      try { d.openingPayments.push({ rowId, paidCents: Domain.parseMoney(entry.paid), reason: entry.reason.trim() }); }
+      catch (error) {
+        if (!(error instanceof Domain.MoneyValidationError)) throw error;
+        invalid.push({ rowId, message: error.message });
+      }
+    }
+    const result = Business.previewContract(d, ui.editor.changeContractId
+      ? { amendment: amendmentContext(ui.editor.changeContractId, ui.editor.effectiveDate) } : {});
+    for (const error of invalid) {
+      const row = result.rows.find(item => item.id === error.rowId);
+      result.errors.push(`${row ? Business.rowTitle(row) : "已有收款"}：${error.message}`);
+    }
+    return result;
+  }
+  async function saveEditor() {
+    if (!ui.editor || !ui.editorDirty) return;
+    const startedIn = workspaceEpoch;
+    const sequence = ui.editorSequence;
+    const editor = clone(ui.editor);
+    editor.updatedAt = now();
+    await saveVault(state => {
+      const index = state.drafts.findIndex(item => item.id === editor.id);
+      if (index < 0) state.drafts.push(editor);
+      else state.drafts[index] = editor;
+    });
+    assertWorkspace(startedIn);
+    if (!ui.editor || ui.editor.id !== editor.id) return;
+    ui.editor.updatedAt = editor.updatedAt;
+    if (sequence === ui.editorSequence) ui.editorDirty = false;
+    const label = document.getElementById("draft-status");
+    if (label) label.textContent = `已加密保存 ${new Date(editor.updatedAt).toLocaleTimeString("zh-CN")}`;
+  }
+  function saveSoon() {
+    ui.editorDirty = true;
+    ui.editorSequence += 1;
+    const label = document.getElementById("draft-status");
+    if (label) label.textContent = "尚未保存 · 正在加密";
+    clearTimeout(pendingSave);
+    pendingSave = setTimeout(() => {
+      pendingSave = null;
+      saveEditor().catch(showError);
+    }, 450);
+  }
+  function editorPart() {
+    if (ui.step === 3) ui.preview = schedule();
+    return ContractForm.render(ui.editor, ui.step, ui.preview, attachmentLink, contractParks());
+  }
+  function wizard() {
+    if (!ui.editor) return contracts();
+    const steps = ["合同双方", "租期和位置", "租金怎么交", "确认收租计划"];
+    return `${heading(ui.editor.changeContractId ? "变更合同" : ui.editor.data.renewalOf ? "续租合同录入" : "录入合同",
+      "先填必需资料，选填内容按需展开。草稿自动保存在这台电脑，提交后由财务审核。")}
+      <div class="steps">${steps.map((title, i) => `<span class="step ${ui.step === i ? "active" : i < ui.step ? "complete" : ""}">
+        <span class="step-number">${i + 1}</span><span class="step-name">${title}</span></span>`).join("")}</div>
+      ${ui.editor.changeContractId ? `<div class="notice warning">合同变更：仅允许在明确生效日的整期边界替换未结清未来期次；如有财务歧义，主机将返回具体错误，旧版本不会被覆盖。</div>
+        <div class="field">${field("变更生效日（须在期次边界）*", "effectiveDate", ui.editor.effectiveDate || "", "date", 'data-effective="1" required')}</div>` : ""}
+      <section class="card wizard-form-card">${editorPart()}</section>
+      <div class="wizard-footer"><div><span class="hint">第 ${ui.step + 1} / 4 步</span>
+        <p class="hint" id="draft-status">${ui.editorDirty ? "尚未保存" : `已保存到本机 ${new Date(ui.editor.updatedAt).toLocaleTimeString("zh-CN")}`}</p></div><div class="button-row">
+        ${button("保存草稿", "save-draft")}${ui.step ? button("上一步", "wizard-back") : ""}
+        ${ui.step < 3 ? button("下一步", "wizard-next", "", "primary") :
+          button(ui.editor.sourceApplicationId ? "重新提交" : "提交审核", "submit-contract", "", "primary")}</div></div>`;
+  }
+
+  function applicationTitle(app) {
+    const p = app.payload;
+    const contract = snapshot.contracts.find(c => c.id === p.contractId);
+    const invoice = snapshot.invoices.find(i => i.id === p.invoiceId);
+    return p.data?.tenant || invoice?.tenant || contract?.data.tenant || app.number || app.id;
+  }
+  function myApplication(app) { return app.creator === user.id; }
+  function applications() {
+    const reviewIds = new Set(pendingReviews().map(app => app.id));
+    const entries = snapshot.applications.filter(app =>
+      (ui.reviewStatus === "mine" ? myApplication(app) :
+        ui.reviewStatus === "pending" ? reviewIds.has(app.id) :
+          ui.reviewStatus === "returned" ? app.status === "returned" && myApplication(app) : true) &&
+      `${app.number} ${app.payload.data?.number || ""} ${applicationTitle(app)} ${kindNames[app.kind]} ${Business.lessorText(app.payload.data)}`.toLocaleLowerCase().includes(ui.q.toLocaleLowerCase()));
+    return `${heading("财务审核与申请", "对照原件核验，只能复核其他人提交的申请。")}
+      <div class="card card-pad"><div class="tabs">${[
+        ...(permitted("reviewer") ? [["pending", "待我复核"]] : []),
+        ["mine", "我的申请"], ["returned", "退回待修改"], ["all", "全部可见"],
+      ].map(([key, name]) =>
+        `<button type="button" data-action="review-filter" data-value="${key}" class="${ui.reviewStatus === key ? "active" : ""}">${name}</button>`).join("")}</div>
+      ${vault.value.queue.some(entry => entry.operation.type === "review") ?
+        note("本机已有排队中的审核决定；这些申请暂不列入待我复核，正式状态仍以主机同步为准。", "warning") : ""}
+      ${entries.length ? table(["申请 / 类型", "提交人 / 时间", "审核状态 / 版本", "操作"], entries.map(app =>
+        `<tr data-application-id="${html(app.id)}"><td>${link(applicationTitle(app), "application-detail", `data-id="${html(app.id)}"`)}
+          <small>${html(kindNames[app.kind] || app.kind)} · ${html(app.payload.data?.number || app.number)} · 申请 ${html(app.number)}</small></td>
+          <td>${html(snapshot.people[app.creator]?.name || app.creator)}<small>${html(app.submittedAt)}</small></td>
+          <td>${html(appStates[app.status] || app.status)}
+            <small>版本 ${app.version} · ${html(app.reviewReason || "")}</small></td>
+          <td>${button("核对详情", "application-detail", `data-id="${html(app.id)}"`, "small")}</td></tr>`)) :
+        empty("暂无此类申请", ui.reviewStatus === "pending" ? "自己提交的申请不能自己复核；仅列出可审他人任务。" : "新提交的申请将在这里保留版本及审核轨迹。")}</div>
+      ${vault.value.queue.length ? `<section class="card card-pad"><h3>本机待同步 · 尚未进入主机审核队列</h3>${queueList()}</section>` : ""}`;
+  }
+  function payloadFacts(app) {
+    const p = app.payload;
+    if (p.data) {
+      const d = p.data;
+      let preview;
+      try { preview = Business.previewContract(d, { requireMetadata: false,
+        ...(app.kind === "contract-change" ? { amendment: amendmentContext(p.contractId, p.effectiveDate) } : {}) }); }
+      catch (error) { preview = { rows: [], errors: [error.message] }; }
+      return `<h3>${html(d.number)} · ${html(d.tenant)}</h3>
+        ${metadataFacts(d)}
+        <p>原始租期 ${html(d.startDate)} — ${html(d.endDate)} · 开始管账 ${html(d.managementStartDate)} ·
+          ¥ ${html(d.amount)} / ${d.amountBasis === "month" ? "月" : "期"}</p>
+        <p>位置：${html(Reporting.locationsText(d.locations))}</p>
+        <p>周期 ${html(d.cycleMonths)} 月 · ${html(d.anchor === "calendar" ? "按自然周期" : "按起租日滚动")} · 提前 ${html(d.advanceMonths)} 月 · 缴付日 ${html(d.dueDay)}</p>
+        ${p.effectiveDate ? `<p>变更生效日：${html(p.effectiveDate)}；下方只列本次新计划，生效日前正式账目保持原样。</p>` : ""}
+        <p>${html(d.notes)}</p><h4>收租计划</h4>${preview.errors.length ? note(preview.errors.join("；"), "danger") : ""}
+        ${table(["费用和对应租期", "应交日期", "应交金额", "开始记账前已收"], preview.rows.map(row =>
+          `<tr>${cell(Business.rowTitle(row))}${cell(row.dueDate || "待确认")}
+            ${cell(`¥ ${money(row.amountCents)} ${row.manual ? "人工核定：" + row.reason : ""}`)}
+            ${cell(d.openingPayments.find(op => op.rowId === row.id) ?
+              `¥ ${money(d.openingPayments.find(op => op.rowId === row.id).paidCents)} · ${d.openingPayments.find(op => op.rowId === row.id).reason}` : row.needsOpening ? "未确认" : "不适用")}</tr>`))}`;
+    }
+    const labels = { contractId: "关联合同", invoiceId: "关联应收", paymentId: "关联收款",
+      expectedVersion: "目标正式版本", amountCents: "申请金额", payDate: "实际到账日",
+      refundDate: "实际退款日", dueDate: "调整后应缴日", method: "收款方式",
+      note: "登记备注", effect: "退款对账务的影响", terminationDate: "终止日期",
+      kind: "费用类别", label: "费用名称", periodStart: "所属期开始",
+      periodEnd: "所属期结束" };
+    const rows = Object.entries(p).filter(([key]) => !["attachments", "adjustments"].includes(key)).map(([key, value]) => {
+      const invoice = key === "invoiceId" ? snapshot.invoices.find(item => item.id === value) : null;
+      const contract = key === "contractId" ? snapshot.contracts.find(item => item.id === value) : null;
+      const payment = key === "paymentId" ? snapshot.payments.find(item => item.id === value) : null;
+      const shown = invoice ? link(`${invoice.tenant} · ${invoice.periodStart} — ${invoice.periodEnd} · 应缴 ${invoice.dueDate}`,
+        "invoice-detail", `data-id="${html(invoice.id)}"`) :
+        contract ? link(`${contract.data.number} · ${contract.data.tenant}`, "contract-detail", `data-id="${html(contract.id)}"`) :
+          payment ? link(`¥ ${money(payment.amountCents)} · 到账 ${payment.payDate}`, "invoice-detail",
+            `data-id="${html(payment.invoiceId)}"`) :
+            html(key === "amountCents" ? `¥ ${money(value)}` :
+              key === "effect" ? value === "reopen" ? "重开未收（只减少已收）" : "减少应收（同时减少应收和已收）" :
+                key === "kind" ? feeNames[value] || value : value);
+      return `<div class="mini-card">${html(labels[key] || key)}：${shown}</div>`;
+    }).join("");
+    const relatedInvoice = snapshot.invoices.find(item => item.id === (p.invoiceId ||
+      snapshot.payments.find(payment => payment.id === p.paymentId)?.invoiceId));
+    const relatedContract = snapshot.contracts.find(item => item.id === p.contractId);
+    return `${relatedInvoice ? metadataFacts(relatedInvoice, true) : relatedContract ?
+      metadataFacts(app.kind === "opening-balance" ? relatedContract.versions[0].data : relatedContract.data) : ""}
+      ${rows}${p.adjustments ? `<h4>逐项终止调整</h4>${p.adjustments.map(a =>
+      `<div class="mini-card">应收 ${html(a.invoiceId)} · 调整后 ¥ ${money(a.amountCents)} · ${html(a.reason)}</div>`).join("")}` : ""}`;
+  }
+  function reviewSources(payload) {
+    const files = payload.data?.attachments || payload.attachments || [];
+    return files.length ? `${files.map(file => `<div class="mini-card">${button(`核对原件：${file.name}`, "inline-file",
+      `data-id="${html(file.id)}" data-name="${html(file.name)}"`, "small")} ${attachmentLink(file)}</div>`).join("")}
+      <div id="review-source-panel" class="source-view"><p class="hint">选择 PDF 或图片后在此与当前字段并排核对；Word 原件请下载人工核对。</p></div>` :
+      `<p>当前申请无新附件；原合同附件请到已审批合同详情查阅。</p>`;
+  }
+  function applicationDetail(id) {
+    const app = snapshot.applications.find(a => a.id === id);
+    if (!app) return empty("申请不可见", "同步后再次查看；也可能超出当前园区授权。");
+    const queuedDecision = vault.value.queue.some(entry => entry.operation.type === "review" &&
+      entry.operation.payload.applicationId === app.id);
+    const canReview = app.status === "pending" && app.creator !== user.id &&
+      permitted("reviewer") && !queuedDecision;
+    const canResubmit = app.status === "returned" && myApplication(app) && permitted("operator");
+    const relatedPayment = snapshot.payments.find(item => item.id === app.payload.paymentId);
+    const relatedInvoice = snapshot.invoices.find(item => item.id === (app.payload.invoiceId || relatedPayment?.invoiceId));
+    const relatedContractId = app.payload.contractId || relatedInvoice?.contractId;
+    const reviewVersion = `data-id="${html(app.id)}" data-version="${app.version}"`;
+    return `${heading(`${kindNames[app.kind] || app.kind} · ${app.number}`,
+      `版本 ${app.version} · 提交 ${app.submittedAt} · ${appStates[app.status] || app.status} · 创建人 ${snapshot.people[app.creator]?.name || app.creator}`)}
+      ${app.status === "returned" ? note(`退回原因：${app.reviewReason || "未注明"}。重新提交必须使用当前申请版本，旧申请记录保留。`, "warning") : ""}
+      <div class="split"><section class="card card-pad"><h3>合同原件与版本</h3>
+        ${reviewSources(app.payload)}<p class="hint">PDF 与图片查看已授权原始字节；Word 仅下载，不伪造预览。</p>
+        ${relatedContractId ? link("查看正式合同、合同原件及旧版本", "contract-detail", `data-id="${html(relatedContractId)}"`) : ""}
+        <h4 class="section-title">审核轨迹</h4>${app.trail.map(entry =>
+          `<div class="mini-card">${html(entry.at)} · ${html(auditNames[entry.action] || entry.action)} · ${html(snapshot.people[entry.actor]?.name || entry.actor)}
+            <p>${html(entry.detail)}</p></div>`).join("")}
+        <h4 class="section-title">历史申请版本</h4>${app.versions.map(v =>
+          `<div class="mini-card">版本 ${v.version} · ${html(v.at)} ${button("查看历史值", "app-version", `data-id="${html(app.id)}" data-version="${v.version}"`, "small")}</div>`).join("")}
+      </section><section class="card card-pad"><h3>当前提交版本 · 核对字段</h3><p>申请原因：${html(app.reason)}</p>
+        ${payloadFacts(app)}${canReview ? `<div class="mini-card"><h4>复核清单（请逐项检查）</h4>
+          <p class="hint">审核期间不会自动重绘本页。未提交的勾选和意见仅保留在本页；更新或退出前，请先完成审核，或复制意见后返回申请清单。</p>
+          ${["原件、出租方主体及租金含税口径与录入字段一致", "承租方、园区权限与原租期正确",
+            "应缴日期、期初已收依据和资金影响已核对"].map((text, index) =>
+              `<label class="file-choice"><input type="checkbox" class="review-check" id="review-check-${index}"> ${html(text)}</label>`).join("")}
+          <div class="field"><label for="review-reason">审核意见（退回必填）</label><textarea id="review-reason" rows="3"></textarea></div>
+          <div class="button-row">${button("退回修改", "review-decision", `${reviewVersion} data-decision="return"`, "danger")}
+            ${button("核准此版本", "review-decision", `${reviewVersion} data-decision="approve"`, "primary")}</div>
+          </div>` : ""}
+        ${app.status === "pending" && permitted("reviewer") && !online ? note("离线可核对已缓存的申请及原件并保存复核意见；仅为本机待同步操作，重连后须由主机重新核验版本、权限和非本人审批关系才正式生效。未缓存原件需联网取得。", "warning") : ""}
+        ${queuedDecision ? note("本机对此申请已有待同步或待解决的审核决定；请到本机工作查看队列，不可重复提交。", "warning") : ""}
+        ${canResubmit ? button("按退回意见修改并重报", "resubmit", `data-id="${html(id)}"`, "primary") : ""}
+      </section></div>`;
+  }
+  function queueList() {
+    const actionNames = { submit: "提交申请", resubmit: "修改后重报", review: "审核意见" };
+    return vault.value.queue.map(entry => `<div class="list-row"><div><strong>${html(actionNames[entry.operation.type] || "业务操作")} ·
+      ${html(kindNames[entry.operation.payload.kind] || "待主机确认")}</strong>
+      <small>${html(new Date(entry.operation.clientTime).toLocaleString("zh-CN"))} · ${entry.error ?
+        `需要处理：${html(entry.error)}` : "尚未同步，未生效"}</small>
+      <details class="technical-note"><summary>操作编号</summary>${html(entry.operation.operationId)}</details></div>
+      ${entry.error ? `${button(entry.operation.type === "review" ? "重新核对当前版本" : "复制内容作为新申请",
+        entry.operation.type === "review" ? "reopen-review" : "resolve-queue",
+        `data-id="${html(entry.operation.operationId)}"`, "small")}
+        ${button("存档拒绝请求", "archive-queue", `data-id="${html(entry.operation.operationId)}"`, "small")}` : ""}</div>`).join("");
+  }
+  async function verifiedImportAccount() {
+    if (!online) throw new Error("导入必须先在新地址在线登录同一主机、同一账号，不能仅凭离线缓存验证身份。");
+    const identity = await json("/api/me");
+    if (identity.serverId !== serverId || identity.user.id !== user.id) {
+      lock("主机或登录账号已经改变；没有导入任何本机数据，请重新登录对应身份。");
+      throw new Error("当前在线主机或账号与工作区不一致，导入已中止。");
+    }
+    csrf = identity.csrfToken;
+  }
+  async function exportLocalWork() {
+    const form = document.getElementById("export-work-form");
+    if (!form.reportValidity()) return;
+    const password = form.elements.transferPassword.value;
+    if (password !== form.elements.confirmTransferPassword.value) throw new Error("两次输入的迁移密码不同；文件未生成。");
+    if (ui.editorDirty) await saveEditor();
+    const bundle = await vault.exportTransfer(password);
+    const file = new Blob([JSON.stringify(bundle)], { type: "application/octet-stream" });
+    await saveDownload(file, `rent-work-${serverId.slice(0, 8)}-${new Date().toISOString().slice(0, 10)}.rent-work`);
+    closeModal();
+    toast(nativeMode ? "加密迁移文件已完整保存到安卓应用私有文件，请另存到安全位置并保管迁移密码。" :
+      "浏览器已开始下载加密迁移文件；确认下载完毕并保管迁移密码，再切换地址或电脑。");
+  }
+  async function inspectLocalWork() {
+    await verifiedImportAccount();
+    const form = document.getElementById("import-work-form");
+    if (!form.reportValidity()) return;
+    const file = form.elements.transferFile.files[0];
+    if (!file || file.size > 512 * 1024 * 1024) throw new Error("迁移文件未选择或超过 512 MiB，未写入本机。");
+    let transfer;
+    try { transfer = JSON.parse(await file.text()); }
+    catch (error) {
+      if (error instanceof SyntaxError) throw new Error("文件不是有效的加密迁移格式，未写入本机。");
+      throw error;
+    }
+    const incoming = await vault.openTransfer(transfer, form.elements.transferPassword.value);
+    const plan = Offline.planTransfer(vault.value, incoming);
+    ui.importBundle = incoming;
+    ui.importPlan = plan;
+    ui.importRevision = vault.revision;
+    openModal("检查迁入内容与冲突", `<p>文件来自 ${html(new Date(transfer.exportedAt).toLocaleString("zh-CN"))}；
+      已验证主机与当前登录账号一致。原浏览器下载的迁移文件仍须留存，直到本次同步完成。</p>
+      ${note("仅迁入本机工作；当前主机快照、用户权限及最近成功同步时间均不以迁移文件替换。队列先暂停，核对后由您手动点击同步；主机会逐条检查版本与权限。", "warning")}
+      <p>文件中：草稿 ${plan.drafts} · 待同步 ${plan.queue} · 已拒记录 ${plan.rejected} · 加密原件 ${plan.files}；
+        同标识但不同内容的草稿将另存 ${plan.draftCopies} 份，不覆盖现有草稿。</p>
+      ${plan.conflicts.length ? `<div class="notice danger"><div><strong>存在 ${plan.conflicts.length} 项冲突</strong>
+        ${plan.conflicts.map(item => `<p>${html(item)}</p>`).join("")}
+        <p>若继续，只保留本机冲突项，跳过对应迁入请求/草稿和相冲突的原件；跳过的原件与请求仍在原加密迁移文件中。请先保存文件并逐项核对。</p></div></div>` :
+        note("没有同标识冲突；与本机相同的请求仅保留一份，幂等标识与上传编号不变。")}
+      <label class="file-choice"><input id="import-reviewed" type="checkbox"> 我已核对账号、文件份数、冲突及队列暂停说明</label>`,
+    `${button("取消导入", "close-modal")}${button(plan.conflicts.length ?
+      "保留本机冲突项，导入其余工作" : "导入并暂停待同步请求", "apply-local-work",
+    plan.conflicts.length ? 'data-skip-conflicts="true"' : "", "primary")}`, true);
+  }
+  async function applyLocalWork(skipConflicts) {
+    if (!ui.importBundle || !ui.importPlan || !document.getElementById("import-reviewed")?.checked) {
+      throw new Error("请先解密检查迁移文件，并明确勾选核对确认。");
+    }
+    await verifiedImportAccount();
+    if (vault.revision !== ui.importRevision) {
+      throw new Error("另一窗口或自动同步更新了本机工作区；未导入。请重新打开文件检查新的冲突。");
+    }
+    let result;
+    await saveVault(value => {
+      result = Offline.mergeTransfer(value, ui.importBundle, ui.importPlan.conflicts, skipConflicts);
+    });
+    closeModal();
+    chrome(); render();
+    toast(`迁入草稿 ${result.addedDrafts} 份、待同步请求 ${result.addedQueue} 件；
+      跳过冲突 ${result.skipped} 项。正式快照未更改，检查后请手动同步。`);
+  }
+  function syncPage() {
+    const expiry = vault.value.syncedAt && new Date(Date.parse(vault.value.syncedAt) +
+      (snapshot.settings.offlineDays || 7) * 86400000).toLocaleString("zh-CN");
+    return `${heading("本机工作与同步", "断网时先保存在这台电脑，恢复连接后再同步到公司主机。",
+      button("连接主机并同步", "retry", "", "primary"))}
+      <div class="split"><section class="card card-pad"><h3>${online ? "已连接主机" : "当前未连接主机"}</h3>
+        <p>当前页面主机：${html(location.origin)}</p>
+        <p>最近成功同步：${html(vault.value.syncedAt ? new Date(vault.value.syncedAt).toLocaleString("zh-CN") : "暂无")}</p>
+        <p>断网时可用至：${html(expiry || "尚无已保存的资料")}（最多 ${snapshot.settings.offlineDays} 天）</p>
+        <p>本机草稿 ${vault.value.drafts.length} 份 · 尚未同步 ${vault.value.queue.length} 项 · 已保存附件 ${Object.keys(vault.value.files).length} 份</p>
+        ${note("只有这台电脑以前登录并保存过的资料，才能断网使用。新操作先留在本机，联网核对后再提交；未经财务审核不会改变正式金额。")}
+        ${note("本机资料不是公司账本的完整备份。换电脑、换访问地址或清理浏览器前，请先同步或导出未完成的工作。", "warning")}
+        <h4 class="section-title">迁移本机工作</h4><p class="hint">仅导出草稿、待同步及被拒请求、所选/最近原件和上传映射；不导出会话、登录密码或正式快照。文件使用单独的迁移密码加密，请脱机妥善保管并核实下载完成后再改变旧电脑。</p>
+        <div class="button-row">${button("导出加密本机工作", "export-local-work")}${button("导入加密本机工作", "import-local-work", "", "soft")}</div>
+        ${vault.value.importAwaitingReview ? note("迁入的工作暂未发送；请先核对，再点顶部“连接主机并同步”确认发送。", "warning") : ""}
+        ${lastError ? note(`最近错误：${lastError}`, "danger") : ""}
+        <details class="form-section"><summary>离线使用和维护说明</summary><div class="section-content">
+        <p>断网期间收不到新提醒。再次联网时，主机会重新核对身份、园区权限和资料版本；账号被停用后不能继续提交。</p>
+        <p>本机资料由密码加密，保存在当前浏览器中，不在公司主机的数据文件夹里。导出的工作只能交回原账套、原账号，不能导入另一套全新账本。</p>
+        <p>若电脑时间被调回过去，需要先联网重新确认身份；不要通过改时间延长离线使用期限。</p>
+        ${location.protocol === "http:" && !["localhost", "127.0.0.1"].includes(location.hostname) ?
+          note("非安全 HTTP 局域网无法使用 Service Worker 和 Web Crypto 离线能力；网络部署须先配置 HTTPS。", "danger") :
+          note("本机地址或已部署安全证书的地址可离线打开页面；公司财务资料不会以明文保存在网页公共缓存中。")}</div></details></section>
+        <section class="card card-pad"><h3>等待同步的工作</h3>${queueList() || `<p class="hint">目前没有等待同步的操作。未提交的草稿仍保存在这台电脑。</p>`}
+          <p class="hint">冲突请求保留原始请求和错误。复制为新申请不会覆盖主机新版本；核对后可将拒绝请求存档以继续后续同步。</p>
+          ${(vault.value.rejected || []).length ? `<h4 class="section-title">已存档的拒绝请求（加密保留原始载荷）</h4>${vault.value.rejected.map(item =>
+            `<div class="mini-card">${html(item.operation.operationId)} · ${html(item.error)} · ${html(item.archivedAt)}
+              ${button("复制为新申请", "resolve-queue", `data-id="${html(item.operation.operationId)}"`, "small")}</div>`).join("")}` : ""}</section></div>`;
+  }
+  function reports() {
+    if (!canViewBusiness()) return heading("收租报表", "当前账号没有业务查看授权。");
+    const filters = { basis: ui.basis, month: ui.month, kind: ui.kind, status: ui.status, q: ui.q };
+    try { report = Reporting.select(snapshot, filters); } catch (error) { return note(error.message, "danger"); }
+    const totals = report.totals;
+    return `${heading("收租报表", "仅统计主机已经审核的账目；一份合同的多个位置不会重复计费。",
+      user.canExport && online ? `${button("导出表格", "export-xlsx")}${button("打印或保存文档", "export-pdf", "", "primary")}` : "")}
+      <section class="card card-pad"><div class="toolbar">
+        ${select("时间口径", "report-basis", [["due", "实际应缴月份"], ["cash", "实际现金到账 / 退款月份"], ["period", "租期交叠月份"]], ui.basis, 'data-filter="basis"')}
+        ${field("月份", "report-month", ui.month, "month", 'data-filter="month"')}
+        ${select("费用", "report-kind", [["all", "全部"], ...Object.entries(feeNames)], ui.kind, 'data-filter="kind"')}
+        ${select("收款状态", "report-status", [["all", "全部"], ["collected", "已收部分或全部"], ["outstanding", "尚未收齐"], ["settled", "已收齐"]], ui.status, 'data-filter="status"')}
+      </div><p class="hint">${html(report.caption)}</p>
+      <p class="hint">含税口径仅作记录，不自动加减税额；产权主体、签约主体和口径按各期应收形成时的批准资料展示，不按公司名称猜园区。</p>
+      <div class="metrics-grid top-gap">${ui.basis === "cash" ?
+        metric("本月净现金", totals.cashCents, "收款减退款；不包括期初已收", "reports") :
+        `${metric("整笔应收", totals.amountCents, "跨月也只在此口径计一次", "reports")}
+         ${metric("已审核收款", totals.paidCents, "含经审核期初已收", "reports", "collected")}
+         ${metric("尚未收齐", totals.balanceCents, "点击直接筛选未收", "reports", "outstanding")}`}</div>
+      <div class="report-details">${table(report.columns, report.rows.map(row => `<tr>${row.map(cell).join("")}</tr>`))}</div>
+      ${report.rows.length ? `<p class="hint top-gap">明细较宽时可横向滚动，查看产权主体、签约主体与租金含税口径。</p>` : ""}
+      ${!user.canExport ? note("当前账号无导出权限；浏览器中已显示的数据仍可能被复制，不能宣称防止复制。", "neutral") : ""}
+      ${!online && user.canExport ? note("离线不能授权或生成正式导出；请连接主机。", "warning") : ""}</section>`;
+  }
+
+  function notificationsClient() {
+    if (!pushClient) pushClient = RentPush.createClient({
+      request: json, getIdentity: () => user && online && csrf ? { serverId, userId: user.id } : null,
+      isMaintenance: () => updatePaused || !["idle", "failed", "completed"].includes(updateState.maintenance?.phase || "idle"),
+      getRegistration: readyPushRegistration,
+    });
+    return pushClient;
+  }
+  async function readyPushRegistration() {
+    const registration = await navigator.serviceWorker.getRegistration();
+    if (!registration?.active || !registration.pushManager) throw new Error("后台通知组件尚未准备好，请联网重新打开页面后再试。");
+    const channel = new MessageChannel();
+    let timer;
+    try {
+      const info = await new Promise((resolve, reject) => {
+        timer = setTimeout(() => reject(new Error("当前后台组件尚未支持设备通知，请保存工作后按新版提示刷新页面。")), 2500);
+        channel.port1.onmessage = event => resolve(event.data);
+        registration.active.postMessage({ type: "GET_APP_INFO" }, [channel.port2]);
+      });
+      if (info?.version !== CLIENT_VERSION || info.pushProtocol !== 1) {
+        throw new Error("页面和后台通知组件版本不一致，请先保存工作，再按新版提示刷新。");
+      }
+      return registration;
+    } finally {
+      clearTimeout(timer);
+      channel.port1.close(); channel.port2.close();
+    }
+  }
+  async function currentInstallation() {
+    if (desktopClient.enabled) return desktopClient.installationId();
+    return nativeMode ? (await nativeClient.hello()).installationId : notificationsClient().installationId();
+  }
+  async function openDesktopTarget() {
+    if (!user || !snapshot || auth.hidden === false) return;
+    const target = desktopClient.takeTarget();
+    if (!target) return;
+    if (modal.open || ui.editorDirty) { notificationRequested = true; toast("请先完成当前填写，再查看提醒。"); return; }
+    if (target.kind === "application" && snapshot.applications.some(item => item.id === target.id)) {
+      await navigate("application-detail", { appId: target.id });
+    } else if (target.kind === "invoice" && snapshot.invoices.some(item => item.id === target.id)) invoiceDetail(target.id);
+    else document.querySelector('[data-action="notifications"]').click();
+  }
+  function devicePage() {
+    const preference = `<section class="card card-pad"><h2>我的提醒</h2>
+      <label><input id="my-reminders" type="checkbox" ${user.receiveReminders ? "checked" : ""}>接收收租和审批提醒</label>
+      ${button("保存", "save-reminders", online ? "" : "disabled", "primary")}</section>`;
+    if (desktopClient.enabled) return preference + `<section class="card card-pad top-gap"><h2>Windows 通知</h2>
+      <p id="desktop-notification-state">${html(desktopClient.status())}</p>
+      <p class="hint">关闭窗口后仍会提醒；退出账号后停止。Windows 勿扰模式会影响弹出。</p>
+      <div class="button-row">${button("发一条测试通知", "desktop-test")}${button("导出故障信息", "desktop-support")}</div>
+      <p class="hint">故障信息不包含密码、合同或账本。</p></section>`;
+    return preference + RentPushPanel.render({ state: ui.push, user, capabilities: RentPush.features(),
+      native: nativeMode, online, installationId: ui.installationId });
+  }
+  async function loadPushStatus() {
+    if (!user || !online) throw new Error("请先在线登录主机，再核对设备通知。");
+    if (pushStatusRequest) return pushStatusRequest;
+    const startedIn = workspaceEpoch;
+    ui.push = { ...ui.push, loading: true, error: "" };
+    if (view === "devices") render();
+    const work = (async () => {
+      try {
+        const status = await json("/api/push/status");
+        if (status.protocolVersion !== 1 || status.publicOrigin !== location.origin || !Array.isArray(status.devices)) {
+          throw new Error("主机返回的设备通知信息无效，不能据此开启推送。");
+        }
+        const installationId = await currentInstallation();
+        assertWorkspace(startedIn);
+        ui.installationId = installationId;
+        ui.push = { ...ui.push, value: status, error: "", readAt: now() };
+      } catch (error) {
+        if (startedIn === workspaceEpoch) ui.push = { ...ui.push, value: null, error: error.message };
+        throw error;
+      } finally {
+        if (startedIn === workspaceEpoch) {
+          ui.push.loading = false;
+          if (view === "devices") render();
+        }
+      }
+    })();
+    pushStatusRequest = work;
+    try { await work; }
+    finally { if (pushStatusRequest === work) pushStatusRequest = null; }
+  }
+  async function enableDevicePush() {
+    if (!online || nativeMode) throw new Error(nativeMode ? "请在安卓客户端自带的通知设置中开启推送。" : "开启设备通知需要连接主机。");
+    if (ui.push.busy) throw new Error("正在等待设备验证，请先完成或取消。");
+    const consent = document.getElementById("push-consent")?.checked === true;
+    const startedIn = workspaceEpoch;
+    const client = notificationsClient();
+    // 权限请求必须直接接在点击后，不能先等待网络请求而丢失 iOS 的用户手势。
+    const operation = client.enable({ consent, status: ui.push.value,
+      label: RentPush.features().ios ? "iPhone / iPad 桌面入口" : "浏览器设备" });
+    ui.push = { ...ui.push, busy: "正在等待这台设备收到验证消息并确认；请保持本页打开。", cancelled: false };
+    render();
+    try {
+      await operation;
+      assertWorkspace(startedIn);
+      await saveVault(value => { value.pagePopupEnabled = false; });
+      toast("主机已确认设备绑定。请再发送测试通知，核对手机锁屏和后台状态。");
+    } catch (error) {
+      assertWorkspace(startedIn);
+      if (ui.push.cancelled) throw new Error("已停止等待，请刷新设备状态确认主机结果；原有业务草稿未删除。");
+      throw error;
+    } finally {
+      if (startedIn === workspaceEpoch) {
+        ui.push.busy = "";
+        if (view === "devices") render();
+      }
+    }
+    await loadPushStatus();
+  }
+  async function testDevicePush(id) {
+    if (!online) throw new Error("测试通知需要连接主机。");
+    if (ui.pushTest && ui.pushTest.deviceId !== id) throw new Error("上次测试的结果尚未确认，请先重试同一台设备，避免重复发送。");
+    const request = ui.pushTest || { requestId: Offline.id(), deviceId: id };
+    ui.pushTest = request;
+    const startedIn = workspaceEpoch;
+    try {
+      await post("/api/push/test", request);
+      if (ui.pushTest === request) ui.pushTest = null;
+    } catch (error) {
+      assertWorkspace(startedIn);
+      if (!error.network && !error.retryable && ui.pushTest === request) ui.pushTest = null;
+      throw error;
+    }
+    toast("测试请求已由主机接受，不等于手机收到。请留意实际通知，再刷新设备状态。");
+    await loadPushStatus();
+  }
+
+  function hasUnsavedSettings() {
+    const form = document.getElementById("settings-form");
+    if (!form || !snapshot) return false;
+    return ["accountingStartDate", "dueReminderTime", "monthlyReminderTime", "offlineDays"].some(key =>
+      form.elements.namedItem(key).value !== form.elements.namedItem(key).defaultValue);
+  }
+  function hasReviewWork() {
+    return view === "application-detail" && !!main.querySelector("#review-reason, #review-source-panel img, #review-source-panel iframe");
+  }
+  function updateWorkState() {
+    return {
+      authenticated: !!(user && vault && snapshot), online: navigator.onLine,
+      generation: workspaceEpoch, busy: busy || actionWork > 0 || savingWork > 0 || authenticating || draftRecovery.hasPending(),
+      modalOpen: modal.open || invitationGuard.open || mobile.isBusy() || hasUnsavedSettings() || hasReviewWork(), fileBusy: fileWork > 0 || nativeClient.isBusy(), navigating,
+      editorDirty: ui.editorDirty, queueCount: vault?.value?.queue.length || 0,
+      importAwaitingReview: !!vault?.value?.importAwaitingReview,
+    };
+  }
+  function pauseWorkspace(value) {
+    updatePaused = !!value;
+    for (const element of [main, document.querySelector(".sidebar"), document.querySelector(".topbar")]) {
+      element.inert = updatePaused;
+    }
+    mobile.setPaused(updatePaused);
+  }
+  function renderUpdateStatus() {
+    const notice = document.getElementById("update-notice");
+    const work = updateWorkState();
+    notice.innerHTML = user ? UpdatePanel.notice({ ...updateState, shellUpdateAvailable }, {
+      isAdmin: permitted("admin"), job: ui.updates?.job,
+      canRefresh: !work.busy && !work.fileBusy && !work.navigating && !work.modalOpen,
+    }) : "";
+    notice.hidden = !notice.innerHTML;
+    const panel = document.getElementById("update-panel");
+    if (panel) panel.innerHTML = UpdatePanel.render(ui.updates);
+  }
+  async function refreshUpdateStatus() {
+    if (!user || !online || !permitted("admin")) return;
+    if (updateStatusRequest) return updateStatusRequest;
+    const startedIn = workspaceEpoch;
+    const pending = json("/api/admin/updates").then(status => {
+      assertWorkspace(startedIn);
+      ui.updates = status;
+      if (ui.updateCommand && !pendingActions.has(`update-${ui.updateCommand.command}`)) ui.updateCommand = null;
+      lastUpdateStatusAt = Date.now();
+      renderUpdateStatus();
+    });
+    updateStatusRequest = pending;
+    try { await pending; }
+    finally { if (updateStatusRequest === pending) updateStatusRequest = null; }
+  }
+  async function updateCommand(command, data = {}) {
+    if (!online || !permitted("admin")) throw new Error("程序更新须由管理员联网操作。");
+    const previous = ui.updateCommand;
+    const cancellingVisibleJob = command === "cancel" && ui.updates?.job?.id === data.jobId && ui.updates.job.canCancel;
+    const retrying = previous?.command === command && JSON.stringify(previous.data) === JSON.stringify(data);
+    if (previous && !retrying && !cancellingVisibleJob) {
+      throw new Error("上一次更新操作的结果尚未确认，请先重试同一个操作或等待主机恢复后查看更新状态。");
+    }
+    const pending = retrying ? previous : { command, data, requestId: Offline.id() };
+    ui.updateCommand = pending;
+    try {
+      await post(`/api/admin/updates/${command}`, { ...data, requestId: pending.requestId });
+      if (ui.updateCommand === pending) ui.updateCommand = null;
+    } catch (error) {
+      if (ui.updateCommand === pending && !error.network && !error.retryable) ui.updateCommand = null;
+      throw error;
+    }
+    await refreshUpdateStatus();
+  }
+  async function saveBeforeUpdate() {
+    const startedIn = workspaceEpoch;
+    clearTimeout(pendingSave); pendingSave = null;
+    while (ui.editorDirty) { await saveEditor(); assertWorkspace(startedIn); }
+  }
+  function watchShellUpdates(registration) {
+    const changed = () => {
+      shellUpdateAvailable = Boolean(registration.waiting);
+      renderUpdateStatus();
+    };
+    const installing = () => {
+      const worker = registration.installing;
+      if (worker) worker.addEventListener("statechange", changed);
+      changed();
+    };
+    registration.addEventListener("updatefound", installing);
+    navigator.serviceWorker.addEventListener("controllerchange", changed);
+    installing();
+  }
+  async function prepareUpdateReload() {
+    const startedIn = workspaceEpoch;
+    const current = await json("/api/bootstrap");
+    assertWorkspace(startedIn);
+    if (current.serverId !== serverId || !current.initialized) throw new Error("主机尚未恢复原账套，未刷新页面。");
+    if (current.maintenance?.phase && current.maintenance.phase !== "idle") throw new Error("主机仍在维护，请稍后保存并刷新。");
+    if (!("serviceWorker" in navigator)) return;
+    if (!await navigator.serviceWorker.getRegistration()) return;
+    const registration = await navigator.serviceWorker.register("/sw.js", { updateViaCache: "none" });
+    await registration.update();
+    assertWorkspace(startedIn);
+    const worker = registration.installing || registration.waiting;
+    if (!worker) return;
+    const awaitState = predicate => new Promise((resolve, reject) => {
+      const cleanup = () => { clearTimeout(timeout); worker.removeEventListener("statechange", changed); };
+      const changed = () => {
+        if (workspaceEpoch !== startedIn) { cleanup(); reject(new DOMException("工作区已切换。", "AbortError")); }
+        else if (worker.state === "redundant") { cleanup(); reject(new Error("新版离线资源未能完整就绪，保留当前页面，请稍后重试。")); }
+        else if (predicate(worker.state)) { cleanup(); resolve(); }
+      };
+      const timeout = setTimeout(() => { cleanup(); reject(new Error("等待新版离线资源超时，当前工作未丢弃。")); }, 20000);
+      worker.addEventListener("statechange", changed);
+      changed();
+    });
+    await awaitState(state => ["installed", "activating", "activated"].includes(state));
+    assertWorkspace(startedIn);
+    if (worker.state === "installed") worker.postMessage({ type: "ACTIVATE_UPDATE" });
+    await awaitState(state => state === "activated");
+    assertWorkspace(startedIn);
+  }
+  async function loadAdmin() {
+    if (!online || !permitted("admin")) return;
+    const invitationVersion = ++invitationListVersion;
+    const [accounts, storage, pushStatus, invitationAdmin, pairings] = await Promise.all([json("/api/admin/users"), json("/api/admin/storage"),
+      desktopClient.enabled ? Promise.resolve(null) : json("/api/admin/push"),
+      json("/api/admin/invitations"), json("/api/admin/pairings"), refreshUpdateStatus()]);
+    ui.adminUsers = accounts.users;
+    ui.storage = storage;
+    ui.adminPush = pushStatus;
+    ui.pairings = pairings;
+    if (invitationVersion === invitationListVersion) {
+      ui.invitationAdmin = invitationAdmin;
+      Invitations.reconcile(invitationAdmin.invitations);
+    }
+    if (view === "admin" && !hasUnsavedSettings()) render();
+  }
+  function pairingPanel() {
+    const value = ui.pairings;
+    return `<div class="card-header"><div><h3>连接同事电脑</h3>
+      <p>让同事打开软件，选择“加入已有公司”。</p></div>${button("刷新", "pairing-refresh")}</div>
+      ${!value ? "<p>正在查看……</p>" : !value.available ? note(value.error, "warning") :
+        value.requests.filter(item => item.status === "pending").map(item => `<div class="list-row"><div>
+          <strong>${html(item.name)}</strong><p>配对码：<strong>${html(item.code.slice(0, 4))} ${html(item.code.slice(4))}</strong></p>
+          <small>请核对同事屏幕上的代码。</small></div>
+          ${button("核对并选择岗位", "pairing-open", `data-id="${html(item.id)}"`, "primary")}
+          ${button("拒绝", "pairing-reject", `data-id="${html(item.id)}"`)}</div>`).join("") || "<p>暂时没有待确认的电脑。</p>"}`;
+  }
+  async function refreshPairings() {
+    if (!permitted("admin")) throw new Error("请使用管理员账号确认同事电脑。");
+    const startedIn = workspaceEpoch;
+    const value = await json("/api/admin/pairings");
+    assertWorkspace(startedIn);
+    ui.pairings = value;
+    const panel = document.getElementById("pairing-panel");
+    if (panel && permitted("admin")) panel.innerHTML = pairingPanel();
+  }
+  function renderInvitations() {
+    const panel = document.getElementById("invitation-panel");
+    if (panel && user && permitted("admin")) {
+      panel.innerHTML = InvitationPanel.renderAdmin(ui.invitationAdmin, Invitations.hasHeld, ui.invitationFeedback, ui.invitationAdminMessage);
+      renderInvitationActivity();
+    }
+  }
+  function renderInvitationActivity() {
+    for (const el of document.querySelectorAll("#invitation-panel [data-action], #modal-actions [data-action=invitation-issue]")) {
+      const action = el.dataset.action;
+      if (!invitationBusyLabels[action]) continue;
+      const running = invitationActivity.has(action);
+      if (running && !el.dataset.idleLabel) el.dataset.idleLabel = el.textContent;
+      if (running) {
+        el.disabled = true;
+        if (invitationActivity.get(action) === (el.dataset.id || "")) el.textContent = invitationBusyLabels[action];
+      } else if (el.dataset.idleLabel) {
+        el.textContent = el.dataset.idleLabel;
+        delete el.dataset.idleLabel;
+        el.disabled = action === "invitation-create" && !ui.invitationAdmin?.delivery.linkAvailable;
+      }
+    }
+  }
+  async function refreshInvitations() {
+    if (!permitted("admin")) throw new Error("请使用管理员账号管理邀请。");
+    const version = ++invitationListVersion, startedIn = workspaceEpoch;
+    try {
+      if (!online) await restoreSession();
+      const state = await json("/api/admin/invitations");
+      if (version !== invitationListVersion) return ui.invitationAdmin || state;
+      ui.invitationAdmin = state;
+      Invitations.reconcile(state.invitations);
+      if (lastError === ui.invitationRefreshError) clearError();
+      ui.invitationRefreshError = "";
+      ui.invitationAdminMessage = ui.invitationIssueUnconfirmed ?
+        "状态已更新。请检查最近的邀请；若已有未下载的新邀请，请先撤销它再新建。" : "";
+      chrome();
+      renderInvitations();
+      return state;
+    } catch (error) {
+      if (startedIn === workspaceEpoch && version === invitationListVersion && error.name !== "AbortError") {
+        ui.invitationAdminMessage = `状态未能刷新，请稍后重试。${error.message}`;
+        ui.invitationRefreshError = error.message;
+        renderInvitations();
+      }
+      throw error;
+    }
+  }
+  async function downloadInvitation(id) {
+    if (!online || !permitted("admin")) throw new Error("请先刷新状态，连接主机后再下载安装包。");
+    const startedIn = workspaceEpoch;
+    fileWork++;
+    try {
+      const response = await Invitations.packageRequest(request, id);
+      const blob = await response.blob();
+      assertWorkspace(startedIn);
+      if (!Invitations.hasHeld(id)) throw new Error("邀请已失效，请刷新列表核对。");
+      if (nativeMode) {
+        await nativeClient.exportBlob(blob, `employee-invitation-${id}.exe`);
+        assertWorkspace(startedIn);
+      } else {
+        const url = URL.createObjectURL(blob);
+        Invitations.trackDownload(url);
+        const anchor = document.createElement("a");
+        anchor.href = url; anchor.download = `employee-invitation-${id}.exe`; anchor.click();
+      }
+      if (lastError === ui.invitationDownloadError) clearError();
+      ui.invitationDownloadError = "";
+      ui.invitationFeedback[id] = nativeMode ?
+        "请在保存的位置确认安装包已保存，再发给这位同事。" :
+        "请在浏览器下载列表确认安装包已保存，再发给这位同事。";
+      renderInvitations();
+      toast(ui.invitationFeedback[id]);
+    } catch (error) {
+      if (startedIn === workspaceEpoch) {
+        ui.invitationDownloadError = error.message;
+        ui.invitationFeedback[id] = Invitations.hasHeld(id) ?
+          `${error.network ? "下载未完成，请先刷新状态再重试。" : "下载未完成，可重新点击“下载安装包”，无需新建邀请。"}${error.message}` :
+          "这份邀请暂不能下载，请先刷新状态核对。已开通账号的同事可直接登录。";
+        renderInvitations();
+      }
+      throw error;
+    } finally {
+      if (startedIn === workspaceEpoch) { fileWork--; renderUpdateStatus(); }
+    }
+  }
+  function adminPage() {
+    if (!online) return `${heading("系统管理", "账号、权限与主机存储只能联网管理。")}${note("断网时不能修改账号和权限，请先重新连接主机。", "warning")}`;
+    const users = ui.adminUsers || [];
+    const storage = ui.storage;
+    return `${heading("系统管理", "管理账号、岗位和主机设置。")}
+      <section id="pairing-panel" class="card card-pad">${pairingPanel()}</section>
+      <details id="legacy-invitations" class="top-gap"><summary>旧版员工邀请</summary><section id="invitation-panel" class="card card-pad">${InvitationPanel.renderAdmin(ui.invitationAdmin, Invitations.hasHeld, ui.invitationFeedback, ui.invitationAdminMessage)}</section></details>
+      <div class="split top-gap"><section class="card card-pad"><div class="card-header"><div><h3>账号与授权</h3><p>经办、复核、查看可组合；同一人永远不能审批自己的申请。</p></div>${button("管理员手动建号（高级）", "user-create")}</div>
+        ${users.map(u => `<div class="list-row"><div><strong>${html(u.displayName)} · ${html(u.username)}</strong>
+          <small>${html(u.roles.map(r => roleNames[r]).join(" / "))} · ${u.active ? "启用" : "停用"} · ${u.canExport ? "可导出" : "不可导出"}</small></div>
+          ${button("编辑 / 重置密码", "user-edit", `data-id="${html(u.id)}"`, "small")}</div>`).join("") ||
+          `<p class="hint">正在取得主机账号列表。</p>`}
+      </section><section class="card card-pad"><h3>设置与存储</h3>
+        <form id="settings-form" class="form-grid" data-version="${snapshot.settings.version}">${field("开始管账日期（业务初始化后不可更改）", "accountingStartDate", snapshot.settings.accountingStartDate, "date", "required")}
+          ${field("到期提醒时间", "dueReminderTime", snapshot.settings.dueReminderTime, "time", "required")}
+          ${field("月度提醒时间", "monthlyReminderTime", snapshot.settings.monthlyReminderTime, "time", "required")}
+          ${field("离线缓存有效天数（1—30）", "offlineDays", snapshot.settings.offlineDays, "number", 'min="1" max="30" required')}</form>
+        ${button("保存主机设置", "save-settings")}${storage ? `<h4 class="section-title">主机存储状态</h4>
+          <p>业务数据目录：${html(storage.dataDir)}</p><p>备份目录：${html(storage.backupDir)}</p>
+          <p>数据库 ${Number(storage.databaseBytes).toLocaleString("zh-CN")} 字节 / 附件 ${Number(storage.attachmentBytes).toLocaleString("zh-CN")} 字节</p>
+          <p>上次备份：${html(storage.lastBackup?.createdAt || storage.lastBackup || "暂无")}</p>
+          ${note(storage.independentBackup ? "备份目录未放在数据目录内，但仍需确认是否在另一物理磁盘或离机；同盘备份不能防范磁盘故障。" :
+            "备份与业务数据可能位于同一磁盘；同盘备份不能防范磁盘故障。", "warning")}
+          ${storage.backupFailure ? note(`最近备份错误：${storage.backupFailure.message}`, "danger") : ""}
+          ${storage.reminderFailure ? note(`最近提醒错误：${storage.reminderFailure.message}`, "danger") : ""}
+          ${button("立即创建主机备份", "manual-backup")}` : "<p class='hint'>正在取得主机目录和备份状态。</p>"}
+        <p class="hint">这里显示实际主机配置；本开发电脑路径不写入正式运行设置。网络连通性取决于实际主机与 HTTPS 部署。</p>
+      </section></div><section id="update-panel" class="card card-pad update-panel">${UpdatePanel.render(ui.updates)}</section>
+      ${desktopClient.enabled ? "" : `<section class="card card-pad top-gap"><div id="admin-push-panel">${RentPushPanel.renderAdmin(ui.adminPush)}</div>
+        <div class="button-row top-gap">${button("刷新通知状态", "push-admin-refresh")}${button("我的通知设备", "navigate", 'data-route="devices"')}</div></section>`}`;
+  }
+  function userForm(account = null) {
+    const u = account || { username: "", displayName: "", roles: ["operator", "viewer"], allParks: true, parks: [], canExport: false,
+      receiveReminders: false, active: true };
+    const presets = { business: ["operator", "viewer"], finance: ["reviewer", "viewer"], owner: ["admin", "viewer"] };
+    const preset = Object.keys(presets).find(key => [...u.roles].sort().join(",") === [...presets[key]].sort().join(",")) || "custom";
+    openModal(account ? "编辑账号与权限" : "创建账号", `<form id="user-form">
+      <div class="form-grid">${!account ? field("登录名 *", "username", u.username, "text", "required") :
+        `<p>登录名：${html(u.username)} · 版本 ${u.version}</p>`}
+        ${field("姓名 *", "displayName", u.displayName, "text", "required")}
+        ${field(account ? "重置密码（不更改则留空，至少 10 位）" : "初始密码（至少 10 位）*", "password", "", "password", account ? 'minlength="10"' : 'required minlength="10"')}</div>
+      ${select("岗位", "user-role-preset", [["business", "业务：录入"], ["finance", "财务：审核"], ["owner", "老板：管理与查看"], ["custom", "自定义权限"]], preset)}
+      <fieldset><legend>角色（至少一种）</legend><div class="selection-grid">${Object.entries(roleNames).map(([key, name]) =>
+        `<label><input type="checkbox" name="roles" value="${key}" ${u.roles.includes(key) ? "checked" : ""}>${name}</label>`).join("")}</div></fieldset>
+      <p class="hint">${account && !account.allParks
+        ? `保留原园区授权：${html(account.parks.join("、") || "未授权业务园区")}。此处修改姓名或岗位不会扩大园区范围。`
+        : "员工按岗位处理全部园区。"}</p>
+      <div class="selection-grid"><label><input name="canExport" type="checkbox" ${u.canExport ? "checked" : ""}>允许 XLSX / PDF 导出</label>
+        <label><input name="receiveReminders" type="checkbox" ${u.receiveReminders ? "checked" : ""}>接收提醒</label>
+        ${account ? `<label><input name="active" type="checkbox" ${u.active ? "checked" : ""}>账号启用</label>` : ""}</div>
+      ${note("老板选择管理和查看；业务负责录入，财务负责审核。", "neutral")}
+      </form>`, `${button("取消", "close-modal")}${button("保存账号", "save-user", `data-id="${html(account?.id || "")}"`, "primary")}`);
+  }
+  function actionForm(kind, targetId, app = null) {
+    const invoice = snapshot.invoices.find(i => i.id === targetId || i.id === app?.payload.invoiceId);
+    const contract = snapshot.contracts.find(c => c.id === targetId || c.id === app?.payload.contractId);
+    const payment = snapshot.payments.find(p => p.id === targetId || p.id === app?.payload.paymentId);
+    const p = app?.payload || {};
+    const selected = invoice || contract || payment;
+    if (!selected) throw new Error("业务目标不存在或当前账号无权访问；请同步主机。");
+    const today = snapshot.today;
+    ui.action = { kind, targetId, appId: app?.id, expectedApplicationVersion: app?.version,
+      targetVersion: selected.version,
+      terminationInvoices: contract ? clone(snapshot.invoices.filter(item => item.contractId === contract.id)) : [],
+      attachments: clone(p.attachments || []), adjustments: p.adjustments || [] };
+    const reason = `<div class="field"><label for="action-reason">申请原因 / 业务依据 *（退款和撤销必须说明）</label>
+      <textarea id="action-reason" rows="3" required>${html(app?.reason || "")}</textarea></div>`;
+    const periodFields = `${field("归属租期开始", "periodStart", p.periodStart || today, "date", "required")}
+      ${field("归属租期结束", "periodEnd", p.periodEnd || today, "date", "required")}`;
+    let body = `<p>${html(invoice?.tenant || contract?.data.tenant || snapshot.invoices.find(i => i.id === payment?.invoiceId)?.tenant || "")} ·
+      ${html(invoice?.label || contract?.data.number || payment?.id || "")} · 正式版本 ${selected.version}</p>`;
+    if (kind === "payment") body += `<div class="form-grid">${field("本次实收金额（元，可部分收款）*", "amount", p.amountCents != null ? yuan(p.amountCents) : "", "text", 'required inputmode="decimal"')}
+      ${field("实际到账日 *", "payDate", p.payDate || today, "date", "required")}
+      ${field("收款方式 *", "method", p.method || "", "text", "required")}
+      ${field("收款备注", "note", p.note || "")}</div><p>当前未收 ¥ ${money(invoice.amountCents - invoice.paidCents)}；登记不立即生效。</p>`;
+    if (kind === "refund") body += `<div class="form-grid">${field("退款金额（元）*", "amount", p.amountCents != null ? yuan(p.amountCents) : "", "text", 'required inputmode="decimal"')}
+      ${field("实际退款日期 *", "refundDate", p.refundDate || today, "date", "required")}
+      ${select("退款的账务影响 *", "effect", [["reopen", "重开未收：仅减少已收"], ["reduce-charge", "减少应收：应收与已收同时减少"]], p.effect || "reopen")}</div>`;
+    if (kind === "invoice-adjustment") body += `<div class="form-grid">${field("调整后应收总额（元）*", "amount", p.amountCents != null ? yuan(p.amountCents) : yuan(invoice.amountCents), "text", 'required inputmode="decimal"')}
+      ${field("调整后应缴日期 *", "dueDate", p.dueDate || invoice.dueDate, "date", "required")}</div><p>既有收款与历史欠款不会在本机消失，主机将拒绝不合理变更。</p>`;
+    if (kind === "opening-balance") body += `<div class="form-grid">
+      ${select("费用类别", "balanceKind", Object.entries(feeNames), p.kind || "rent")}
+      ${field("历史欠款名称 *", "label", p.label || "", "text", "required")}
+      ${field("历史欠款金额（元）*", "amount", p.amountCents != null ? yuan(p.amountCents) : "", "text", 'required inputmode="decimal"')}
+      ${periodFields}${field("实际应缴日期 *", "dueDate", p.dueDate || today, "date", "required")}</div>
+      <p>补登历史欠款需独立审批；不生成虚构历史现金流水。</p>`;
+    if (kind === "termination") {
+      body += `${field("终止生效日期 *", "terminationDate", p.terminationDate || today, "date", 'required data-termination="1"')}
+        <p>必须逐条明确终止日之后结束的期次如何调整；已付和过往欠款不得静默删除。请为每项填写调整后应收总额与原因。</p>
+        <div id="termination-items">${terminationRows(contract.id, p.terminationDate || today, {}, p.adjustments)}</div>`;
+    }
+    if (["contract-void", "payment-void"].includes(kind)) body += note(
+      "此操作提出撤销申请，不会直接删除合同、历史应收、已收或现金流水。主机将复核版本及财务约束。", "warning");
+    if (["payment", "refund"].includes(kind)) body += `<div class="field"><label for="action-files">凭证附件（可选）</label>
+      <input id="action-files" type="file" accept=".pdf,.png,.jpg,.jpeg,.webp,.doc,.docx" multiple data-files="action"></div>
+      <div id="action-attachments">${ui.action.attachments.map(attachmentLink).join("<br>")}</div>`;
+    body += reason;
+    openModal(`${kindNames[kind]} · 异人复核`, `<form id="action-form">${body}</form>`,
+      `${button("取消", "close-modal")}${button(app ? "重新提交当前版本" : "提交复核", "submit-action", "", "primary")}`);
+  }
+  function terminationRows(contractId, date, previous = {}, adjustments = []) {
+    return (ui.action?.terminationInvoices || snapshot.invoices).filter(i => i.contractId === contractId && i.status === "active" && i.periodEnd > date)
+      .map(i => {
+        const old = adjustments.find(a => a.invoiceId === i.id);
+        return `<div class="mini-card" data-adjust="${html(i.id)}">${html(i.label)} · ${html(i.periodStart)} — ${html(i.periodEnd)} · 当前应收 ¥ ${money(i.amountCents)}
+          <div class="form-grid">${field(`调整后应收（元） · ${i.id}`, `adjust-${i.id}`,
+            previous[`adjust-${i.id}`] ?? (old ? yuan(old.amountCents) : yuan(i.amountCents)), "text", 'required inputmode="decimal"')}
+            ${field(`调整依据 · ${i.id}`, `reason-${i.id}`, previous[`reason-${i.id}`] ?? old?.reason ?? "", "text", "required")}</div></div>`;
+      }).join("");
+  }
+  function readAction() {
+    const form = document.getElementById("action-form");
+    if (!form.reportValidity()) throw new Error("请填齐所有标记 * 的业务字段。");
+    const data = Object.fromEntries(new FormData(form));
+    const item = ui.action;
+    const invoice = snapshot.invoices.find(i => i.id === item.targetId || i.id === snapshot.payments.find(p => p.id === item.targetId)?.invoiceId);
+    const contract = snapshot.contracts.find(c => c.id === item.targetId);
+    const payment = snapshot.payments.find(p => p.id === item.targetId);
+    const reason = document.getElementById("action-reason").value.trim();
+    if (!reason) throw new Error("请填写业务申请原因和核验依据。");
+    const cents = () => Domain.parseMoney(data.amount);
+    let payload;
+    switch (item.kind) {
+      case "payment":
+        payload = { invoiceId: invoice.id, expectedVersion: item.targetVersion, amountCents: cents(),
+          payDate: data.payDate, method: data.method.trim(), note: data.note.trim(), attachments: item.attachments }; break;
+      case "refund":
+        payload = { invoiceId: invoice.id, expectedVersion: item.targetVersion, amountCents: cents(),
+          refundDate: data.refundDate, effect: data.effect, attachments: item.attachments }; break;
+      case "invoice-adjustment":
+        payload = { invoiceId: invoice.id, expectedVersion: item.targetVersion, amountCents: cents(), dueDate: data.dueDate }; break;
+      case "payment-void": payload = { paymentId: payment.id, expectedVersion: item.targetVersion }; break;
+      case "contract-void": payload = { contractId: contract.id, expectedVersion: item.targetVersion }; break;
+      case "opening-balance":
+        payload = { contractId: contract.id, expectedVersion: item.targetVersion, kind: data.balanceKind,
+          label: data.label.trim(), amountCents: cents(), periodStart: data.periodStart, periodEnd: data.periodEnd, dueDate: data.dueDate }; break;
+      case "termination":
+        payload = { contractId: contract.id, expectedVersion: item.targetVersion, terminationDate: data.terminationDate,
+          adjustments: item.terminationInvoices.filter(i => i.contractId === contract.id && i.status === "active" &&
+            i.periodEnd > data.terminationDate).map(i => ({
+            invoiceId: i.id, expectedVersion: i.version,
+            amountCents: Domain.parseMoney(data[`adjust-${i.id}`]), reason: data[`reason-${i.id}`]?.trim() || "",
+          })) };
+        if (payload.adjustments.some(a => !a.reason)) throw new Error("每一期未来应收都必须填写明确的终止调整原因。");
+        break;
+      default: throw new Error("不支持此申请类型。");
+    }
+    return { payload, reason };
+  }
+
+  function openModal(title, content, actions = button("关闭", "close-modal"), wide = false) {
+    if (sourceUrl) { URL.revokeObjectURL(sourceUrl); sourceUrl = null; }
+    document.getElementById("modal-title").textContent = title;
+    document.getElementById("modal-body").innerHTML = content;
+    document.getElementById("modal-actions").innerHTML = actions;
+    modal.classList.toggle("wide", wide);
+    if (!modal.open) modal.showModal();
+    modal.querySelector(".modal-header button").focus();
+  }
+  function closeModal() {
+    modal.close();
+    if (sourceUrl) { URL.revokeObjectURL(sourceUrl); sourceUrl = null; }
+    ui.action = null;
+    ui.importBundle = null; ui.importPlan = null; ui.importRevision = null;
+  }
+  async function viewFile(id, name) {
+    const blob = await fileBlob(id, name);
+    const lower = name.toLowerCase();
+    if (/\.docx?$/.test(lower) || nativeMode && /\.pdf$/.test(lower)) {
+      await saveDownload(blob, name);
+      toast(nativeMode ? "原件已完整交给安卓客户端，请核对真实文件后返回本页。" :
+        "Word 原件已下载；请在本地应用中打开，不在网页中伪造预览。");
+      return;
+    }
+    if (!/\.(pdf|png|jpe?g|webp)$/.test(lower)) throw new Error("此格式不支持网页预览，请下载真实原件。");
+    if (/\.pdf$/.test(lower) && (!online || id.startsWith("local:"))) {
+      await downloadFile(id, name);
+      toast("本机原件已下载；离线 PDF 请在浏览器或本机阅读器打开。");
+      return;
+    }
+    openModal(`原件 · ${name}`, `<div class="source-view">${/\.pdf$/.test(lower) ?
+      `<iframe title="${html(name)}"></iframe>` :
+      `<img alt="合同原件 ${html(name)}">`}</div>
+      <p>若浏览器无法显示，请通过下方按钮下载原始字节核对。</p>`,
+    `${button("下载原始文件", "download-file", `data-id="${html(id)}" data-name="${html(name)}"`)}${button("关闭", "close-modal")}`, true);
+    const target = document.querySelector(".modal .source-view iframe, .modal .source-view img");
+    if (target) {
+      if (/\.pdf$/.test(lower)) target.src = `/api/attachments/${encodeURIComponent(id)}#view=FitH&navpanes=0`;
+      else {
+        sourceUrl = URL.createObjectURL(blob);
+        target.src = sourceUrl;
+      }
+    }
+  }
+  async function fileBlob(id, name) {
+    const startedIn = workspaceEpoch;
+    const locally = vault.value.files[id];
+    if (online && !id.startsWith("local:")) {
+      const blob = await (await request(`/api/attachments/${encodeURIComponent(id)}`)).blob();
+      assertWorkspace(startedIn);
+      if (!locally) {
+        const cached = await Offline.cacheRecent(blob, name);
+        assertWorkspace(startedIn);
+        try { await saveVault(state => { state.files[id] = cached; }); }
+        catch (error) {
+          assertWorkspace(startedIn);
+          if (!user) throw error;
+          showError(new Error(`原件可查看，但无法加密缓存至本机：${error.message}`));
+        }
+      }
+      assertWorkspace(startedIn);
+      return blob;
+    }
+    if (locally) return Offline.asBlob(locally);
+    throw new Error("此原件未缓存于本机；请连接主机获取真实文件。");
+  }
+  async function inlineFile(id, name) {
+    const panel = document.getElementById("review-source-panel");
+    if (!panel) throw new Error("请先打开申请的当前版本详情。");
+    if (/\.docx?$/i.test(name) || nativeMode && /\.pdf$/i.test(name)) {
+      await downloadFile(id, name);
+      panel.innerHTML = `<p class="hint">原件 ${html(name)} 已交给本机文件功能；请核对实际原件后回到本页，再勾选复核清单。</p>`;
+      return;
+    }
+    const blob = await fileBlob(id, name);
+    if (/\.pdf$/i.test(name) && (!online || id.startsWith("local:"))) {
+      await downloadFile(id, name);
+      panel.innerHTML = `<p class="hint">已下载缓存的 PDF 原件 ${html(name)}，离线请在本机阅读器人工核对。</p>`;
+      return;
+    }
+    if (sourceUrl) URL.revokeObjectURL(sourceUrl);
+    if (/\.pdf$/i.test(name)) {
+      sourceUrl = null;
+      panel.innerHTML = `<iframe title="${html(name)}" src="/api/attachments/${encodeURIComponent(id)}#view=FitH&navpanes=0"></iframe>`;
+    } else {
+      sourceUrl = URL.createObjectURL(blob);
+      panel.innerHTML = `<img alt="原件 ${html(name)}" src="${html(sourceUrl)}">`;
+    }
+  }
+  async function downloadFile(id, name) {
+    const blob = await fileBlob(id, name);
+    await saveDownload(blob, name);
+  }
+  async function saveDownload(blob, name) {
+    const startedIn = workspaceEpoch;
+    if (nativeMode) {
+      fileWork++;
+      try { await nativeClient.exportBlob(blob, name); assertWorkspace(startedIn); }
+      finally {
+        if (startedIn === workspaceEpoch) { fileWork--; renderUpdateStatus(); }
+      }
+      return;
+    }
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a"); a.href = url; a.download = name; a.click();
+    setTimeout(() => URL.revokeObjectURL(url), 30000);
+  }
+  function render() {
+    if (!user || !snapshot || !offlineAccess()) return;
+    chrome();
+    if (!user) return;
+    main.innerHTML = ({
+      dashboard, contracts, wizard, review: applications, reports, "my-work": myWork,
+      sync: syncPage, admin: adminPage, devices: devicePage,
+      "contract-detail": () => contractDetail(ui.selectedContract),
+      "application-detail": () => applicationDetail(ui.appId),
+    }[view] || dashboard)();
+    for (const ring of main.querySelectorAll(".progress-ring[data-progress]")) {
+      ring.style.setProperty("--progress", `${Number(ring.dataset.progress)}%`);
+    }
+    if (view === "admin") renderInvitationActivity();
+  }
+  async function navigate(route, changes = {}, replace = false) {
+    if (!offlineAccess()) return;
+    if (!Object.hasOwn(Navigation.titles, route)) throw new Error("这个页面不存在，请从左侧导航重新选择。");
+    if (navigating) throw new Error("正在保存并切换页面，请稍候。");
+    navigating = true;
+    const startedIn = workspaceEpoch;
+    const previous = Navigation.capture(view, ui, window.scrollY);
+    try {
+      clearTimeout(pendingSave);
+      while (ui.editorDirty) { await saveEditor(); assertWorkspace(startedIn); }
+      assertWorkspace(startedIn);
+      if (!offlineAccess()) return;
+      if (sourceUrl) { URL.revokeObjectURL(sourceUrl); sourceUrl = null; }
+      view = route;
+      ui.q = "";
+      if (route === "dashboard") { ui.invoiceStatus = "all"; ui.month = snapshot.today.slice(0, 7); }
+      if (route === "review") ui.reviewStatus = permitted("reviewer") ? "pending" : "mine";
+      if (route === "reports") {
+        ui.basis = "due"; ui.month = snapshot.today.slice(0, 7); ui.kind = "rent"; ui.status = "all";
+      }
+      Object.assign(ui, changes);
+      if (!replace) trail.push(previous, Navigation.capture(view, ui));
+      if (route === "admin" && permitted("admin") && online) {
+        ui.adminUsers = null; ui.storage = null;
+        loadAdmin().catch(showError);
+      }
+      if (route === "devices" && online && !desktopClient.enabled) loadPushStatus().catch(showError);
+      render();
+      mobile.close();
+      main.focus({ preventScroll: true });
+      window.scrollTo({ top: 0, behavior: "instant" });
+    } finally { navigating = false; renderUpdateStatus(); }
+  }
+  async function goBack() {
+    if (!offlineAccess()) return;
+    if (!trail.peek()) { await navigate("dashboard", {}, true); return; }
+    if (navigating) throw new Error("正在保存并返回，请稍候。");
+    navigating = true;
+    const startedIn = workspaceEpoch;
+    try {
+      clearTimeout(pendingSave);
+      while (ui.editorDirty) { await saveEditor(); assertWorkspace(startedIn); }
+      assertWorkspace(startedIn);
+      if (!offlineAccess()) return;
+      const previous = trail.pop();
+      Object.assign(ui, previous.filters, { selectedContract: previous.selectedContract, appId: previous.appId });
+      view = previous.view;
+      if (view === "wizard") {
+        // 草稿始终取刚保存的最新版；导航记录只保存草稿编号，不能用旧页面覆盖新输入。
+        const draft = vault.value.drafts.find(item => item.id === previous.editorId);
+        if (draft) {
+          ui.editor = clone(draft); ui.editor.data = blankContract(ui.editor.data);
+          ui.step = previous.step; ui.editorDirty = false; ui.preview = null;
+        } else {
+          view = "my-work"; ui.editor = null;
+          toast("这份草稿已提交或不在本机，已返回我的待处理。");
+        }
+      }
+      if (view === "admin" && permitted("admin") && online) loadAdmin().catch(showError);
+      if (view === "devices" && online && !desktopClient.enabled) loadPushStatus().catch(showError);
+      render();
+      mobile.close();
+      main.focus({ preventScroll: true });
+      window.scrollTo({ top: previous.scrollY, behavior: "instant" });
+    } finally { navigating = false; renderUpdateStatus(); }
+  }
+  async function submitContract() {
+    if (!ui.editor) throw new Error("请先创建合同草稿。");
+    await saveEditor();
+    const result = schedule();
+    ui.preview = result;
+    if (result.errors.length) { render(); throw new Error(`合同尚未核对通过：${result.errors.join("；")}`); }
+    const d = ui.editor.data;
+    if (!d.attachments.length) throw new Error("至少选择一份真实合同原件并保存到加密工作区，才能提交。");
+    if (ui.editor.changeContractId && !Domain.isISODate(ui.editor.effectiveDate)) throw new Error("请填写合同变更的明确生效日期。");
+    const payload = ui.editor.changeContractId ? { contractId: ui.editor.changeContractId,
+      expectedVersion: ui.editor.changeVersion, data: clone(d), effectiveDate: ui.editor.effectiveDate } :
+      { data: clone(d) };
+    const reason = ui.editor.changeContractId ? `合同变更，自 ${ui.editor.effectiveDate} 生效；请核对新旧版本及未结清期次。` :
+      d.renewalOf ? `续租自 ${d.startDate} 开始；原合同 ${d.renewalOf}。` : "提交合同原件、租金及期初核实情况，申请审核。";
+    const id = ui.editor.id;
+    if (ui.editor.sourceApplicationId) {
+      await enqueue("resubmit", { applicationId: ui.editor.sourceApplicationId,
+        expectedVersion: ui.editor.sourceVersion, payload, reason });
+    } else await enqueue("submit", { kind: ui.editor.changeContractId ? "contract-change" : "contract", payload, reason });
+    if (!user || !vault || ui.editor?.id !== id) return;
+    await saveVault(state => { state.drafts = state.drafts.filter(item => item.id !== id); });
+    ui.editor = null; ui.editorDirty = false;
+    await navigate("review", { reviewStatus: "mine" }, true);
+  }
+  async function printReport() {
+    const target = document.getElementById("print-area");
+    target.innerHTML = `<h1>园区租赁 · ${html(report.caption)}</h1>
+      <p>主机授权打印 · ${html(user.displayName)} · ${html(new Date().toLocaleString("zh-CN"))}</p>
+      <p>应收 ¥ ${money(report.totals.amountCents)} / 已收 ¥ ${money(report.totals.paidCents)}
+        / 未收 ¥ ${money(report.totals.balanceCents)} / 净现金 ¥ ${money(report.totals.cashCents)}</p>
+      <table><thead><tr>${report.columns.map(column => `<th>${html(column)}</th>`).join("")}</tr></thead>
+      <tbody>${report.rows.map(row => `<tr>${row.map(cell).join("")}</tr>`).join("")}</tbody></table>`;
+    if (nativeMode) await nativeClient.printReport();
+    else window.print();
+  }
+  async function handleAction(el) {
+    const action = el.dataset.action, id = el.dataset.id;
+    if (action === "close-modal") {
+      const form = document.getElementById("invitation-form");
+      if (form?.getAttribute("aria-busy") === "true") { formFeedback(form, "正在生成邀请，请稍候。"); return; }
+      closeModal(); return;
+    }
+    if (action === "invitation-login" || action === "invitation-dismiss") {
+      if (claimingInvitation) { formFeedback(document.getElementById("join-form"), "正在创建账号，请稍候。"); return; }
+      Invitations.clearJoin("none", false);
+      if (invitationGuard.open) invitationGuard.close();
+      if (!user) renderAuth();
+      return;
+    }
+    if (action === "invitation-inspect") { await inspectInvitation(); return; }
+    if (action === "toggle-password") {
+      const input = document.getElementById(el.dataset.target);
+      if (!input || !auth.contains(input)) throw new Error("密码输入框已改变，请重新打开登录页面。");
+      const reveal = input.type === "password";
+      input.type = reveal ? "text" : "password";
+      el.textContent = reveal ? "隐藏" : "显示";
+      el.setAttribute("aria-pressed", String(reveal));
+      el.setAttribute("aria-label", reveal ? "隐藏密码" : "显示密码");
+      return;
+    }
+    if (action === "offline-unlock") {
+      const form = document.getElementById("auth-form");
+      if (authenticating) { formFeedback(form, "正在验证或解锁账号，请稍候。"); return; }
+      authenticating = true;
+      const label = el.textContent;
+      el.disabled = true; el.textContent = "正在解锁……";
+      formFeedback(form, "");
+      try { await authSubmit(true); }
+      catch (error) { formFeedback(document.getElementById("auth-form"), error.message); }
+      finally {
+        authenticating = false;
+        renderUpdateStatus();
+        el.disabled = false; el.textContent = label;
+        if (Invitations.status().phase !== "none") invitationArrived();
+        if (notificationRequested) openRequestedNotifications();
+      }
+      return;
+    }
+    if (!user) return;
+    switch (action) {
+      case "pairing-refresh": await refreshPairings(); break;
+      case "pairing-open": {
+        const item = ui.pairings?.requests.find(value => value.id === id && value.status === "pending");
+        if (!item) throw new Error("这次配对已变化，请刷新。");
+        openModal("确认同事电脑", `<form id="pairing-form">
+          <p>${html(item.name)}</p>
+          ${field("输入同事屏幕上的配对码", "pairing-code", "", "text", 'required inputmode="numeric" maxlength="8" pattern="[0-9]{8}" autocomplete="off"')}
+          ${select("岗位", "pairing-role", [["business", "业务：录入"], ["finance", "财务：审核"], ["viewer", "只查看"]], "business")}
+          </form>`, `${button("取消", "close-modal")}${button("同意加入", "pairing-approve", `data-id="${html(id)}"`, "primary")}`);
+        break;
+      }
+      case "pairing-approve": {
+        if (!document.getElementById("pairing-form").reportValidity()) return;
+        await post(`/api/admin/pairings/${encodeURIComponent(id)}/approve`,
+          { code: document.getElementById("pairing-code").value, role: document.getElementById("pairing-role").value });
+        closeModal(); await refreshPairings(); toast("已同意。请同事继续设置账号。"); break;
+      }
+      case "pairing-reject":
+        await post(`/api/admin/pairings/${encodeURIComponent(id)}/reject`, {});
+        await refreshPairings(); break;
+      case "go-back": await goBack(); break;
+      case "logout": {
+        if (ui.editorDirty) await saveEditor();
+        const startedIn = workspaceEpoch;
+        const exitingOnline = online;
+        let subscriptionWarning = "";
+        pushClient?.invalidate();
+        if (exitingOnline) {
+          try {
+            const installationId = await currentInstallation();
+            assertWorkspace(startedIn);
+            if (!nativeMode && !desktopClient.enabled && RentPush.features().supported) {
+              try { await notificationsClient().disable(); }
+              catch (error) { assertWorkspace(startedIn); subscriptionWarning = error.message; }
+            }
+            assertWorkspace(startedIn);
+            await json("/api/logout", { method: "POST", headers: { "X-Rent-Installation-Id": installationId }, body: "{}" });
+          }
+          catch (error) {
+            if (startedIn !== workspaceEpoch) throw error;
+            lock("已锁定本机内容。主机退出状态暂无法确认：" + error.message, "manual-logout");
+            return;
+          }
+        } else if (!nativeMode && !desktopClient.enabled && RentPush.features().supported) {
+          const client = notificationsClient();
+          let timer;
+          try {
+            await Promise.race([client.disableLocal(), new Promise((resolve, reject) => {
+              timer = setTimeout(() => {
+                if (startedIn === workspaceEpoch) client.invalidate();
+                reject(new Error("取消本机浏览器通知等待超时，请在浏览器设置中关闭本网站通知。"));
+              }, 15000);
+            })]);
+            assertWorkspace(startedIn);
+          } catch (error) {
+            assertWorkspace(startedIn);
+            subscriptionWarning = error.message || "本机浏览器订阅的取消状态未能确认。";
+          } finally { clearTimeout(timer); }
+        }
+        notificationRequested = false;
+        lock(exitingOnline ? `已退出，本机财务内容已锁定。${subscriptionWarning ? `主机已收到本设备退出，但浏览器订阅清理暂未确认：${subscriptionWarning}` : ""}` :
+          `本机财务内容已锁定。当前离线，主机会话和设备通知的撤销状态暂无法确认，请联网后重新登录核对。${subscriptionWarning ? `本机浏览器通知清理未确认：${subscriptionWarning}` : ""}`, "manual-logout");
+        break;
+      }
+      case "password":
+        if (!online) throw new Error("修改主机密码须先连接主机。");
+        openModal("修改自己的密码", `<form id="password-form" class="form-grid">
+          ${field("当前密码", "oldPassword", "", "password", "required")}
+          ${field("新密码（至少 10 位）", "newPassword", "", "password", "required minlength=10")}
+          ${field("再次确认新密码", "confirmPassword", "", "password", "required minlength=10")}</form>
+          ${note("密码更改会使所有主机会话失效；本机草稿、原件及待同步请求会重新加密。", "warning")}`,
+          `${button("取消", "close-modal")}${button("更新密码并重新登录", "change-password", "", "primary")}`); break;
+      case "change-password": {
+        const form = document.getElementById("password-form");
+        if (!form.reportValidity()) return;
+        const d = Object.fromEntries(new FormData(form));
+        if (d.newPassword !== d.confirmPassword) throw new Error("两次输入的新密码不一致。");
+        if (ui.editorDirty) await saveEditor();
+        await post("/api/change-password", { oldPassword: d.oldPassword, newPassword: d.newPassword });
+        desktopClient.clear();
+        try { await vault.rekey(d.newPassword); }
+        catch (error) { lock("主机密码已变更，但本机加密工作区未能重新加密：" + error.message +
+          "。联网登录时请填写旧本机加密密码以恢复草稿和队列。"); return; }
+        lock("密码已变更，本机内容已重新加密；请使用新密码重新登录。"); break;
+      }
+      case "export-local-work":
+        openModal("导出加密本机工作", `<form id="export-work-form" class="form-grid">
+          ${field("设置迁移文件密码（12—128 位）*", "transferPassword", "", "password",
+            'required minlength="12" maxlength="128" autocomplete="new-password"')}
+          ${field("再次输入迁移文件密码*", "confirmTransferPassword", "", "password",
+            'required minlength="12" maxlength="128" autocomplete="new-password"')}</form>
+          ${note("导出的是本浏览器配置文件、此网站来源下的草稿、排队请求及所选/最近原件；不含已批准主机快照、登录密码或会话。更换网址不会自动复制 IndexedDB。文件已加密，但仍须安全保管密码与文件。", "warning")}`,
+          `${button("取消", "close-modal")}${button("生成加密迁移文件", "download-local-work", "", "primary")}`); break;
+      case "download-local-work": await exportLocalWork(); break;
+      case "import-local-work":
+        if (!online) throw new Error("请先在新地址联网登录，确认仍是原来的账套和账号，才能导入。");
+        ui.importBundle = null; ui.importPlan = null; ui.importRevision = null;
+        openModal("导入加密本机工作", `<form id="import-work-form" class="form-grid">
+          <div class="field full"><label for="transferFile">选择从旧浏览器下载的 .rent-work 加密文件 *</label>
+            <input id="transferFile" name="transferFile" type="file" accept=".rent-work,application/json" required></div>
+          ${field("导出时设定的迁移文件密码 *", "transferPassword", "", "password", "required autocomplete=off")}</form>
+          ${note("仅允许当前在线登录的同一主机与账号导入。旧快照不会成为正式账目；队列会先暂停，操作编号及原件上传编号保持不变。", "warning")}`,
+          `${button("取消", "close-modal")}${button("解密并检查冲突", "inspect-local-work", "", "primary")}`); break;
+      case "inspect-local-work": await inspectLocalWork(); break;
+      case "apply-local-work": await applyLocalWork(el.dataset.skipConflicts === "true"); break;
+      case "navigate":
+        await navigate(el.dataset.route, el.dataset.reviewFilter ? { reviewStatus: el.dataset.reviewFilter } : {});
+        break;
+      case "metric":
+        if (el.dataset.target === "review") await navigate("review", { reviewStatus: el.dataset.status || "pending" });
+        else if (el.dataset.target === "invoices") await navigate("dashboard", { invoiceStatus: el.dataset.status || "all", month: ui.month });
+        else await navigate(el.dataset.target, el.dataset.target === "reports" ? { status: el.dataset.status || "all", month: ui.month } : {});
+        break;
+      case "invoice-filter": ui.q = ""; ui.invoiceStatus = el.dataset.value; render(); break;
+      case "new-contract": if (!permitted("operator")) throw new Error("当前账号没有合同经办权限。"); await editContract(); break;
+      case "renew": {
+        const c = snapshot.contracts.find(value => value.id === id);
+        if (!c) throw new Error("原合同不可见。");
+        const d = blankContract(c.data);
+        d.renewalOf = c.id; d.number = ""; d.startDate = ""; d.endDate = "";
+        d.freeEnabled = false; d.freeStart = ""; d.freeEnd = ""; d.overrides = {}; d.openingPayments = [];
+        d.attachments = []; d.fees = d.fees.map(f => ({ ...f, id: Offline.id().replaceAll("-", "").slice(0, 30) }));
+        await editContract(d); break;
+      }
+      case "change-contract": {
+        const c = snapshot.contracts.find(value => value.id === id);
+        if (!c) throw new Error("合同不可见。");
+        await editContract(c.data, { changeContractId: c.id, changeVersion: c.version, effectiveDate: "" }); break;
+      }
+      case "edit-draft": {
+        const draft = vault.value.drafts.find(d => d.id === id);
+        if (!draft) throw new Error("此草稿已被另一个窗口更新；请重新登录加载。");
+        const editor = clone(draft); editor.data = blankContract(editor.data);
+        await navigate("wizard", { editor, step: 0, editorDirty: false, preview: null }); break;
+      }
+      case "save-draft": await saveEditor(); toast("草稿已加密保存。"); break;
+      case "wizard-next":
+        await saveEditor();
+        if (ui.step === 0 && !ui.editor.data.attachments.length) throw new Error("先选择一份真实原始合同文件。");
+        for (const control of main.querySelectorAll(".wizard-form-card input, .wizard-form-card select")) {
+          if (!control.checkValidity()) {
+            for (let parent = control.parentElement; parent; parent = parent.parentElement) {
+              if (parent.tagName === "DETAILS") parent.open = true;
+            }
+            control.reportValidity();
+            throw new Error("请先补齐这一页标有 * 的资料，并检查日期和数字。");
+          }
+        }
+        if (ui.step === 1 && ui.editor.data.locations.some(location =>
+          ["building", "floor", "zone", "area"].every(key => !location[key].trim()))) {
+          throw new Error("每处位置还要填写楼栋、楼层、区域或位置说明中的至少一项。");
+        }
+        if (ui.step === 1 && snapshot.parkDirectory && ui.editor.data.locations.some(location =>
+          !contractParks().some(entry => entry.name === Business.normalizePark(location.park)))) {
+          throw new Error("请从当前授权清单选择园区；原位置说明已保留，不会自动替换。");
+        }
+        if (ui.step === 1 && ui.editor.data.startDate > ui.editor.data.endDate) throw new Error("租期结束不能早于租期开始，请核对原合同日期。");
+        if (ui.step === 1 && ui.editor.data.managementStartDate > ui.editor.data.endDate) throw new Error("开始记账日期不能晚于这份合同的租期结束。");
+        if (ui.step === 2) Domain.parseMoney(ui.editor.data.amount);
+        clearError();
+        ui.step = Math.min(3, ui.step + 1); render(); window.scrollTo({ top: 0, behavior: "instant" }); break;
+      case "wizard-back": await saveEditor(); ui.step = Math.max(0, ui.step - 1); render(); window.scrollTo({ top: 0, behavior: "instant" }); break;
+      case "preview-again":
+        ui.editor.adjustingPeriod = null;
+        await saveEditor(); render(); break;
+      case "edit-period":
+        ui.editor.adjustingPeriod = el.dataset.period; render();
+        main.querySelector(`[data-adjustment-card="${CSS.escape(el.dataset.period)}"]`)?.scrollIntoView({ block: "center" });
+        break;
+      case "clear-period":
+        delete ui.editor.data.overrides[el.dataset.period];
+        ui.editor.adjustingPeriod = null; saveSoon(); render(); break;
+      case "apply-opening-batch": {
+        const result = ContractForm.applyOpeningBatch(schedule().rows, ui.editor.opening,
+          ui.editor.openingBatch?.choice, ui.editor.openingBatch?.reason, ui.editor.openingChoices || {});
+        ui.editor.opening = result.opening; saveSoon(); await saveEditor(); render();
+        toast(`已填入 ${result.count} 笔已收情况，未覆盖原有输入。`); break;
+      }
+      case "clear-unused-opening": {
+        const { rows, retainedOpeningIds = [] } = schedule();
+        if (!rows.length) throw new Error("请先补齐租期和租金，确认新的收租计划后再移除旧确认。");
+        const unused = Object.keys(ui.editor.opening).filter(key => !retainedOpeningIds.includes(key) &&
+          !rows.some(row => row.id === key && row.needsOpening));
+        if (!unused.length) throw new Error("当前没有不适用的收款确认。");
+        for (const key of unused) {
+          delete ui.editor.opening[key];
+          if (ui.editor.openingChoices) delete ui.editor.openingChoices[key];
+        }
+        saveSoon(); render(); break;
+      }
+      case "clear-unused-overrides": {
+        const dates = ContractForm.unusedOverrides(ui.editor.data);
+        if (!dates.length) throw new Error("没有可移除的旧调整；如租期尚未填完，请先补齐后再确认。");
+        for (const date of dates) delete ui.editor.data.overrides[date];
+        saveSoon(); render(); break;
+      }
+      case "submit-contract": await submitContract(); break;
+      case "remove-file":
+        ui.editor.data.attachments = ui.editor.data.attachments.filter(f => f.id !== id);
+        saveSoon(); render(); break;
+      case "add-location":
+        ui.editor.data.locations.push({ park: "", building: "", floor: "", zone: "", area: "", allocatedRent: "" });
+        saveSoon(); render(); break;
+      case "remove-location":
+        if (ui.editor.data.locations.length === 1) throw new Error("至少保留一个真实出租位置。");
+        ui.editor.data.locations.splice(Number(el.dataset.index), 1); saveSoon(); render(); break;
+      case "add-fee":
+        ui.editor.data.fees.push({ id: Offline.id().replaceAll("-", "").slice(0, 30), kind: "property",
+          label: "", amount: "", frequency: "once", dueDate: "" }); saveSoon(); render(); break;
+      case "remove-fee": ui.editor.data.fees.splice(Number(el.dataset.index), 1); saveSoon(); render(); break;
+      case "contract-detail": closeModalIfOpen(); await navigate("contract-detail", { selectedContract: id }); break;
+      case "invoice-detail": invoiceDetail(id); break;
+      case "application-detail": await navigate("application-detail", { appId: id }); break;
+      case "review-filter": ui.reviewStatus = el.dataset.value; render(); break;
+      case "review-decision": {
+        const startedIn = workspaceEpoch;
+        const app = snapshot.applications.find(a => a.id === ui.appId);
+        const displayedVersion = Number(el.dataset.version);
+        if (!app || app.id !== el.dataset.id || app.version !== displayedVersion)
+          throw new Error("申请已在你核对期间发生变化；请重新打开详情核对当前版本，原页面上的决定未提交。");
+        if (!permitted("reviewer") || !app || app.creator === user.id ||
+          app.status !== "pending" || !pendingReviews().includes(app))
+          throw new Error("只能复核他人当前可见的待审版本；离线意见待主机确认后生效。");
+        const decision = el.dataset.decision;
+        if (decision === "approve" && [...document.querySelectorAll(".review-check")].some(box => !box.checked))
+          throw new Error("请核实原件、权限和账务影响并勾选每项清单，再批准当前版本。");
+        const reason = document.getElementById("review-reason").value.trim();
+        if (decision === "return" && !reason) throw new Error("退回必须填写具体原因。");
+        await enqueue("review", { applicationId: app.id, expectedVersion: displayedVersion, decision, reason });
+        assertWorkspace(startedIn);
+        if (view === "application-detail" && ui.appId === app.id) render();
+        break;
+      }
+      case "resubmit": {
+        const app = snapshot.applications.find(a => a.id === id);
+        if (!app || app.creator !== user.id || app.status !== "returned") throw new Error("仅创建人可修改并重报退回申请。");
+        if (["contract", "contract-change"].includes(app.kind)) {
+          await editContract(app.payload.data, { sourceApplicationId: app.id, sourceVersion: app.version,
+            changeContractId: app.payload.contractId, changeVersion: app.payload.expectedVersion,
+            effectiveDate: app.payload.effectiveDate || "" });
+        } else actionForm(app.kind, app.payload.invoiceId || app.payload.contractId || app.payload.paymentId, app);
+        break;
+      }
+      case "start-action": actionForm(el.dataset.kind, id); break;
+      case "submit-action": {
+        const item = ui.action;
+        const { payload, reason } = readAction();
+        await enqueue(item.appId ? "resubmit" : "submit",
+          item.appId ? { applicationId: item.appId, expectedVersion: item.expectedApplicationVersion, payload, reason } :
+            { kind: item.kind, payload, reason });
+        if (!user || !vault || ui.action !== item) return;
+        closeModal(); await navigate("review", { reviewStatus: "mine" }); break;
+      }
+      case "retry":
+        if (vault.value.importAwaitingReview &&
+            !confirm("迁入请求将按原操作编号、原先后顺序向主机逐件提交，并重新检查当前权限、版本及非本人复核。确认继续同步？")) return;
+        retryCount = 0; await synchronize(true); break;
+      case "resolve-queue": {
+        const entry = [...vault.value.queue, ...(vault.value.rejected || [])].find(q => q.operation.operationId === id);
+        if (!entry?.error) throw new Error("没有需要人工处理的冲突请求。");
+        const op = entry.operation;
+        openModal("保留冲突记录 · 复制为新草稿", `<p>原请求 ${html(op.operationId)} 不会删除或修改，错误：${html(entry.error)}</p>
+          ${note("新申请将采用当前正式版本重新填写和核对；不会暗中覆盖较新的主机数据。", "warning")}
+          <p>请复制原申请原因和金额，逐项核对服务器最新版本再提交。</p>`,
+          `${button("保留原记录并关闭", "close-modal")}${button("复制到可编辑表单", "copy-queue", `data-id="${html(id)}"`, "primary")}`); break;
+      }
+      case "reopen-review": {
+        const entry = vault.value.queue.find(item => item.operation.operationId === id);
+        if (!entry?.error || entry.operation.type !== "review") throw new Error("只有已被主机拒绝的复核决定可以重新核对；未确认请求必须先同步。");
+        if (!online) throw new Error("请先联网读取当前申请；不得将旧审批意见直接改为新版本提交。");
+        await refresh();
+        if (!confirm("将旧的拒绝请求保留在加密存档中，并重新打开当前申请核对？不会复制旧的批准或退回决定。")) return;
+        await saveVault(state => {
+          state.rejected ||= [];
+          state.rejected.push({ ...entry, archivedAt: now() });
+          state.queue = state.queue.filter(item => item.operation.operationId !== id);
+        });
+        if (!vault.value.queue.some(item => item.error)) clearError();
+        await navigate("application-detail", { appId: entry.operation.payload.applicationId });
+        break;
+      }
+      case "copy-queue": {
+        const q = [...vault.value.queue, ...(vault.value.rejected || [])].find(entry => entry.operation.operationId === id);
+        if (!q) throw new Error("待处理请求不存在。");
+        if (q.operation.type === "review") throw new Error("复核冲突必须重新在线核对当前申请版本，不可复制旧审批决定。");
+        const kind = q.operation.payload.kind ||
+          snapshot.applications.find(a => a.id === q.operation.payload.applicationId)?.kind;
+        const p = q.operation.payload.payload;
+        closeModal();
+        if (["contract", "contract-change"].includes(kind)) await editContract(p.data, kind === "contract-change" ?
+          { changeContractId: p.contractId, changeVersion: snapshot.contracts.find(c => c.id === p.contractId)?.version,
+            effectiveDate: p.effectiveDate } : {});
+        else actionForm(kind, p.invoiceId || p.contractId || p.paymentId,
+          { payload: p, reason: q.operation.payload.reason });
+        break;
+      }
+      case "archive-queue": {
+        const entry = vault.value.queue.find(item => item.operation.operationId === id);
+        if (!entry?.error) throw new Error("只有被主机拒绝的请求可存档；待确认请求必须先向主机查询结果。");
+        if (!confirm("将拒绝请求加密存档并继续后续同步？原始请求、错误和文件仍保留，可再复制为新申请。")) return;
+        await saveVault(state => {
+          state.rejected ||= [];
+          state.rejected.push({ ...entry, archivedAt: now() });
+          state.queue = state.queue.filter(item => item.operation.operationId !== id);
+        });
+        render();
+        if (online) await synchronize();
+        break;
+      }
+      case "view-file": await viewFile(id, el.dataset.name); break;
+      case "inline-file": await inlineFile(id, el.dataset.name); break;
+      case "download-file": await downloadFile(id, el.dataset.name); break;
+      case "version-detail": {
+        const c = snapshot.contracts.find(item => item.id === id);
+        const v = c?.versions.find(item => item.version === Number(el.dataset.version));
+        if (!v) throw new Error("此版本不在授权快照中。");
+        openModal(`合同版本 ${v.version}`, `<p>${html(v.at)} · ${html(v.reason)}</p><h3>${html(v.data.number)} · ${html(v.data.tenant)}</h3>
+          ${metadataFacts(v.data)}
+          <p>原租期 ${html(v.data.startDate)} — ${html(v.data.endDate)} · 管账日 ${html(v.data.managementStartDate)}</p>
+          <p>租金 ¥ ${html(v.data.amount)} · ${html(Reporting.locationsText(v.data.locations))}</p>
+          ${v.data.attachments.map(attachmentLink).join("<br>")}`, button("关闭", "close-modal")); break;
+      }
+      case "app-version": {
+        const app = snapshot.applications.find(a => a.id === id);
+        const v = app?.versions.find(item => item.version === Number(el.dataset.version));
+        if (!v) throw new Error("旧申请版本不在授权快照中。");
+        openModal(`申请版本 ${v.version}`, `<p>${html(v.at)}</p>${payloadFacts({ ...app, payload: v.payload })}`, button("关闭", "close-modal"), true); break;
+      }
+      case "export-xlsx": {
+        const startedIn = workspaceEpoch;
+        const month = ui.month;
+        if (!online || !user.canExport) throw new Error("导出须联网并获主机授权。");
+        const params = new URLSearchParams({ basis: ui.basis, month: ui.month, kind: ui.kind, status: ui.status, q: ui.q });
+        const response = await request(`/api/reports.xlsx?${params}`);
+        const blob = await response.blob();
+        assertWorkspace(startedIn);
+        await saveDownload(blob, `收租报表-${month}.xlsx`); break;
+      }
+      case "export-pdf": {
+        if (!online || !user.canExport) throw new Error("打印导出须联网并获主机授权。");
+        const startedIn = workspaceEpoch;
+        await post("/api/exports/authorize", { format: "pdf", basis: ui.basis, month: ui.month,
+          kind: ui.kind, status: ui.status, q: ui.q });
+        assertWorkspace(startedIn);
+        await printReport(); break;
+      }
+      case "notifications":
+        notificationRequested = false;
+        if (location.hash === "#notifications") history.replaceState(history.state, "", location.pathname + location.search);
+        openModal("我的提醒", `<p>${desktopClient.enabled ? "未处理事项会保留在这里。" : "连接主机后同步最新提醒。"}</p>
+          ${snapshot.notifications.map(n => `<div class="mini-card">${html(n.title)} · ${html(n.date)}
+            <p>${html(n.detail)} ${n.read ? "· 已读" : ""}</p>
+            ${n.invoiceId ? link("查看应收明细", "invoice-detail", `data-id="${html(n.invoiceId)}"`) : ""}
+            ${n.applicationId ? link("查看申请", "application-detail", `data-id="${html(n.applicationId)}"`) : ""}
+            ${n.month ? link("查看当月缴费日与租金清单", "notification-month", `data-month="${html(n.month)}"`) : ""}
+            ${!n.read && online ? button("标记已读", "read-notification", `data-id="${html(n.id)}"`, "small") : ""}</div>`).join("") || "当前无提醒"}
+          ${button("通知设置", "push-settings")}
+          ${!nativeMode && !desktopClient.enabled ? button("开启系统弹窗", "notification-permission") : ""}`, button("关闭", "close-modal")); break;
+      case "save-reminders":
+        await post("/api/me/reminders", { receiveReminders: document.getElementById("my-reminders").checked, expectedVersion: user.version });
+        await refresh(); render(); toast("提醒设置已保存。"); break;
+      case "desktop-test": desktopClient.test(); break;
+      case "desktop-support": desktopClient.support(); break;
+      case "notification-month":
+        closeModal();
+        await navigate("reports", { month: el.dataset.month, basis: "due", kind: "rent", status: "all", q: "" });
+        break;
+      case "read-notification":
+        if (!online) throw new Error("离线无法向主机确认已读。");
+        await post("/api/notifications/read", { ids: [id] }); closeModal(); await refresh(); break;
+      case "notification-permission":
+        if (!("Notification" in window)) throw new Error("当前浏览器不支持系统弹窗提醒。");
+        if (await Notification.requestPermission() !== "granted") throw new Error("浏览器未允许弹窗提醒，站内提醒仍可使用。");
+        await saveVault(value => { value.pagePopupEnabled = true; });
+        await showNotifications();
+        toast("本页面弹窗已允许；手机后台推送还须单独完成设备绑定与通道配置。"); break;
+      case "push-settings": closeModalIfOpen(); await navigate("devices"); break;
+      case "push-refresh": await loadPushStatus(); break;
+      case "push-admin-refresh":
+        if (!online || !permitted("admin")) throw new Error("主机通知状态需要管理员在线查看。");
+        if (desktopClient.enabled) throw new Error("Windows 提醒请在“通知设置”中查看。");
+        ui.adminPush = await json("/api/admin/push");
+        if (view === "admin") document.getElementById("admin-push-panel").innerHTML = RentPushPanel.renderAdmin(ui.adminPush);
+        break;
+      case "push-enable": await enableDevicePush(); break;
+      case "push-cancel":
+        ui.push.cancelled = true;
+        notificationsClient().invalidate();
+        toast("已停止等待设备验证。请刷新设备状态，以主机的确认结果为准。");
+        break;
+      case "push-disable":
+        await notificationsClient().disable();
+        await loadPushStatus();
+        toast("主机设备绑定和本浏览器订阅均已关闭；业务草稿未删除。");
+        break;
+      case "push-test": await testDevicePush(id); break;
+      case "push-revoke":
+        if (!online) throw new Error("停用通知设备需要连接主机。");
+        if (!confirm("停用这台设备后，主机不再为它新增推送；已交给服务商的消息可能仍在途中。确定停用？")) return;
+        await json(`/api/push/devices/${encodeURIComponent(id)}`, { method: "DELETE" });
+        await loadPushStatus();
+        toast("主机已停用这台设备的后续通知。");
+        break;
+      case "user-create": userForm(); break;
+      case "invitation-create": {
+        if (modal.open) throw new Error("请先完成当前窗口，再打开个人邀请。");
+        const state = await refreshInvitations();
+        if (!state.delivery.linkAvailable) throw new Error(state.delivery.reason);
+        if (modal.open) { toast("邀请状态已更新，请完成当前窗口后再打开个人邀请。"); break; }
+        openModal("选择同事的岗位", InvitationPanel.issueForm(),
+          `${button("取消", "close-modal")}${button(state.delivery.packageAvailable ? "生成并下载安装包" : "生成邀请链接", "invitation-issue", "", "primary")}`);
+        break;
+      }
+      case "invitation-issue": {
+        if (!online || !permitted("admin")) throw new Error("邀请管理需要联网并使用管理员账号。");
+        const form = document.getElementById("invitation-form");
+        if (!form?.reportValidity()) return;
+        const data = new FormData(form), roles = data.getAll("roles");
+        if (!roles.length) {
+          formFeedback(form, "请选择至少一种岗位。", form.querySelector('[name="roles"]'));
+          return;
+        }
+        formFeedback(form, "");
+        form.setAttribute("aria-busy", "true");
+        for (const input of form.querySelectorAll("input")) input.disabled = true;
+        let issued;
+        const startedIn = workspaceEpoch;
+        try {
+          issued = await Invitations.issue(post, { roles,
+            canExport: data.has("canExport"), receiveReminders: data.has("receiveReminders") });
+        } catch (error) {
+          if (startedIn !== workspaceEpoch || error.name === "AbortError") return;
+          if (error.network || error.status >= 500 || !error.status) {
+            ui.invitationIssueUnconfirmed = true;
+            ui.invitationAdminMessage = `创建结果尚未确认。请先刷新状态；若已有新邀请，请先撤销再新建，不要重复生成。${error.message}`;
+            if (modal.open && document.getElementById("invitation-form") === form) closeModal();
+            renderInvitations();
+          } else formFeedback(form, error.message);
+          return;
+        } finally {
+          form.setAttribute("aria-busy", "false");
+          for (const input of form.querySelectorAll("input")) input.disabled = false;
+        }
+        if (modal.open && document.getElementById("invitation-form") === form) closeModal();
+        invitationListVersion++;
+        ui.invitationIssueUnconfirmed = false;
+        ui.invitationAdminMessage = "";
+        ui.invitationAdmin = { ...ui.invitationAdmin, delivery: issued.delivery,
+          invitations: [issued.invitation, ...(ui.invitationAdmin?.invitations || []).filter(item => item.id !== issued.invitation.id)] };
+        renderInvitations();
+        if (issued.delivery.packageAvailable) await downloadInvitation(issued.invitation.id);
+        else {
+          ui.invitationFeedback[issued.invitation.id] = "邀请已创建。请复制邀请链接，只发给这位同事。";
+          renderInvitations();
+        }
+        break;
+      }
+      case "invitation-refresh": await refreshInvitations(); break;
+      case "invitation-download": await downloadInvitation(id); break;
+      case "invitation-copy": {
+        const startedIn = workspaceEpoch;
+        try {
+          const state = await refreshInvitations();
+          const invitation = state.invitations.find(item => item.id === id);
+          if (!invitation || invitation.status !== "pending") throw new Error(invitation?.status === "accepted" ?
+            "账号已开通，无需再发送邀请。请让同事直接登录。" : "这份邀请已不能使用，请刷新状态核对。");
+          if (!state.delivery.linkAvailable) throw new Error(state.delivery.reason || "邀请链接暂不可用，请刷新状态后重试。");
+          if (!navigator.clipboard?.writeText) throw new Error(state.delivery.packageAvailable ?
+            "浏览器无法复制链接，请改为下载安装包。" : "浏览器无法复制链接，请使用支持剪贴板的安全浏览器入口。");
+          await Invitations.copyLink(id, value => navigator.clipboard.writeText(value));
+          if (lastError === ui.invitationCopyError) clearError();
+          ui.invitationCopyError = "";
+          ui.invitationFeedback[id] = "邀请链接已复制，请只发给这位同事。";
+          renderInvitations();
+        } catch (error) {
+          if (startedIn === workspaceEpoch && error.name !== "AbortError") {
+            ui.invitationCopyError = error.message;
+            ui.invitationFeedback[id] = !ui.invitationAdmin?.delivery.linkAvailable ? "邀请链接暂不可用，请先处理上方提示。" : Invitations.hasHeld(id) ?
+              `${ui.invitationAdmin?.delivery.packageAvailable ? "链接未复制，请重试或改为下载安装包。" : "链接未复制，请检查浏览器的复制权限后重试。"}${error.message}` :
+              "本页已不能复制，请先刷新状态核对；需要新邀请时，请先撤销旧邀请再新建。";
+            renderInvitations();
+          }
+          throw error;
+        }
+        break;
+      }
+      case "invitation-revoke": {
+        if (!confirm("撤销后，这份个人文件和链接将不能再开通账号。确定撤销？")) return;
+        try {
+          const result = await post(`/api/admin/invitations/${encodeURIComponent(id)}/revoke`, {});
+          invitationListVersion++;
+          Invitations.reconcile([result.invitation]);
+          if (ui.invitationAdmin) ui.invitationAdmin.invitations = ui.invitationAdmin.invitations.map(item =>
+            item.id === id ? result.invitation : item);
+          renderInvitations();
+        } catch (error) {
+          if (error.code === "INVITATION_ACCEPTED") {
+            invitationListVersion++;
+            Invitations.reconcile([{ id, status: "accepted" }]);
+            if (ui.invitationAdmin) ui.invitationAdmin.invitations = ui.invitationAdmin.invitations.map(item =>
+              item.id === id ? { ...item, status: "accepted" } : item);
+            renderInvitations();
+          }
+          throw error;
+        }
+        await refreshInvitations();
+        toast("邀请已撤销。如仍需开通，请重新签发一份。");
+        break;
+      }
+      case "user-edit": userForm(ui.adminUsers.find(item => item.id === id)); break;
+      case "save-user": {
+        if (!online || !permitted("admin")) throw new Error("账号管理必须联网。");
+        const form = document.getElementById("user-form");
+        if (!form.reportValidity()) return;
+        const data = new FormData(form);
+        const roles = data.getAll("roles");
+        if (!roles.length) throw new Error("至少选择一个角色。");
+        const payload = { displayName: data.get("displayName").trim(), roles,
+          canExport: data.has("canExport"), receiveReminders: data.has("receiveReminders") };
+        const account = ui.adminUsers.find(item => item.id === id);
+        if (account) {
+          payload.expectedVersion = account.version; payload.active = data.has("active");
+          if (data.get("password")) payload.password = data.get("password");
+          await json(`/api/admin/users/${encodeURIComponent(id)}`, { method: "PUT", body: JSON.stringify(payload) });
+        } else {
+          payload.username = data.get("username").trim(); payload.password = data.get("password");
+          await post("/api/admin/users", payload);
+        }
+        closeModal(); await loadAdmin(); break;
+      }
+      case "save-settings": {
+        if (!online || !permitted("admin")) throw new Error("设置必须联网保存。");
+        const form = document.getElementById("settings-form");
+        if (!form.reportValidity()) return;
+        const data = Object.fromEntries(new FormData(form));
+        const settings = await json("/api/admin/settings", { method: "PUT", body: JSON.stringify({
+          accountingStartDate: data.accountingStartDate, dueReminderTime: data.dueReminderTime,
+          monthlyReminderTime: data.monthlyReminderTime, offlineDays: Number(data.offlineDays),
+          expectedVersion: Number(form.dataset.version),
+        }) });
+        await refresh(); render(); toast(`设置已由主机保存（版本 ${settings.settings.version}）。`); break;
+      }
+      case "update-check": await updateCommand("check"); break;
+      case "update-stage": await updateCommand("stage", { releaseId: el.dataset.release }); break;
+      case "update-install":
+        if (!confirm("将先等待最近在线页面保存和同步，备份主机账目及原件，再短暂重启。未完成工作不会被强制丢弃；请通知其他使用人员。确定开始？")) return;
+        await updateCommand("install", { stagedId: el.dataset.staged, expectedVersion: el.dataset.version }); break;
+      case "update-cancel": await updateCommand("cancel", { jobId: el.dataset.job }); break;
+      case "update-reload": await updateClient.safeReload(); break;
+      case "manual-backup":
+        if (!online || !permitted("admin")) throw new Error("主机备份只能在线进行。");
+        await post("/api/admin/backup", {}); await loadAdmin(); toast("主机已创建备份。"); break;
+      default: throw new Error(`未知操作 ${action}。`);
+    }
+  }
+  function closeModalIfOpen() { if (modal.open) closeModal(); }
+
+  document.addEventListener("submit", event => {
+    if (event.target.id === "invitation-form") {
+      event.preventDefault();
+      document.querySelector('[data-action="invitation-issue"]')?.click();
+      return;
+    }
+    if (event.target.id === "join-form") {
+      event.preventDefault();
+      joinSubmit(event.target).catch(error => formFeedback(event.target, error.message));
+      return;
+    }
+    if (event.target.id !== "auth-form") return;
+    event.preventDefault();
+    if (authenticating) { toast("正在验证账号，请稍候。"); return; }
+    authenticating = true;
+    const button = event.target.querySelector('button[type="submit"]');
+    const label = button?.textContent;
+    if (button) { button.disabled = true; button.textContent = bootstrap && !bootstrap.initialized ? "正在创建……" : "正在登录……"; }
+    formFeedback(event.target, "");
+    authSubmit().catch(error => {
+      if (error.status !== 401 && error.status !== 403 && error.network) online = false;
+      const form = document.getElementById("auth-form"), input = error.field ? form?.elements.namedItem(error.field) : null;
+      if (input?.closest("details")) input.closest("details").open = true;
+      formFeedback(form, error.message, input);
+    }).finally(() => {
+      authenticating = false;
+      renderUpdateStatus();
+      if (button) { button.disabled = false; button.textContent = label; }
+      if (Invitations.status().phase !== "none") invitationArrived();
+      if (notificationRequested) openRequestedNotifications();
+    });
+  });
+  document.addEventListener("click", event => {
+    const el = event.target.closest("[data-action]");
+    if (!el) return;
+    if (el.tagName === "A") event.preventDefault();
+    if (user && !offlineAccess()) return;
+    const action = el.dataset.action;
+    if (updatePaused && !action.startsWith("update-") && action !== "invitation-dismiss") { toast("这页已保存并暂停，请等待主机更新完成或取消。"); return; }
+    if (pendingActions.has(action)) { toast("此操作正在保存或同步，请稍候，勿重复提交。"); return; }
+    const guarded = guardedActions.has(action);
+    const startedIn = workspaceEpoch, trackWork = !action.startsWith("update-");
+    if (trackWork) actionWork++;
+    if (guarded) {
+      pendingActions.add(action); el.disabled = true;
+      if (invitationBusyLabels[action]) {
+        invitationActivity.set(action, el.dataset.id || "");
+        renderInvitationActivity();
+      }
+    }
+    handleAction(el).catch(error => {
+      if (invitationBusyLabels[action] && (startedIn !== workspaceEpoch || error.name === "AbortError")) return;
+      showError(error);
+    }).finally(() => {
+      if (startedIn === workspaceEpoch) {
+        if (trackWork) actionWork--;
+        if (guarded) {
+          pendingActions.delete(action);
+          invitationActivity.delete(action);
+          renderInvitationActivity();
+        }
+        renderUpdateStatus();
+      }
+      if (guarded && !invitationBusyLabels[action]) el.disabled = false;
+    });
+  });
+  document.addEventListener("input", event => {
+    if (user && !offlineAccess()) return;
+    const el = event.target;
+    if (el.id === "manualUsername") lastLoginName = el.value;
+    if (el.id === "global-search") {
+      ui.q = el.value;
+      if (view !== "wizard" && !hasReviewWork()) {
+        const search = el;
+        const position = search.selectionStart;
+        render();
+        document.getElementById("global-search").focus();
+        document.getElementById("global-search").setSelectionRange(position, position);
+      }
+      return;
+    }
+    if (el.dataset.edit !== undefined && ui.editor) {
+      const key = el.dataset.edit;
+      ui.editor.data[key] = ["cycleMonths", "advanceMonths", "dueDay"].includes(key) ?
+        (el.value === "" ? null : Number(el.value)) : key === "freeEnabled" ? el.value === "true" : el.value;
+      if (key === "freeEnabled" && !ui.editor.data.freeEnabled) {
+        ui.editor.data.freeStart = ""; ui.editor.data.freeEnd = "";
+      }
+      if (key === "lessorId" && el.value !== "other") ui.editor.data.lessorOtherName = "";
+      saveSoon();
+    }
+    if (el.dataset.group && ui.editor) {
+      const item = ui.editor.data[el.dataset.group][Number(el.dataset.index)];
+      if (item) {
+        item[el.dataset.key] = el.value;
+        if (el.dataset.group === "fees" && el.dataset.key === "frequency") item.dueDate = "";
+        saveSoon();
+      }
+    }
+    if (el.dataset.override && ui.editor) {
+      const key = el.dataset.override;
+      const value = ui.editor.data.overrides[key] || { amount: "", dueDate: "", reason: "" };
+      value[el.dataset.key] = el.value;
+      if (Object.values(value).some(Boolean)) ui.editor.data.overrides[key] = value;
+      else delete ui.editor.data.overrides[key];
+      saveSoon();
+    }
+    if (el.dataset.opening && ui.editor) {
+      const value = ui.editor.opening[el.dataset.opening] || { paid: "", reason: "" };
+      value[el.dataset.key] = el.value;
+      ui.editor.opening[el.dataset.opening] = value;
+      saveSoon();
+    }
+    if (el.dataset.openingBatch && ui.editor) {
+      ui.editor.openingBatch ||= { choice: "", reason: "" };
+      ui.editor.openingBatch[el.dataset.openingBatch] = el.value;
+      saveSoon();
+    }
+    if (el.dataset.effective && ui.editor) {
+      ui.editor.effectiveDate = el.value; saveSoon();
+      if (ui.step === 3) main.querySelector(".wizard-form-card").innerHTML = editorPart();
+    }
+  });
+  document.addEventListener("change", async event => {
+    const el = event.target;
+    const startedWorkIn = workspaceEpoch, trackFile = !!el.dataset.files;
+    if (trackFile) fileWork++;
+    try {
+      if (user && !offlineAccess()) return;
+      if (el.id === "user-role-preset" && el.value !== "custom") {
+        const roles = { business: ["operator", "viewer"], finance: ["reviewer", "viewer"], owner: ["admin", "viewer"] }[el.value];
+        if (!roles) throw new Error("岗位无效。");
+        const form = document.getElementById("user-form");
+        for (const input of form.querySelectorAll('input[name="roles"]')) input.checked = roles.includes(input.value);
+        form.querySelector('input[name="receiveReminders"]').checked = el.value !== "business";
+        return;
+      }
+      if (el.dataset.openingChoice && ui.editor) {
+        const row = schedule().rows.find(item => item.id === el.dataset.openingChoice);
+        if (!row) throw new Error("这笔费用已经不在收租计划中，请重新预览。");
+        ui.editor.opening[row.id] = ContractForm.chooseOpening(row, ui.editor.opening[row.id], el.value);
+        ui.editor.openingChoices ||= {};
+        ui.editor.openingChoices[row.id] = el.value;
+        saveSoon(); render(); return;
+      }
+      if (el.dataset.filter) { ui[el.dataset.filter] = el.value; render(); return; }
+      if (el.dataset.termination) {
+        const previous = Object.fromEntries(new FormData(document.getElementById("action-form")));
+        const contract = snapshot.contracts.find(c => c.id === ui.action.targetId);
+        document.getElementById("termination-items").innerHTML = terminationRows(contract.id, el.value, previous, ui.action.adjustments);
+        return;
+      }
+      if (["edit-freeEnabled", "edit-lessorId", "edit-cycleMonths"].includes(el.id) || el.dataset.key === "frequency") { render(); return; }
+      if (el.dataset.files) {
+        if (!vault) throw new Error("工作区尚未解锁，无法缓存附件。");
+        if (!offlineAccess()) return;
+        const group = el.dataset.files;
+        const startedIn = workspaceEpoch, editor = ui.editor, action = ui.action;
+        const assertForm = () => {
+          assertWorkspace(startedIn);
+          if (group === "contract" ? ui.editor !== editor : ui.action !== action)
+            throw new Error("选择文件期间表单已切换；未把文件附加到新表单，请重新选择。");
+        };
+        for (const file of el.files) {
+          if (!offlineAccess()) return;
+          const result = await Offline.cacheFile(file);
+          assertForm();
+          await saveVault(value => { value.files[result.attachment.id] = result.record; });
+          assertForm();
+          if (group === "contract") {
+            ui.editor.data.attachments.push(result.attachment);
+            ui.editorDirty = true;
+            await saveEditor();
+          } else {
+            if (!ui.action) throw new Error("收款表单已关闭，请重新选择附件。");
+            ui.action.attachments.push(result.attachment);
+            document.getElementById("action-attachments").innerHTML = ui.action.attachments.map(attachmentLink).join("<br>");
+          }
+        }
+        if (group === "contract") render();
+        toast(`${el.files.length} 份真实文件已写入本账号加密工作区；联网时按固定上传编号发送。`);
+      }
+    } catch (error) { showError(error); }
+    finally {
+      if (trackFile && startedWorkIn === workspaceEpoch) { fileWork--; renderUpdateStatus(); }
+    }
+  });
+  modal.addEventListener("close", () => {
+    if (sourceUrl) { URL.revokeObjectURL(sourceUrl); sourceUrl = null; }
+    ui.action = null;
+    ui.importBundle = null; ui.importPlan = null; ui.importRevision = null;
+    renderUpdateStatus();
+  });
+  modal.addEventListener("cancel", event => {
+    const form = document.getElementById("invitation-form");
+    if (form?.getAttribute("aria-busy") === "true") { event.preventDefault(); formFeedback(form, "正在生成邀请，请稍候。"); }
+  });
+  invitationGuard.addEventListener("cancel", () => Invitations.clearJoin("none", false));
+  window.addEventListener("rent-invitation-change", invitationArrived);
+  window.addEventListener("rent-invitations-held-change", renderInvitations);
+  window.addEventListener("pagehide", () => {
+    document.getElementById("join-form")?.reset();
+    document.getElementById("auth-form")?.reset();
+  });
+  window.addEventListener("pageshow", event => {
+    if (event.persisted && document.getElementById("join-form") && !user) renderAuth("请重新打开原邀请，或使用已有账号登录。");
+  });
+  document.addEventListener("toggle", event => {
+    const section = event.target.dataset?.editorSection;
+    if (!section || !ui.editor || !main.contains(event.target)) return;
+    ui.editor.expandedSections ||= {};
+    if (ui.editor.expandedSections[section] === event.target.open) return;
+    ui.editor.expandedSections[section] = event.target.open;
+  }, true);
+  document.addEventListener("keyup", event => {
+    const hint = document.getElementById("caps-lock-hint");
+    if (hint && auth.contains(event.target)) hint.hidden = !event.getModifierState("CapsLock");
+  });
+  window.addEventListener("online", () => { retryCount = 0; synchronize(); });
+  window.addEventListener("rent-open-notifications", openRequestedNotifications);
+  window.addEventListener("rent-native-notification", openRequestedNotifications);
+  navigator.serviceWorker?.addEventListener("message", event => {
+    if (event.data?.type === "RENT_OPEN_NOTIFICATIONS") openRequestedNotifications();
+    if (event.data?.type === "RENT_PUSH_RECEIPT_PENDING" && user) toast("通知回执暂未被主机确认，设备状态可能仍显示“通道接受”，不影响查看站内未读提醒。");
+    if (event.data?.type === "RENT_PUSH_PAYLOAD_REJECTED" && user) toast("收到无法核验的设备消息。请在“通知设置”中核对配置，不要信任通知外的未知链接。");
+  });
+  window.addEventListener("offline", () => {
+    online = false; chrome();
+    if (user && view !== "wizard" && !modal.open && !hasReviewWork()) render();
+  });
+  syncTimer = setInterval(() => {
+    if (user && retryCount < 6 && navigator.onLine) synchronize();
+  }, desktopClient.enabled ? 10000 : 45000);
+  setInterval(() => {
+    if (user && online && permitted("admin") && (view === "admin" || updateState.maintenance) &&
+        Date.now() - lastUpdateStatusAt >= 4500) {
+      refreshUpdateStatus().catch(error => {
+        if (!error.network && error.name !== "AbortError") showError(error);
+      });
+    }
+  }, 5000);
+  setInterval(() => {
+    if (user && online && permitted("admin") && view === "admin" && !modal.open) refreshPairings().catch(showError);
+  }, 5000);
+  setInterval(() => { if (user) offlineAccess(); }, 10000);
+  window.addEventListener("beforeunload", event => {
+    if (ui.editorDirty || draftRecovery.hasPending() || modal.open || invitationGuard.open || hasUnsavedSettings() || hasReviewWork() ||
+        fileWork > 0 || savingWork > 0 || claimingInvitation) {
+      event.preventDefault(); event.returnValue = "";
+    }
+  });
+  updateClient = RentUpdateClient.createController({
+    version: CLIENT_VERSION, tabId: CLIENT_ID, getWorkState: updateWorkState,
+    saveDraft: saveBeforeUpdate, pause: pauseWorkspace, prepareReload: prepareUpdateReload,
+    request: async (path, options) => {
+      const wasOnline = online;
+      if (!csrf) await restoreSession();
+      const response = await json(path, { ...options, body: JSON.stringify(options.body) });
+      if (wasOnline !== online && user) chrome();
+      return response;
+    },
+    changed: state => { updateState = state; renderUpdateStatus(); },
+    reportError: showError, reload: () => location.reload(),
+  });
+  initialize().catch(error => {
+    if (Invitations.status().phase !== "none") {
+      renderAuth(error.message || "暂时无法检查邀请，请稍后重试。");
+      return;
+    }
+    auth.innerHTML = `<div class="card auth-card"><h1>无法打开安全工作区</h1><p>${html(error.message)}</p>
+      <p class="auth-footer">请检查主机连接、浏览器私密存储和安全来源（localhost / HTTPS），然后重新加载页面。</p></div>`;
+  });
+})();
