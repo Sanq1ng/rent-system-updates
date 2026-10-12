@@ -1,0 +1,41 @@
+"use strict";
+
+const fs = require("node:fs");
+const path = require("node:path");
+const crypto = require("node:crypto");
+
+function generateVapidFile(file, { programDir = path.resolve(__dirname, "..") } = {}) {
+  if (typeof file !== "string" || !path.isAbsolute(file)) throw new Error("VAPID 密钥须写入明确的外部绝对路径。");
+  const parent = fs.realpathSync(path.dirname(file));
+  const program = fs.realpathSync(programDir);
+  const relative = path.relative(program, parent);
+  if (relative === "" || (relative !== ".." && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative))) {
+    throw new Error("VAPID 私钥不能放在程序、打包或更新目录内。");
+  }
+  const ecdh = crypto.createECDH("prime256v1");
+  ecdh.generateKeys();
+  const scalar = ecdh.getPrivateKey();
+  if (scalar.length < 1 || scalar.length > 32) throw new Error("VAPID 私钥长度无效，未创建文件。");
+  const privateKey = Buffer.alloc(32);
+  scalar.copy(privateKey, 32 - scalar.length);
+  const keys = { publicKey: ecdh.getPublicKey().toString("base64url"), privateKey: privateKey.toString("base64url") };
+  const handle = fs.openSync(path.join(parent, path.basename(file)), "wx", 0o600);
+  try {
+    fs.writeFileSync(handle, `${JSON.stringify(keys)}\n`, "utf8");
+    fs.fsyncSync(handle);
+  } finally { fs.closeSync(handle); }
+  return { created: true, publicKey: keys.publicKey };
+}
+
+if (require.main === module) {
+  try {
+    if (process.argv.length !== 3) throw new Error("用法：node server\\push-keys.cjs <程序目录以外的密钥文件绝对路径>");
+    generateVapidFile(process.argv[2]);
+    console.log("已创建外部 VAPID 密钥文件；未发送任何通知。Windows 请另用文件 ACL 限制为服务账号可读。");
+  } catch (error) {
+    console.error(error.message);
+    process.exitCode = 1;
+  }
+}
+
+module.exports = { generateVapidFile };

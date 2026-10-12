@@ -1,0 +1,323 @@
+using System;
+using System.Collections.Generic;
+using System.Diagnostics;
+using System.Drawing;
+using System.IO;
+using System.IO.Pipes;
+using System.Linq;
+using System.Reflection;
+using System.Security.Cryptography;
+using System.Security.Principal;
+using System.Text;
+using System.Threading;
+using System.Threading.Tasks;
+using System.Windows.Forms;
+using RentLan;
+
+[assembly: AssemblyTitle("园区租赁 · 程序更新")]
+[assembly: AssemblyVersion("0.4.9.0")]
+[assembly: AssemblyFileVersion("0.4.9.0")]
+
+namespace RentCentre.Apply
+{
+    internal sealed class ApplyOptions
+    {
+        internal string Program, Config, Job, ParentStarted;
+        internal int Parent;
+        internal bool Rollback, Recover, Client;
+        internal static ApplyOptions Parse(string[] args)
+        {
+            var result = new ApplyOptions(); var seen = new HashSet<string>();
+            for (int i = 0; i < args.Length; i++) {
+                string key = args[i];
+                if (!seen.Add(key)) throw new IOException("更新参数重复。");
+                if (key == "--rollback") result.Rollback = true;
+                else if (key == "--recover") result.Recover = true;
+                else if (key == "--client") result.Client = true;
+                else {
+                    if (++i >= args.Length) throw new IOException("更新参数不完整。");
+                    if (key == "--program") result.Program = args[i];
+                    else if (key == "--config") result.Config = args[i];
+                    else if (key == "--job") result.Job = args[i];
+                    else if (key == "--parent") result.Parent = Int32.Parse(args[i]);
+                    else if (key == "--parent-start") result.ParentStarted = args[i];
+                    else throw new IOException("不支持的更新参数。");
+                }
+            }
+            Paths.Absolute(result.Program, false); Paths.Absolute(result.Config, false); Product.Uuid(result.Job);
+            if (!result.Recover && (result.Parent <= 0 || String.IsNullOrEmpty(result.ParentStarted))) throw new IOException("缺少原窗口的交接身份。");
+            return result;
+        }
+    }
+
+    internal sealed class ApplyForm : Form
+    {
+        private readonly ApplyOptions options;
+        private readonly Label label = new Label { Dock = DockStyle.Fill, Padding = new Padding(24), Text = "正在核对更新……" };
+        private readonly Button close = new Button { Dock = DockStyle.Bottom, Height = 40, Text = "关闭", Enabled = false };
+        private bool finished;
+        private bool rolledBack;
+        private bool recoveryHandedOff;
+        private string source, root;
+        internal ApplyForm(ApplyOptions options)
+        {
+            this.options = options;
+            Text = "园区租赁 · 更新"; Size = new Size(600, 240); StartPosition = FormStartPosition.CenterScreen;
+            Font = new Font("Microsoft YaHei UI", 11); Controls.Add(label); Controls.Add(close);
+            close.Click += (sender, e) => Close();
+            Shown += async (sender, e) => {
+                try { await Run(); label.Text = recoveryHandedOff ? "正在交给恢复窗口处理，请等待结果。" :
+                    rolledBack ? "新版未启用，已恢复上一程序版本。" :
+                    "更新完成，软件已重新打开。"; }
+                catch (Exception error) { label.Text = "更新未完成。\r\n\r\n" + Clean(error.Message) +
+                    "\r\n\r\n请保留当前目录，再次打开原软件继续更新；不要重新建账。"; }
+                finally { finished = true; close.Enabled = true; }
+            };
+        }
+        private static string Clean(string message)
+        {
+            string value = System.Text.RegularExpressions.Regex.Replace(message ?? "未知错误", @"[\x00-\x1f\x7f]+", " ");
+            return value.Length > 650 ? value.Substring(0, 650) : value;
+        }
+        private static string Quote(string value)
+        {
+            if (value == null || value.Contains("\"") || value.EndsWith("\\", StringComparison.Ordinal)) throw new IOException("更新启动路径无效。");
+            return "\"" + value + "\"";
+        }
+        private void CheckOwner()
+        {
+            root = Directory.GetParent(options.Program).FullName;
+            using (var pins = new DirectoryPins(root)) {
+                var installation = Json.Object(Product.Utf8.GetString(Paths.Read(Path.Combine(root, "installation.json"), 32768)));
+                if (Json.String(installation, "format") != "industrial-rent-installation" ||
+                    Json.Integer(installation, "formatVersion") != 1 || Json.String(installation, "ownerSid") != Product.Sid ||
+                    Directory.GetAccessControl(root).GetOwner(typeof(SecurityIdentifier)).Value != Product.Sid ||
+                    options.Program != Path.Combine(root, "程序") || options.Config != Path.Combine(root, "配置", "config.json"))
+                    throw new IOException("只能更新当前 Windows 用户的这套受管安装。");
+                source = Directory.GetParent(Path.GetDirectoryName(Application.ExecutablePath)).FullName;
+                if (!System.Text.RegularExpressions.Regex.IsMatch(Path.GetFileName(source), "^[a-f0-9]{64}$") ||
+                    Directory.GetParent(source).Name != "releases") throw new IOException("更新助手必须来自已核验的不可变程序暂存目录。");
+            }
+        }
+        private async Task WaitForParent()
+        {
+            if (options.Recover) return;
+            using (var parent = Process.GetProcessById(options.Parent)) {
+                if (parent.StartTime.ToUniversalTime().Ticks.ToString() != options.ParentStarted ||
+                    !new[] { Path.Combine(root, "启动园区租赁.exe"), Path.Combine(options.Program, "园区租赁主机.exe"),
+                        Path.Combine(options.Program, "desktop", "园区租赁主机.exe"), Path.Combine(options.Program, "client-windows", "园区租赁.exe") }
+                        .Contains(parent.MainModule.FileName, StringComparer.OrdinalIgnoreCase))
+                    throw new IOException("原窗口身份已变化，未替换程序。");
+                var frame = Json.Object(Console.ReadLine());
+                if (Json.String(frame, "command") != "apply" || Json.Integer(frame, "protocol") != 1 ||
+                    Json.String(frame, "jobId") != options.Job) throw new IOException("没有收到原窗口的私有交接确认。");
+                Console.WriteLine("{\"ready\":true}"); Console.Out.Flush();
+                if (!await Task.Run(() => parent.WaitForExit(30000))) throw new IOException("原窗口尚未退出，未替换正在运行的程序。");
+            }
+        }
+        private async Task CloseBusiness()
+        {
+            string state = Path.Combine(root, "电脑端资料");
+            string name = "RentClient-" + Product.Hash(Product.Utf8.GetBytes(Path.GetFullPath(state).ToLowerInvariant() + ":" + Product.Sid));
+            using (var pipe = new NamedPipeClientStream(".", name, PipeDirection.InOut)) {
+                try { await Task.Run(() => pipe.Connect(1500)); }
+                catch (TimeoutException) { return; }
+                using (var writer = new StreamWriter(pipe, Product.Utf8, 1024, true))
+                using (var reader = new StreamReader(pipe, Product.Utf8, false, 1024, true)) {
+                    writer.WriteLine("{\"command\":\"exit-for-update\"}"); writer.Flush();
+                    Task<string> reading = reader.ReadLineAsync();
+                    if (await Task.WhenAny(reading, Task.Delay(5000)) != reading) throw new IOException("业务窗口没有回应，未替换程序。");
+                    var response = Json.Object(await reading);
+                    int id = Json.Integer(response, "pid");
+                    Process process;
+                    try { process = Process.GetProcessById(id); } catch (ArgumentException) { return; }
+                    using (process) {
+                        if (process.StartTime.ToUniversalTime().Ticks.ToString() != Json.String(response, "startedAt") ||
+                            process.MainModule.FileName != Path.Combine(options.Program, "client-windows", "园区租赁.exe"))
+                            throw new IOException("业务窗口归属无法确认。");
+                        if (!await Task.Run(() => process.WaitForExit(30000)))
+                            throw new IOException("请先完成业务窗口里的填写或上传并退出软件，再重新打开继续更新。");
+                    }
+                }
+            }
+        }
+        private async Task<Dictionary<string, object>> Node(string command)
+        {
+            var start = new ProcessStartInfo(Path.Combine(source, "runtime", "node.exe"),
+                "--disable-warning=ExperimentalWarning " + Quote(Path.Combine(source, "updates", options.Client ? "desktop-agent.cjs" : "full-apply.cjs")) + " " + command +
+                " --program " + Quote(options.Program) + " --config " + Quote(options.Config) + " --job " + options.Job +
+                (command == "prepare" && options.Rollback ? " --rollback yes" : "")) {
+                UseShellExecute = false, CreateNoWindow = true, WorkingDirectory = source, RedirectStandardOutput = true, RedirectStandardError = true,
+                StandardOutputEncoding = Product.Utf8, StandardErrorEncoding = Product.Utf8
+            };
+            start.EnvironmentVariables.Remove("NODE_OPTIONS"); start.EnvironmentVariables.Remove("NODE_PATH");
+            using (var process = Process.Start(start)) {
+                Task<string> output = process.StandardOutput.ReadToEndAsync(), errors = process.StandardError.ReadToEndAsync();
+                if (!await Task.Run(() => process.WaitForExit(300000))) { process.Kill(); throw new IOException("程序交接检查超时，未声明更新成功。"); }
+                string result = await output, error = await errors;
+                if (process.ExitCode != 0) throw new IOException(String.IsNullOrWhiteSpace(error) ? "程序交接检查失败。" : error);
+                return Json.Object(result, 2097152);
+            }
+        }
+        private static string Hash(string file)
+        {
+            using (var input = new CheckedFile(file, false)) using (var sha = SHA256.Create())
+                return BitConverter.ToString(sha.ComputeHash(input.Stream)).Replace("-", "").ToLowerInvariant();
+        }
+        private static string Below(string directory, string relative)
+        {
+            if (relative.Contains("\\") || relative.StartsWith("/", StringComparison.Ordinal)) throw new IOException("程序清单路径无效。");
+            string result = Path.GetFullPath(Path.Combine(directory, relative.Replace('/', '\\')));
+            Paths.Absolute(result, false);
+            if (!result.StartsWith(directory.TrimEnd('\\') + "\\", StringComparison.OrdinalIgnoreCase)) throw new IOException("程序路径超出本次范围。");
+            return result;
+        }
+        private async Task Copy(string from, string to, string expected)
+        {
+            Product.Sha256(expected);
+            using (var parent = new DirectoryPins(Path.GetDirectoryName(from))) {
+                if (Hash(from) != expected) throw new IOException("暂存程序在复制前发生变化。");
+            }
+            string directory = Path.GetDirectoryName(to);
+            EnsureDirectory(directory);
+            using (var pins = new DirectoryPins(directory)) {
+                if (File.Exists(to) && Hash(to) == expected) return;
+                string temporary = to + ".update-" + options.Job.Replace("-", "");
+                if (File.Exists(temporary)) {
+                    if (Hash(temporary) != expected) {
+                        label.Text = "正在重写本次中断的程序临时副本……";
+                        using (var owned = new CheckedFile(temporary, true)) NativeFiles.Delete(owned.Stream.SafeFileHandle, temporary);
+                    }
+                }
+                if (!File.Exists(temporary)) {
+                    using (var input = new CheckedFile(from, false))
+                    using (var output = new FileStream(temporary, FileMode.CreateNew, FileAccess.Write, FileShare.None)) {
+                        input.Stream.CopyTo(output); output.Flush(true);
+                    }
+                    if (Hash(temporary) != expected) throw new IOException("复制后程序摘要不符。");
+                }
+                DateTime deadline = DateTime.UtcNow.AddSeconds(30);
+                while (true) {
+                    try {
+                        if (File.Exists(to)) { using (var existing = new CheckedFile(to, false)) { } File.Replace(temporary, to, null); }
+                        else File.Move(temporary, to);
+                        break;
+                    } catch (IOException error) {
+                        int code = error.HResult & 65535;
+                        if ((code != 32 && code != 33) || DateTime.UtcNow >= deadline) throw;
+                    }
+                    await Task.Delay(250);
+                }
+            }
+        }
+        private static void EnsureDirectory(string directory)
+        {
+            if (!Directory.Exists(directory)) {
+                string parent = Path.GetDirectoryName(directory);
+                EnsureDirectory(parent);
+                using (var pins = new DirectoryPins(parent)) Directory.CreateDirectory(directory);
+            }
+            using (var pins = new DirectoryPins(directory)) { }
+        }
+        private async Task Run()
+        {
+            CheckOwner();
+            using (var mutex = new Mutex(false, @"Local\RentFullApply-" + Product.Hash(Product.Utf8.GetBytes(root.ToLowerInvariant() + ":" + Product.Sid)))) {
+                bool owns = false;
+                DateTime deadline = DateTime.UtcNow.AddSeconds(12);
+                do {
+                    try { owns = mutex.WaitOne(0); } catch (AbandonedMutexException) { owns = true; }
+                    if (!owns) await Task.Delay(200);
+                } while (!owns && DateTime.UtcNow < deadline);
+                if (!owns) throw new IOException("另一窗口正在更新这套软件，请等待它完成。");
+                try {
+                    await WaitForParent();
+                    label.Text = "正在确认本机工作已保存……";
+                    await CloseBusiness();
+                    var plan = await Node("prepare");
+                    if (Json.String(plan, "format") != "industrial-rent-full-apply" || Json.Integer(plan, "formatVersion") != 1 ||
+                        Json.String(plan, "jobId") != options.Job || Json.String(plan, "program") != options.Program ||
+                        Json.String(plan, "configFile") != options.Config || Json.String(plan, "root") != root)
+                        throw new IOException("程序复制计划不属于本次安装。");
+                    string selected = Json.String(plan, "source");
+                    if (Path.GetDirectoryName(selected) != Path.GetDirectoryName(source)) throw new IOException("保留程序不在同一暂存根目录。");
+                    var files = plan["files"] as List<object>;
+                    if (files == null || files.Count > 512) throw new IOException("程序清单数量无效。");
+                    int completed = 0;
+                    foreach (var raw in files) {
+                        var file = raw as Dictionary<string, object>;
+                        string relative = Json.String(file, "path");
+                        label.Text = "正在更新程序 " + (++completed) + " / " + files.Count + "……";
+                        await Copy(Below(selected, relative), Below(options.Program, relative), Json.String(file, "sha256"));
+                    }
+                    foreach (var raw in (List<object>)plan["obsolete"]) {
+                        var file = (Dictionary<string, object>)raw;
+                        string location = Below(options.Program, Json.String(file, "path"));
+                        if (File.Exists(location)) {
+                            if (Hash(location) != Json.String(file, "sha256")) throw new IOException("旧程序文件已被其他操作修改，没有删除。");
+                            using (var pins = new DirectoryPins(Path.GetDirectoryName(location))) using (var owned = new CheckedFile(location, true))
+                                NativeFiles.Delete(owned.Stream.SafeFileHandle, location);
+                        }
+                    }
+                    foreach (var raw in (List<object>)plan["aliases"]) {
+                        var alias = (Dictionary<string, object>)raw;
+                        string destination = Json.String(alias, "target");
+                        if (!new[] { Path.Combine(root, "启动园区租赁.exe"), Path.Combine(options.Program, "园区租赁主机.exe") }.Contains(destination))
+                            throw new IOException("启动入口路径无效。");
+                        await Copy(Below(selected, Json.String(alias, "source")), destination, Json.String(alias, "sha256"));
+                    }
+                    label.Text = "正在核对完整程序和账本格式……";
+                    await Node("verify");
+                    var start = new ProcessStartInfo(Path.Combine(root, "启动园区租赁.exe"), "--config " + Quote(options.Config) +
+                        (options.Client ? "" : " --update-job " + options.Job)) {
+                        UseShellExecute = false, WorkingDirectory = root
+                    };
+                    using (var process = Process.Start(start)) {
+                        if (await Task.Run(() => process.WaitForExit(1500)) && !(options.Client && process.ExitCode == 0))
+                            throw new IOException("新窗口提前退出，请保留错误信息。");
+                    }
+                    if (options.Client) return;
+                    label.Text = "正在等待主机确认更新完成……";
+                    string stateFile = Path.Combine(Json.String(plan, "storage"), "update-state", "state.json");
+                    DateTime end = DateTime.UtcNow.AddSeconds(75);
+                    while (DateTime.UtcNow < end) {
+                        var current = Json.Object(Product.Utf8.GetString(Paths.Read(stateFile, 8388608, true)), 8388608);
+                        var job = current["job"] as Dictionary<string, object>;
+                        if (job == null || Json.String(job, "id") != options.Job) throw new IOException("更新任务发生变化，未声明成功。");
+                        string phase = Json.String(job, "phase");
+                        if (phase == "committed" || phase == "rolled-back") { rolledBack = phase == "rolled-back"; return; }
+                        if (phase == "full-apply-pending" && job.ContainsKey("fullRollback") && Equals(job["fullRollback"], true)) {
+                            recoveryHandedOff = true; return;
+                        }
+                        await Task.Delay(500);
+                    }
+                    throw new IOException("尚未收到主机完成确认。程序与备份保留，请查看主机窗口。");
+                } finally { mutex.ReleaseMutex(); }
+            }
+        }
+        protected override void OnFormClosing(FormClosingEventArgs e) { if (!finished) e.Cancel = true; base.OnFormClosing(e); }
+    }
+    internal static class ApplyProgram
+    {
+        internal static void OpenHandoffStreams()
+        {
+            // A GUI helper inherits private pipes, not a console with a mutable code page.
+            var input = Console.OpenStandardInput();
+            if (input == Stream.Null) throw new IOException("更新助手没有收到原窗口的私有交接管道。");
+            Console.SetIn(new StreamReader(input, Product.Utf8, false));
+            Arguments.Streams();
+        }
+        [STAThread]
+        private static int Main(string[] args)
+        {
+            Application.EnableVisualStyles(); Application.SetCompatibleTextRenderingDefault(false);
+            try {
+                var options = ApplyOptions.Parse(args);
+                if (!options.Recover) OpenHandoffStreams();
+                using (var window = new ApplyForm(options)) Application.Run(window);
+                return 0;
+            }
+            catch (Exception error) { MessageBox.Show(error.Message, "更新未启动", MessageBoxButtons.OK, MessageBoxIcon.Error); return 1; }
+        }
+    }
+}

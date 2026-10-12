@@ -1,0 +1,320 @@
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Linq;
+
+namespace RentLan
+{
+    internal sealed class HostState
+    {
+        public string format = "industrial-rent-lan-host-state";
+        public int formatVersion = 1;
+        public string ownerSid, configFile, programDirectory, serverId, runId, certificateDirectory, sourceOrigin;
+        public FirewallPlan firewall;
+        public TrustReceipt trust;
+        public bool certificateReady, coreConfigured, coreRestored, shareReady;
+        public string firewallState = "none";
+        public string discoveryFirewallState = "none";
+        public string shareDirectory;
+        public string phase = "prepared";
+        public string lastError;
+        internal static string JournalDirectory(string configFile)
+        {
+            Paths.Absolute(configFile, false);
+            return Path.Combine(Path.GetDirectoryName(configFile), "局域网向导-" + Product.Hash(Product.Utf8.GetBytes(configFile.ToLowerInvariant())).Substring(0, 16));
+        }
+        internal static HostState New(LanStatus status, InterfaceChoice choice, bool domain)
+        {
+            if (!status.initialized) throw new IOException("请先在本机创建管理员账号。");
+            choice.Validate();
+            if (!status.interfaces.Any(item => item.address == choice.address && item.prefixLength == choice.prefixLength))
+                throw new IOException("只能选择刚刚检测到的网卡，不接受另一个来源。");
+            string run = Guid.NewGuid().ToString("D");
+            var state = new HostState {
+                ownerSid = Product.Sid, configFile = status.configFile, programDirectory = status.programDirectory, serverId = status.serverId,
+                runId = run, sourceOrigin = status.sourceOrigin,
+                certificateDirectory = Path.Combine(Path.GetDirectoryName(status.configFile), "局域网证书-" + run),
+                firewall = new FirewallPlan {
+                    programDirectory = status.programDirectory, serverId = status.serverId, runId = run, ownerSid = Product.Sid,
+                    address = choice.address, prefixLength = choice.prefixLength, port = status.port, includeDomain = domain
+                }
+            };
+            string installation = Path.GetDirectoryName(status.programDirectory);
+            state.shareDirectory = Path.Combine(installation, "维护接入资料-" + run);
+            state.Validate(status); state.CheckDestinations(status);
+            return state;
+        }
+        internal void Validate(LanStatus status)
+        {
+            if (format != "industrial-rent-lan-host-state" || formatVersion != 1 || ownerSid != Product.Sid ||
+                configFile != status.configFile || programDirectory != status.programDirectory || serverId != status.serverId || firewall == null)
+                throw new IOException("向导归属记录与当前用户、程序、配置或账套不同，拒绝接管。");
+            Product.Uuid(runId);
+            if (certificateDirectory != Path.Combine(Path.GetDirectoryName(configFile), "局域网证书-" + runId))
+                throw new IOException("证书目录不属于本次向导的固定新目录。");
+            Paths.Absolute(certificateDirectory, false); Paths.Absolute(shareDirectory, false);
+            firewall.Validate();
+            if (firewall.programDirectory != programDirectory || firewall.serverId != serverId || firewall.runId != runId || firewall.ownerSid != ownerSid)
+                throw new IOException("防火墙计划与向导归属不符。");
+            if (firewall.discovery || !new[] { "none", "planned", "added", "preexisting", "removed" }.Contains(firewallState) ||
+                !new[] { "none", "planned", "added", "preexisting", "removed" }.Contains(discoveryFirewallState))
+                throw new IOException("防火墙归属状态无效。");
+            if (coreConfigured && !certificateReady) throw new IOException("向导配置与证书准备记录不一致。");
+            if (certificateReady)
+            {
+                Connection connection = ReadConnection();
+                if (trust == null) throw new IOException("主机证书信任记录缺失。");
+                trust.Validate(connection, ownerSid);
+            }
+        }
+        internal void CheckDestinations(LanStatus status)
+        {
+            foreach (string root in new[] { status.programDirectory, status.dataDir, status.backupDir, status.updateDir }.Where(value => value != null))
+                if (Paths.Inside(root, certificateDirectory) || Paths.Inside(certificateDirectory, root) ||
+                    Paths.Inside(root, shareDirectory) || Paths.Inside(shareDirectory, root))
+                    throw new IOException("证书和员工接入目录必须位于程序、账本、备份、更新目录之外。若配置仍在程序目录内，请先由维护人员改用外置配置。");
+            if (Paths.Inside(certificateDirectory, shareDirectory) || Paths.Inside(shareDirectory, certificateDirectory))
+                throw new IOException("员工接入目录不能包含私钥目录，二者必须分开。");
+        }
+        internal Connection ReadConnection()
+        {
+            var connection = Connection.Read(Path.Combine(certificateDirectory, "connection.rent-lan"), true);
+            if (connection.serverId != serverId || connection.origin != Network.Origin(firewall.address, firewall.port))
+                throw new IOException("证书材料的账套或来源不属于当前计划。");
+            return connection;
+        }
+        internal string Summary()
+        {
+            return "证书材料：" + (certificateReady ? "已生成（未共享私钥）" : "未确认") +
+                "\r\n主机网络配置：" + (coreRestored ? "原本机配置已恢复" : coreConfigured ? "HTTPS 已保存，需主机恢复运行" : "未确认启用，请刷新核对") +
+                "\r\n防火墙：" + (firewallState == "added" ? "本工具已新增并核验" : firewallState == "preexisting" ? "精确规则已存在但不归本次删除" :
+                    firewallState == "removed" ? "本次规则已撤销" : "未确认") +
+                "\r\n同网发现：" + (discoveryFirewallState == "added" || discoveryFirewallState == "preexisting" ? "UDP 48765，仅所选办公子网" : "尚未放行或已停用") +
+                "\r\n主机当前用户信任：" + (trust == null ? "未操作" : trust.state) +
+                "\r\n员工接入目录：" + (shareReady ? shareDirectory : "尚未完成") +
+                "\r\n远程联网/业务登录：本向导不作成功声明，须主机恢复后由员工工具单独验证。";
+        }
+    }
+    internal interface IHostEffects
+    {
+        LanStatus Status();
+        void CheckNetwork(HostState state);
+        Connection MakeCertificate(HostState state);
+        Connection ReadConnection(HostState state);
+        void Configure(HostState state);
+        bool AddFirewall(HostState state);
+        void RemoveFirewall(HostState state);
+        bool AddDiscoveryFirewall(HostState state);
+        void RemoveDiscoveryFirewall(HostState state);
+        void AddTrust(HostState state, Connection connection, Action save);
+        void RemoveTrust(HostState state, Connection connection, Action save);
+        void Share(HostState state, Connection connection);
+        void Restore(HostState state);
+    }
+    internal sealed class WindowsHostEffects : IHostEffects
+    {
+        private readonly ICoreLan core;
+        private readonly ITrustStore trust;
+        internal WindowsHostEffects(ICoreLan core, ITrustStore trust) { this.core = core; this.trust = trust; }
+        public LanStatus Status() { return core.Status(); }
+        public void CheckNetwork(HostState state)
+        {
+            if (OfficeNetwork.NeedsPrivate(state.firewall)) FirewallElevation.Request(state.firewall, false, true);
+            new WindowsNetworkGate().RequireTrusted(state.firewall);
+        }
+        public Connection MakeCertificate(HostState state)
+        {
+            return Certificates.Make(state.certificateDirectory, state.firewall.address, state.firewall.port, state.serverId);
+        }
+        public Connection ReadConnection(HostState state) { return state.ReadConnection(); }
+        public void Configure(HostState state) { core.Enable(state.certificateDirectory, state.firewall.address, state.firewall.prefixLength); }
+        public bool AddFirewall(HostState state)
+        { return AddRule(state.firewall, state.firewallState == "added"); }
+        public bool AddDiscoveryFirewall(HostState state)
+        { return AddRule(state.firewall.DiscoveryPlan(), state.discoveryFirewallState == "added"); }
+        private static bool AddRule(FirewallPlan plan, bool owned)
+        {
+            using (var store = new WindowsFirewallStore())
+            {
+                store.RequireEnabled(plan.Profiles);
+                var actual = store.Find(plan.Name);
+                if (actual != null)
+                {
+                    if (!plan.Expected().Same(actual)) throw new IOException("规则已被修改，未覆盖。");
+                    return owned;
+                }
+            }
+            bool added = FirewallElevation.Request(plan, false);
+            using (var store = new WindowsFirewallStore())
+                if (!plan.Expected().Same(store.Find(plan.Name))) throw new IOException("UAC 返回后规则核验失败，不能确认放行。");
+            return added;
+        }
+        public void RemoveFirewall(HostState state)
+        { RemoveRule(state.firewall, state.firewallState == "added"); }
+        public void RemoveDiscoveryFirewall(HostState state)
+        { RemoveRule(state.firewall.DiscoveryPlan(), state.discoveryFirewallState == "added"); }
+        private static void RemoveRule(FirewallPlan plan, bool owned)
+        {
+            if (!owned) return;
+            using (var store = new WindowsFirewallStore())
+            {
+                var actual = store.Find(plan.Name);
+                if (actual == null) return;
+                if (!plan.Expected().Same(actual)) throw new IOException("规则被修改，拒绝删除；请管理员核对 " + plan.Name);
+            }
+            FirewallElevation.Request(plan, true);
+            using (var store = new WindowsFirewallStore())
+                if (store.Find(plan.Name) != null) throw new IOException("授权后仍存在本次规则，未确认删除。");
+        }
+        public void AddTrust(HostState state, Connection connection, Action save)
+        {
+            Trust.Add(trust, connection, state.trust, Product.Sid, true, save);
+        }
+        public void RemoveTrust(HostState state, Connection connection, Action save)
+        {
+            Trust.Remove(trust, connection, state.trust, Product.Sid, save);
+        }
+        public void Share(HostState state, Connection connection)
+        {
+            if (state.shareReady)
+            {
+                using (var pins = new DirectoryPins(state.shareDirectory))
+                {
+                    string[] names = Directory.GetFileSystemEntries(state.shareDirectory).Select(Path.GetFileName).OrderBy(name => name, StringComparer.Ordinal).ToArray();
+                    string[] expected = new[] { Product.ClientExe, "connection.rent-lan", "接入必读.txt" }.OrderBy(name => name, StringComparer.Ordinal).ToArray();
+                    if (!names.SequenceEqual(expected) ||
+                        !Product.Equal(Paths.Read(Path.Combine(state.shareDirectory, Product.ClientExe), 32 * 1024 * 1024), ClientPackage.Executable(state.programDirectory)) ||
+                        Json.Encode(Connection.Read(Path.Combine(state.shareDirectory, "connection.rent-lan"), false)) != Json.Encode(connection))
+                        throw new IOException("员工接入目录已改变或含有额外文件，拒绝宣称可安全共享。请另选一个新目录重新制作。");
+                    Paths.Read(Path.Combine(state.shareDirectory, "接入必读.txt"), 16384);
+                }
+                return;
+            }
+            ClientPackage.Create(state.shareDirectory, state.programDirectory, connection);
+        }
+        public void Restore(HostState state) { core.Disable(); }
+    }
+    internal static class HostWorkflow
+    {
+        internal static int ResumeExitCode(LanStatus status, HostState state)
+        {
+            if (status == null || status.addressChanged) return 1;
+            if (state == null) return status.lanEnabled || status.recoveryAvailable ? 1 : 0;
+            if (state.lastError != null || state.configFile != status.configFile || state.serverId != status.serverId ||
+                state.programDirectory != status.programDirectory) return 1;
+            if (state.phase == "disabled")
+                return state.coreRestored && !status.lanEnabled && !status.recoveryAvailable && status.sourceOrigin == state.sourceOrigin ? 0 : 1;
+            if (state.phase != "awaiting-host-restart" || state.coreRestored || !state.coreConfigured || !state.certificateReady ||
+                !state.shareReady || !status.lanEnabled || !status.initialized || state.trust == null || state.firewall == null ||
+                !new[] { "added", "preexisting" }.Contains(state.firewallState) ||
+                !new[] { "added", "preexisting" }.Contains(state.discoveryFirewallState) ||
+                !new[] { "added", "preexisting", "uncertain" }.Contains(state.trust.state)) return 1;
+            return String.Equals(status.certificateDirectory, state.certificateDirectory, StringComparison.OrdinalIgnoreCase) &&
+                status.sourceOrigin == Network.Origin(state.firewall.address, state.firewall.port) ? 0 : 1;
+        }
+        private static void Stage(HostState state, string phase, Action save) { state.phase = phase; state.lastError = null; save(); }
+        private static IOException Failure(HostState state, Exception failure, Action save)
+        {
+            state.lastError = failure.Message;
+            string error = failure.Message;
+            try { save(); }
+            catch (Exception persistence) { error += "\r\n另有归属记录保存失败：" + persistence.Message; }
+            return new IOException("操作未全部完成，未自动回滚、未删除证书或业务文件。\r\n" + error + "\r\n\r\n" + state.Summary() +
+                "\r\n可在同一记录重试；若要换 IP/证书，请确认草稿后先停用并恢复原配置。", failure);
+        }
+        internal static void Continue(HostState state, IHostEffects effects, bool drafts, bool firewallConsent, bool trustConsent, Action save)
+        {
+            if (!drafts || !firewallConsent || !trustConsent)
+                throw new IOException("必须确认员工草稿已同步或导出，并分别同意窄范围防火墙及主机当前用户证书信任。");
+            if (state.coreRestored) throw new IOException("这次操作已恢复本机配置；请建立新的证书和接入计划，不能重新启用旧来源。");
+            try
+            {
+                LanStatus status = effects.Status();
+                if (status.serverId != state.serverId || status.configFile != state.configFile)
+                    throw new IOException("账套或配置路径在准备后变化，已停止。");
+                if (!status.initialized) throw new IOException("原账套的初始化状态异常，请联系维护人员核对。");
+                if (status.lanEnabled)
+                {
+                    if (!String.Equals(status.certificateDirectory, state.certificateDirectory, StringComparison.OrdinalIgnoreCase) ||
+                        status.sourceOrigin != Network.Origin(state.firewall.address, state.firewall.port))
+                        throw new IOException("当前 HTTPS 来源不属于这次记录，不能覆盖或扩大访问。");
+                    state.coreConfigured = true; save();
+                }
+                else if (state.coreConfigured || status.recoveryAvailable)
+                    throw new IOException("已有部分配置或恢复记录；请先明确停用恢复，不能盲目重复启用。");
+                if (status.addressChanged) throw new IOException("主机地址或子网已变化。请先同步或导出员工草稿，再停用并重新配置同事连接。");
+                Stage(state, "checking-office-network", save);
+                effects.CheckNetwork(state);
+                Connection connection;
+                if (!state.certificateReady)
+                {
+                    Stage(state, "creating-certificate", save);
+                    connection = effects.MakeCertificate(state);
+                    state.certificateReady = true;
+                    state.trust = new TrustReceipt { ownerSid = state.ownerSid, caSha256 = connection.caSha256 };
+                    save();
+                }
+                else connection = effects.ReadConnection(state);
+                connection.RequireCurrent();
+                if (!state.coreConfigured)
+                {
+                    Stage(state, "configuring-https", save);
+                    effects.Configure(state);
+                    state.coreConfigured = true; save();
+                }
+                Stage(state, "firewall", save);
+                if (state.firewallState != "added" && state.firewallState != "preexisting") { state.firewallState = "planned"; save(); }
+                state.firewallState = effects.AddFirewall(state) ? "added" : "preexisting"; save();
+                Stage(state, "discovery-firewall", save);
+                if (state.discoveryFirewallState != "added" && state.discoveryFirewallState != "preexisting") { state.discoveryFirewallState = "planned"; save(); }
+                state.discoveryFirewallState = effects.AddDiscoveryFirewall(state) ? "added" : "preexisting"; save();
+                Stage(state, "host-user-trust", save);
+                effects.AddTrust(state, connection, save);
+                Stage(state, "public-handoff", save);
+                effects.Share(state, connection);
+                state.shareReady = true; state.phase = "awaiting-host-restart"; save();
+            }
+            catch (Exception failure) { throw Failure(state, failure, save); }
+        }
+        internal static void Disable(HostState state, IHostEffects effects, bool drafts, bool removalConsent, Action save)
+        {
+            if (!drafts || !removalConsent) throw new IOException("停用前须确认员工草稿已同步/导出，并同意仅撤销本工具自有的规则和证书。");
+            try
+            {
+                LanStatus status = effects.Status();
+                if (status.serverId != state.serverId || status.configFile != state.configFile)
+                    throw new IOException("当前账套或配置已变化，不能自动恢复。");
+                if ((status.lanEnabled || status.recoveryAvailable) &&
+                    !String.Equals(status.certificateDirectory, state.certificateDirectory, StringComparison.OrdinalIgnoreCase))
+                    throw new IOException("当前局域网恢复记录已属于另一批证书/操作，不能用旧向导恢复或删除其配置。");
+                if (!state.coreRestored)
+                {
+                    Stage(state, "restoring-original-configuration", save);
+                    if (status.lanEnabled || status.recoveryAvailable) effects.Restore(state);
+                    else if (status.sourceOrigin != state.sourceOrigin)
+                        throw new IOException("找不到可核对的原来源，不能假定已恢复。");
+                    state.coreRestored = true; save();
+                }
+                var failures = new List<string>();
+                if (state.discoveryFirewallState == "added")
+                {
+                    try { effects.RemoveDiscoveryFirewall(state); state.discoveryFirewallState = "removed"; save(); }
+                    catch (Exception error) { failures.Add("同网发现规则清理未完成：" + error.Message); }
+                }
+                if (state.firewallState == "added")
+                {
+                    try { effects.RemoveFirewall(state); state.firewallState = "removed"; save(); }
+                    catch (Exception error) { failures.Add("本机配置已恢复，但防火墙清理未完成：" + error.Message); }
+                }
+                if (state.certificateReady)
+                {
+                    try { effects.RemoveTrust(state, effects.ReadConnection(state), save); }
+                    catch (Exception error) { failures.Add("本机配置已恢复，但主机当前用户信任撤销未完成：" + error.Message); }
+                }
+                if (failures.Count > 0) throw new IOException(String.Join("\r\n", failures));
+                state.phase = "disabled"; state.lastError = null; save();
+            }
+            catch (Exception failure) { throw Failure(state, failure, save); }
+        }
+    }
+}

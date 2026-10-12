@@ -1,0 +1,176 @@
+using System;
+using System.Collections.Generic;
+using System.Drawing;
+using System.IO;
+using System.Threading.Tasks;
+using System.Windows.Forms;
+
+namespace RentCentre.Desktop
+{
+    internal sealed class AccountSetupForm : Form
+    {
+        private readonly TextBox username = new TextBox { Name = "accountUsername", MaxLength = 80, Dock = DockStyle.Fill };
+        private readonly TextBox password = new TextBox { Name = "accountPassword", MaxLength = 128, UseSystemPasswordChar = true, Dock = DockStyle.Fill };
+        private readonly CheckBox reveal = new CheckBox { Name = "showAccountPassword", Text = "显示", AutoSize = true, Dock = DockStyle.Fill };
+        private readonly DateTimePicker date = new DateTimePicker {
+            Name = "accountStartDate", Format = DateTimePickerFormat.Custom, CustomFormat = "yyyy-MM-dd",
+            Value = DateTimeOffset.UtcNow.ToOffset(TimeSpan.FromHours(8)).Date, Dock = DockStyle.Fill
+        };
+        private readonly TextBox result = new TextBox {
+            Name = "accountSetupResult", ReadOnly = true, Multiline = true, BorderStyle = BorderStyle.None,
+            Dock = DockStyle.Fill, ScrollBars = ScrollBars.Vertical, BackColor = Color.White, ForeColor = Theme.Muted, TabStop = false
+        };
+        private readonly Button submit = new Button { Name = "createAccountButton", Text = "创建账号并继续", AutoSize = true };
+        private readonly Button cancel = new Button { Name = "cancelAccountSetup", Text = "稍后再设置", AutoSize = true };
+        private readonly Func<string, string, DateTime, Task> create;
+        private bool busy;
+
+        internal AccountSetupForm(Func<string, string, DateTime, Task> create)
+        {
+            this.create = create;
+            Text = "园区租赁 · 设置我的账号";
+            Font = new Font("Microsoft YaHei UI", 10);
+            StartPosition = FormStartPosition.CenterParent; ClientSize = new Size(590, 370);
+            FormBorderStyle = FormBorderStyle.FixedDialog; MaximizeBox = false; MinimizeBox = false;
+            AutoScaleMode = AutoScaleMode.Dpi; BackColor = Color.White;
+            var layout = new TableLayoutPanel { Dock = DockStyle.Fill, Padding = new Padding(24), ColumnCount = 2, RowCount = 6 };
+            layout.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 145));
+            layout.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
+            layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 65));
+            for (int i = 0; i < 3; i++) layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 42));
+            layout.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
+            layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 42));
+            var heading = new Label { Text = "创建你的管理员账号。用户名可以用中文。", AutoSize = true };
+            layout.Controls.Add(heading, 0, 0); layout.SetColumnSpan(heading, 2);
+            layout.Controls.Add(new Label { Text = "用户名", AutoSize = true }, 0, 1); layout.Controls.Add(username, 1, 1);
+            var passwordRow = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 2, RowCount = 1, Margin = Padding.Empty };
+            passwordRow.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
+            passwordRow.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
+            passwordRow.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 70));
+            passwordRow.Controls.Add(password, 0, 0); passwordRow.Controls.Add(reveal, 1, 0);
+            reveal.CheckedChanged += delegate { password.UseSystemPasswordChar = !reveal.Checked; };
+            layout.Controls.Add(new Label { Text = "密码（至少10位）", AutoSize = true }, 0, 2); layout.Controls.Add(passwordRow, 1, 2);
+            layout.Controls.Add(new Label { Text = "开始登记日期", AutoSize = true }, 0, 3); layout.Controls.Add(date, 1, 3);
+            result.Text = "从哪天开始记账，就选择哪天。";
+            layout.Controls.Add(result, 0, 4); layout.SetColumnSpan(result, 2);
+            var actions = new FlowLayoutPanel { Dock = DockStyle.Fill, FlowDirection = FlowDirection.RightToLeft };
+            actions.Controls.Add(submit); actions.Controls.Add(cancel);
+            layout.Controls.Add(actions, 0, 5); layout.SetColumnSpan(actions, 2); Controls.Add(layout);
+            AcceptButton = submit; CancelButton = cancel;
+            cancel.Click += delegate { Close(); };
+            submit.Click += async delegate { await Create(); };
+            FormClosing += delegate(object sender, FormClosingEventArgs e) { if (busy) e.Cancel = true; else password.Clear(); };
+        }
+
+        private async Task Create()
+        {
+            if (busy) return;
+            string name = username.Text.Trim(), secret = password.Text;
+            if (name.Length == 0)
+            {
+                InvalidInput("请填写用户名，可以使用中文。", username); return;
+            }
+            if (String.IsNullOrWhiteSpace(secret) || secret.Length < 10)
+            {
+                InvalidInput("密码至少需要10位，不能全是空格。", password); return;
+            }
+            reveal.Checked = false;
+            busy = true; submit.Enabled = cancel.Enabled = username.Enabled = password.Enabled = date.Enabled = reveal.Enabled = false;
+            result.ForeColor = Theme.Ink;
+            result.Text = "正在创建账号……";
+            submit.Text = "正在创建……";
+            bool completed = false;
+            try
+            {
+                await create(name, secret, date.Value.Date);
+                password.Clear(); completed = true;
+            }
+            catch (IOException error) { result.ForeColor = Theme.Red; result.Text = "账号未确认创建成功：" + error.Message; }
+            finally
+            {
+                secret = null;
+                busy = false; submit.Enabled = cancel.Enabled = username.Enabled = password.Enabled = date.Enabled = reveal.Enabled = true;
+                submit.Text = "创建账号并继续";
+                if (completed) { DialogResult = DialogResult.OK; Close(); }
+            }
+        }
+
+        private void InvalidInput(string message, TextBox field)
+        {
+            reveal.Checked = false;
+            result.ForeColor = Theme.Red;
+            result.Text = message;
+            result.SelectionStart = 0;
+            result.ScrollToCaret();
+            field.Select();
+            field.Focus();
+            field.SelectAll();
+        }
+    }
+
+    internal sealed partial class Manager
+    {
+        private ActionButton setupAccountButton;
+        private bool creatingAccount;
+        private string accountSetupRequest;
+        private TaskCompletionSource<bool> accountSetupReply;
+
+        private bool ReceiveAccountSetup(Dictionary<string, object> message, string type)
+        {
+            if (type != "account-setup-result") return false;
+            Guid id; object success;
+            if (!Guid.TryParse(Value(message, "requestId"), out id) || !message.TryGetValue("ok", out success) || !(success is bool))
+                throw new InvalidDataException();
+            if (accountSetupReply == null || accountSetupRequest != id.ToString("D")) return true;
+            if ((bool)success) accountSetupReply.TrySetResult(true);
+            else accountSetupReply.TrySetException(new IOException(Clean(Value(message, "message"), 600)));
+            return true;
+        }
+
+        private async Task CreateAccount(HostRun run, string username, string password, DateTime date)
+        {
+            if (current != run || run.ExpectedStop || run.ReportedError) throw new IOException("本机主机已停止，请启动后再设置账号。");
+            if (initialized) throw new IOException("账号已经创建，请关闭本窗口并使用原账号登录。");
+            var completion = new TaskCompletionSource<bool>();
+            accountSetupRequest = Guid.NewGuid().ToString("D");
+            accountSetupReply = completion;
+            try
+            {
+                run.SendAccountSetup(json.Serialize(new {
+                    command = "account-setup", protocol = 2, requestId = accountSetupRequest, username = username, password = password,
+                    accountingStartDate = date.ToString("yyyy-MM-dd", System.Globalization.CultureInfo.InvariantCulture)
+                }), delegate { completion.TrySetException(new IOException("本机主机连接中断，请保持主机窗口打开后重试。")); });
+                if (await Task.WhenAny(completion.Task, Task.Delay(15000)) != completion.Task)
+                    throw new IOException("尚未收到主机确认，请先等待主机状态刷新，不要重复创建或更换账本。");
+                await completion.Task;
+                initialized = true; ClearToken(); UpdateSetup(); RefreshControls();
+                AddActivity("管理员账号已创建。");
+            }
+            finally { accountSetupRequest = null; accountSetupReply = null; }
+        }
+
+        private void OpenAccountSetup()
+        {
+            HostRun run = current;
+            if (creatingAccount) return;
+            if (initialized || run == null || !run.Ready || run.ExpectedStop || run.ReportedError || String.IsNullOrEmpty(setupToken))
+            {
+                ShowNotice(initialized ? "账号已经创建，请使用原账号登录。" : "主机尚未就绪，请先启动主机再设置账号。");
+                return;
+            }
+            creatingAccount = true; RefreshControls();
+            try
+            {
+                using (var form = new AccountSetupForm((username, password, date) => CreateAccount(run, username, password, date)))
+                {
+                    if (form.ShowDialog(this) == DialogResult.OK)
+                    {
+                        creatingAccount = false;
+                        ConfigureLan(true);
+                    }
+                }
+            }
+            finally { creatingAccount = false; RefreshControls(); }
+        }
+    }
+}

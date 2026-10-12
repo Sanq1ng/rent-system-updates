@@ -1,0 +1,386 @@
+using System;
+using System.Collections;
+using System.ComponentModel;
+using System.Diagnostics;
+using System.Globalization;
+using System.IO;
+using System.Linq;
+using System.Net.NetworkInformation;
+using System.Net.Sockets;
+using System.Runtime.InteropServices;
+using System.Security.Principal;
+using System.Text.RegularExpressions;
+
+namespace RentLan
+{
+    internal sealed class FirewallPlan
+    {
+        public string programDirectory;
+        public string serverId;
+        public string runId;
+        public string ownerSid;
+        public string address;
+        public int prefixLength;
+        public int port;
+        public bool includeDomain;
+        public bool discovery;
+        public OfficeIdentity officeNetwork;
+        internal string Name { get { return "IndustrialRent-LAN-" + serverId + "-" + runId + (discovery ? "-discovery" : ""); } }
+        internal string Program { get { return Path.Combine(programDirectory, "runtime", "node.exe"); } }
+        internal string Subnet { get { return Network.Subnet(address, prefixLength); } }
+        internal int Profiles { get { return includeDomain ? 3 : 2; } }
+        internal string Tag
+        {
+            get
+            {
+                return "industrial-rent-lan:v1:" + serverId + ":" + runId + ":" + ownerSid + ":" +
+                    Product.Hash(Product.Utf8.GetBytes(programDirectory.ToLowerInvariant() + "\n" + address + "\n" + Subnet + "\n" + port + "\n" + Profiles +
+                        (officeNetwork == null ? "" : "\n" + officeNetwork.Tag) + (discovery ? "\ndiscovery-v1" : "")));
+            }
+        }
+        internal void Validate()
+        {
+            Paths.Absolute(programDirectory, false); Product.Uuid(serverId); Product.Uuid(runId);
+            Network.PrivateV4(address); Network.Port(port); Network.Subnet(address, prefixLength);
+            if (discovery && port != 48765) throw new IOException("同网发现只允许固定 UDP 48765 端口。");
+            if (ownerSid == null || !Regex.IsMatch(ownerSid, @"^S-1-(?:5-21|12-1)-[0-9]{1,10}-[0-9]{1,10}-[0-9]{1,10}-[0-9]{1,10}$"))
+                throw new IOException("防火墙规则必须登记到明确的本机 Windows 用户 SID。");
+            new SecurityIdentifier(ownerSid);
+            Paths.Absolute(Program, false);
+            if (officeNetwork != null)
+            {
+                officeNetwork.Validate();
+                if (includeDomain != (officeNetwork.category == 2)) throw new IOException("办公网络类别与授权范围不一致。");
+            }
+        }
+        internal FirewallRule Expected()
+        {
+            Validate();
+            return new FirewallRule {
+                name = Name, application = Program, description = Tag, grouping = "IndustrialRent LAN",
+                protocol = discovery ? 17 : 6, localPorts = port.ToString(CultureInfo.InvariantCulture), remotePorts = "*",
+                localAddress = discovery ? "*" : address, remoteAddress = Subnet, profiles = Profiles, direction = 1, action = 1,
+                enabled = true, edgeTraversal = false, interfaceTypes = "All", interfaces = "", service = ""
+            };
+        }
+        internal FirewallPlan DiscoveryPlan()
+        {
+            var copy = Json.Decode<FirewallPlan>(Json.Encode(this));
+            copy.discovery = true; copy.port = 48765; copy.Validate(); return copy;
+        }
+        internal string[] Args(string mode)
+        {
+            Validate();
+            var result = new System.Collections.Generic.List<string> { mode, "--program", programDirectory, "--server-id", serverId, "--run-id", runId,
+                "--owner-sid", ownerSid, "--address", address, "--prefix-length", prefixLength.ToString(CultureInfo.InvariantCulture),
+                "--port", port.ToString(CultureInfo.InvariantCulture), "--profiles", includeDomain ? "private-domain" : "private" };
+            if (discovery) result.AddRange(new[] { "--purpose", "discovery" });
+            if (officeNetwork != null) result.AddRange(new[] { "--office-adapter", officeNetwork.adapterId,
+                "--office-connection", officeNetwork.connectionId, "--office-network", officeNetwork.networkId,
+                "--office-category", officeNetwork.category.ToString(CultureInfo.InvariantCulture) });
+            return result.ToArray();
+        }
+    }
+    internal sealed class FirewallRule
+    {
+        public string name, application, description, grouping, localPorts, remotePorts, localAddress, remoteAddress, interfaceTypes, interfaces, service;
+        public int protocol, profiles, direction, action;
+        public bool enabled, edgeTraversal;
+        internal bool Same(FirewallRule other)
+        {
+            return other != null && name == other.name && String.Equals(application, other.application, StringComparison.OrdinalIgnoreCase) &&
+                description == other.description && grouping == other.grouping && localPorts == other.localPorts &&
+                remotePorts == other.remotePorts && localAddress == other.localAddress && remoteAddress == other.remoteAddress &&
+                protocol == other.protocol && profiles == other.profiles && direction == other.direction && action == other.action &&
+                enabled == other.enabled && edgeTraversal == other.edgeTraversal && interfaceTypes == other.interfaceTypes &&
+                interfaces == other.interfaces && service == other.service;
+        }
+    }
+    internal interface IFirewallStore
+    {
+        FirewallRule Find(string name);
+        void Add(FirewallRule rule);
+        void Remove(string name);
+    }
+    internal interface INetworkGate { void RequireTrusted(FirewallPlan plan); }
+
+    [ComImport, Guid("DCB00005-570F-4A9B-8D69-199FDBA5723B"), InterfaceType(ComInterfaceType.InterfaceIsDual)]
+    internal interface INetworkConnection
+    {
+        [return: MarshalAs(UnmanagedType.Interface)] object GetNetwork();
+        [return: MarshalAs(UnmanagedType.VariantBool)] bool IsConnectedToInternet();
+        [return: MarshalAs(UnmanagedType.VariantBool)] bool IsConnected();
+        int GetConnectivity();
+        Guid GetConnectionId();
+        Guid GetAdapterId();
+        int GetDomainType();
+    }
+
+    internal static class Firewall
+    {
+        internal static bool Add(IFirewallStore store, INetworkGate networks, FirewallPlan plan)
+        {
+            FirewallRule expected = plan.Expected();
+            networks.RequireTrusted(plan);
+            FirewallRule prior = store.Find(plan.Name);
+            if (prior != null)
+            {
+                if (!expected.Same(prior)) throw new IOException("已有同名但不同范围/归属的防火墙规则；未覆盖、未扩大权限。");
+                return false;
+            }
+            store.Add(expected);
+            if (!expected.Same(store.Find(plan.Name))) throw new IOException("防火墙调用后无法核实完整规则，不能认为已放行；请保留规则和恢复记录。");
+            return true;
+        }
+        internal static void Remove(IFirewallStore store, FirewallPlan plan, bool owned)
+        {
+            if (!owned) throw new IOException("没有成功新增此规则的归属记录，不能删除预先存在或归属不明的规则。");
+            FirewallRule expected = plan.Expected(), actual = store.Find(plan.Name);
+            if (actual == null) return;
+            if (!expected.Same(actual)) throw new IOException("防火墙规则已被修改，拒绝删除；请让管理员按完整名称核对，不能清理其他规则。");
+            store.Remove(plan.Name);
+            if (store.Find(plan.Name) != null) throw new IOException("规则移除后仍可读到同名项，不能声称已撤销。");
+        }
+    }
+
+    internal sealed class WindowsNetworkGate : INetworkGate
+    {
+        public void RequireTrusted(FirewallPlan plan)
+        {
+            plan.Validate();
+            if (plan.officeNetwork != null)
+            {
+                string name;
+                OfficeNetwork.RequireSame(plan, OfficeNetwork.Read(plan, out name));
+            }
+            var adapters = NetworkInterface.GetAllNetworkInterfaces().Where(adapter => adapter.OperationalStatus == OperationalStatus.Up &&
+                adapter.GetIPProperties().UnicastAddresses.Any(ip => ip.Address.AddressFamily == AddressFamily.InterNetwork &&
+                    ip.Address.ToString() == plan.address && Prefix(ip.IPv4Mask.GetAddressBytes()) == plan.prefixLength)).ToArray();
+            if (adapters.Length != 1) throw new IOException("所选 IPv4/子网已变化、未连接或不唯一，请刷新后重新选择。");
+            Guid adapterId;
+            if (!Guid.TryParse(adapters[0].Id, out adapterId)) throw new IOException("无法可靠识别所选 Windows 网卡。");
+            object manager = Activator.CreateInstance(Type.GetTypeFromCLSID(new Guid("DCB00C01-570F-4A9B-8D69-199FDBA5723B"), true));
+            bool found = false;
+            try
+            {
+                dynamic nlm = manager;
+                object networks = nlm.GetNetworks(1);
+                try
+                {
+                    foreach (object network in (IEnumerable)networks)
+                    {
+                        try
+                        {
+                            dynamic entry = network;
+                            object connections = entry.GetNetworkConnections();
+                            try
+                            {
+                                foreach (object connection in (IEnumerable)connections)
+                                {
+                                    try
+                                    {
+                                        // NLM returns a native GUID, which IDispatch late binding cannot
+                                        // marshal reliably. Use the published dual interface's vtable.
+                                        if (((INetworkConnection)connection).GetAdapterId() != adapterId) continue;
+                                        int category = (int)entry.GetCategory();
+                                        if (category == 0) throw new IOException("所选网卡属于“公用网络”。请确认这是可信的办公室网络，再到 Windows 网络设置中将其改为“专用网络”。");
+                                        if (category == 2 && !plan.includeDomain) throw new IOException("所选网卡是域网络，请先勾选“同时允许公司域网络”。");
+                                        if (category != 1 && category != 2) throw new IOException("无法确认所选网卡属于专用/域网络，已停止。");
+                                        found = true;
+                                    }
+                                    finally { Marshal.FinalReleaseComObject(connection); }
+                                }
+                            }
+                            finally { Marshal.FinalReleaseComObject(connections); }
+                        }
+                        finally { Marshal.FinalReleaseComObject(network); }
+                    }
+                }
+                finally { Marshal.FinalReleaseComObject(networks); }
+            }
+            finally { Marshal.FinalReleaseComObject(manager); }
+            if (!found) throw new IOException("Windows 未返回所选网卡的网络类别；不能安全开放，请检查网络连接后重试。");
+        }
+        internal static int Prefix(byte[] mask)
+        {
+            int prefix = 0; bool zero = false;
+            foreach (byte b in mask)
+                for (int bit = 7; bit >= 0; bit--)
+                {
+                    bool one = (b & (1 << bit)) != 0;
+                    if (one && zero) return -1;
+                    if (one) prefix++; else zero = true;
+                }
+            return prefix;
+        }
+    }
+
+    internal sealed class WindowsFirewallStore : IFirewallStore, IDisposable
+    {
+        private readonly object policyObject;
+        private readonly object rulesObject;
+        internal WindowsFirewallStore()
+        {
+            policyObject = Activator.CreateInstance(Type.GetTypeFromProgID("HNetCfg.FwPolicy2", true));
+            try { dynamic policy = policyObject; rulesObject = policy.Rules; }
+            catch { Marshal.FinalReleaseComObject(policyObject); throw; }
+        }
+        internal void RequireEnabled(int profiles)
+        {
+            dynamic policy = policyObject;
+            foreach (int profile in new[] { 1, 2 })
+                if ((profiles & profile) != 0 && !(bool)policy.FirewallEnabled[profile])
+                    throw new IOException("所选网络的 Windows 防火墙已关闭，请让管理员恢复保护后重试。");
+        }
+        private static string Addresses(string value, bool subnet)
+        {
+            if (String.IsNullOrEmpty(value)) return "*";
+            string[] parts = value.Split('/');
+            if (!subnet)
+                return parts.Length == 2 && (parts[1] == "32" || parts[1] == "255.255.255.255") ? parts[0] : value;
+            if (parts.Length == 2 && parts[1].IndexOf('.') >= 0)
+            {
+                System.Net.IPAddress mask;
+                if (!System.Net.IPAddress.TryParse(parts[1], out mask) || mask.AddressFamily != AddressFamily.InterNetwork) return value;
+                int prefix = WindowsNetworkGate.Prefix(mask.GetAddressBytes());
+                if (prefix < 0) return value;
+                return parts[0] + "/" + prefix.ToString(CultureInfo.InvariantCulture);
+            }
+            return value;
+        }
+        internal static FirewallRule Snapshot(object item)
+        {
+            dynamic rule = item;
+            object interfaceValue = rule.Interfaces;
+            string interfaces = "";
+            if (interfaceValue != null)
+            {
+                var array = interfaceValue as Array;
+                interfaces = array == null ? Convert.ToString(interfaceValue, CultureInfo.InvariantCulture) :
+                    String.Join(",", array.Cast<object>().Select(v => Convert.ToString(v, CultureInfo.InvariantCulture)));
+            }
+            return new FirewallRule {
+                name = rule.Name, application = rule.ApplicationName, description = rule.Description, grouping = rule.Grouping,
+                protocol = rule.Protocol, localPorts = rule.LocalPorts,
+                remotePorts = String.IsNullOrEmpty((string)rule.RemotePorts) ? "*" : (string)rule.RemotePorts,
+                localAddress = Addresses(rule.LocalAddresses, false), remoteAddress = Addresses(rule.RemoteAddresses, true),
+                profiles = rule.Profiles, direction = rule.Direction, action = rule.Action, enabled = rule.Enabled,
+                edgeTraversal = rule.EdgeTraversal, interfaceTypes = rule.InterfaceTypes, interfaces = interfaces,
+                service = (string)rule.ServiceName ?? ""
+            };
+        }
+        public FirewallRule Find(string name)
+        {
+            FirewallRule result = null;
+            foreach (object item in (IEnumerable)rulesObject)
+            {
+                try
+                {
+                    dynamic rule = item;
+                    if (!String.Equals((string)rule.Name, name, StringComparison.OrdinalIgnoreCase)) continue;
+                    if (result != null) throw new IOException("存在多个同名规则，拒绝猜测或批量删除。");
+                    result = Snapshot(item);
+                }
+                finally { Marshal.FinalReleaseComObject(item); }
+            }
+            return result;
+        }
+        internal static void SetDetached(object created, FirewallRule expected)
+        {
+            dynamic rule = created;
+            rule.Name = expected.name; rule.Description = expected.description; rule.Grouping = expected.grouping;
+            rule.ApplicationName = expected.application; rule.Protocol = expected.protocol; rule.LocalPorts = expected.localPorts;
+            rule.RemotePorts = "*"; rule.LocalAddresses = expected.localAddress; rule.RemoteAddresses = expected.remoteAddress;
+            rule.Profiles = expected.profiles; rule.Direction = 1; rule.Action = 1; rule.EdgeTraversal = false;
+            rule.InterfaceTypes = "All"; rule.Enabled = true;
+        }
+        public void Add(FirewallRule expected)
+        {
+            RequireEnabled(expected.profiles);
+            object created = Activator.CreateInstance(Type.GetTypeFromProgID("HNetCfg.FWRule", true));
+            try
+            {
+                SetDetached(created, expected);
+                dynamic rules = rulesObject;
+                rules.Add((dynamic)created);
+            }
+            finally { Marshal.FinalReleaseComObject(created); }
+        }
+        public void Remove(string name) { dynamic rules = rulesObject; rules.Remove(name); }
+        public void Dispose() { Marshal.FinalReleaseComObject(rulesObject); Marshal.FinalReleaseComObject(policyObject); }
+    }
+
+    internal static class FirewallElevation
+    {
+        internal static FirewallPlan Parse(System.Collections.Generic.Dictionary<string, string> arguments, string mode)
+        {
+            Arguments.Only(arguments, mode, "--program", "--server-id", "--run-id", "--owner-sid", "--address", "--prefix-length", "--port", "--profiles",
+                "--office-adapter", "--office-connection", "--office-network", "--office-category", "--purpose");
+            string profiles = Arguments.Need(arguments, "--profiles");
+            if (profiles != "private" && profiles != "private-domain") throw new IOException("只允许专用或明确选择的专用加域网络，永不接受 Public。");
+            if (arguments.ContainsKey("--purpose") && arguments["--purpose"] != "discovery") throw new IOException("防火墙用途无效。");
+            var plan = new FirewallPlan {
+                programDirectory = Arguments.Need(arguments, "--program"), serverId = Arguments.Need(arguments, "--server-id"),
+                runId = Arguments.Need(arguments, "--run-id"), ownerSid = Arguments.Need(arguments, "--owner-sid"),
+                address = Arguments.Need(arguments, "--address"), prefixLength = Arguments.Number(arguments, "--prefix-length"),
+                port = Arguments.Number(arguments, "--port"), includeDomain = profiles == "private-domain",
+                discovery = arguments.ContainsKey("--purpose")
+            };
+            if (new[] { "--office-adapter", "--office-connection", "--office-network", "--office-category" }.Any(arguments.ContainsKey))
+                plan.officeNetwork = new OfficeIdentity {
+                    adapterId = Arguments.Need(arguments, "--office-adapter"), connectionId = Arguments.Need(arguments, "--office-connection"),
+                    networkId = Arguments.Need(arguments, "--office-network"), category = Arguments.Number(arguments, "--office-category")
+                };
+            plan.Validate();
+            return plan;
+        }
+        internal static int Run(FirewallPlan plan, bool remove, bool officeOnly = false)
+        {
+            plan.Validate();
+            if (!new WindowsPrincipal(WindowsIdentity.GetCurrent()).IsInRole(WindowsBuiltInRole.Administrator))
+                throw new IOException("请从局域网向导发起防火墙授权，并确认 Windows 权限提示。");
+            string expectedHelper = Path.Combine(plan.programDirectory, "lan-windows", Product.HostExe);
+            if (!String.Equals(Paths.Absolute(System.Windows.Forms.Application.ExecutablePath, false), expectedHelper, StringComparison.OrdinalIgnoreCase))
+                throw new IOException("防火墙助手必须来自本次明确指定程序的 lan-windows 目录，不能为其他任意程序放行。");
+            // This helper never launches Node, PowerShell or a script, and accepts no command/result file.
+            using (var root = new DirectoryPins(plan.programDirectory))
+            using (var node = new CheckedFile(plan.Program, false))
+            using (var host = new CheckedFile(Path.Combine(plan.programDirectory, "host.cjs"), false))
+            using (var lan = new CheckedFile(Path.Combine(plan.programDirectory, "deployment", "lan.cjs"), false))
+            {
+                Pe.Require(node.Stream, false);
+                if (officeOnly) { OfficeNetwork.SetConfirmedPrivate(plan); return 0; }
+                using (var store = new WindowsFirewallStore())
+                {
+                    if (remove) { Firewall.Remove(store, plan, true); return 0; }
+                    return Firewall.Add(store, new WindowsNetworkGate(), plan) ? 0 : 10;
+                }
+            }
+        }
+        internal static bool Request(FirewallPlan plan, bool remove, bool officeOnly = false)
+        {
+            plan.Validate();
+            string ownExe = Paths.Absolute(System.Windows.Forms.Application.ExecutablePath, false);
+            using (var executable = new CheckedFile(ownExe, false))
+            {
+                var start = new ProcessStartInfo(ownExe, String.Join(" ", plan.Args(officeOnly ? "--office-network-apply" : remove ? "--firewall-remove" : "--firewall-apply").Select(Arguments.Quote))) {
+                    UseShellExecute = true, Verb = "runas", WorkingDirectory = Path.GetDirectoryName(ownExe)
+                };
+                Process process;
+                try { process = Process.Start(start); }
+                catch (Win32Exception error)
+                {
+                    if (error.NativeErrorCode == 1223) throw new IOException("已取消 UAC：未确认防火墙配置；HTTPS 配置和证书可能已保存，可重试或明确停用。", error);
+                    throw new IOException("无法打开防火墙授权程序：" + error.Message, error);
+                }
+                using (process)
+                {
+                    process.WaitForExit();
+                    if (process.ExitCode == 10 && !remove) return false;
+                    if (process.ExitCode != 0) throw new IOException("防火墙授权程序未成功完成（代码 " + process.ExitCode + "）。请看授权窗口的具体错误；未自动回退配置。");
+                    return true;
+                }
+            }
+        }
+    }
+}

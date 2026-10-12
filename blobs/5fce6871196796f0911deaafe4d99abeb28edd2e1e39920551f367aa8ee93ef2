@@ -1,0 +1,512 @@
+using System;
+using System.Collections.Generic;
+using System.Drawing;
+using System.IO;
+using System.Linq;
+using System.Reflection;
+using System.Runtime.ExceptionServices;
+using System.Threading.Tasks;
+using System.Windows.Forms;
+
+namespace RentLan
+{
+    internal class WizardForm : Form
+    {
+        protected new readonly TableLayoutPanel Layout = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 1, Padding = new Padding(18), AutoScroll = true };
+        protected readonly TextBox Output = new TextBox { Multiline = true, ReadOnly = true, ScrollBars = ScrollBars.Vertical, Dock = DockStyle.Fill, BackColor = Color.White, MinimumSize = new Size(100, 120) };
+        protected readonly List<Control> Actions = new List<Control>();
+        private readonly Label operation = new Label { Name = "operationProgress", AutoSize = true, Visible = false,
+            ForeColor = Color.FromArgb(25, 123, 112), MaximumSize = new Size(700, 0) };
+        private readonly Timer progressTimer = new Timer { Interval = 1000 };
+        private DateTime phaseBegan;
+        private string progressText;
+        protected bool Busy;
+        internal WizardForm(string title)
+        {
+            Text = title; Font = new Font("Microsoft YaHei UI", 10); AutoScaleMode = AutoScaleMode.Dpi;
+            StartPosition = FormStartPosition.CenterScreen; Size = new Size(960, 860); MinimumSize = new Size(790, 700);
+            BackColor = Color.FromArgb(246, 249, 250); Controls.Add(Layout);
+            FormClosing += (sender, args) => { if (Busy) { args.Cancel = true; MessageBox.Show(this, "正在处理，请先完成或取消 Windows 提示。", "请稍候"); } };
+            progressTimer.Tick += (sender, args) => UpdateProgressText();
+        }
+        protected void Row(Control control, bool fill)
+        {
+            if (control == Output) Row(operation, false);
+            int row = Layout.RowCount++; Layout.RowStyles.Add(fill ? new RowStyle(SizeType.Percent, 100) : new RowStyle(SizeType.AutoSize));
+            control.Margin = new Padding(0, 0, 0, 9); Layout.Controls.Add(control, 0, row);
+            if (!fill) control.Dock = DockStyle.Top;
+        }
+        protected Label LabelText(string text, bool heading)
+        {
+            return new Label { Text = text, AutoSize = true, MaximumSize = new Size(850, 0),
+                Font = new Font(Font.FontFamily, heading ? 16 : 10, heading ? FontStyle.Bold : FontStyle.Regular) };
+        }
+        protected Button Button(string text, EventHandler handler, bool action)
+        {
+            var button = new Button { Text = text, AutoSize = true, Padding = new Padding(9, 5, 9, 5), Margin = new Padding(0, 0, 8, 5) };
+            button.Click += handler; if (action) Actions.Add(button);
+            return button;
+        }
+        protected FlowLayoutPanel Buttons(params Control[] controls)
+        {
+            var panel = new FlowLayoutPanel { AutoSize = true, WrapContents = true };
+            panel.Controls.AddRange(controls); return panel;
+        }
+        protected async Task Run(Func<string> action)
+        {
+            if (Busy) return;
+            Busy = true; foreach (Control control in Actions) control.Enabled = false; UseWaitCursor = true;
+            UpdateButtons();
+            operation.Visible = true; progressText = null; ReportProgress("正在处理……"); progressTimer.Start();
+            Output.ForeColor = SystemColors.WindowText;
+            try { Output.Text = await Task.Run(action); }
+            catch (Exception error) { Output.ForeColor = Color.FromArgb(184, 78, 72); Output.Text = error.Message; }
+            finally
+            {
+                progressTimer.Stop(); operation.Visible = false;
+                Busy = false; UseWaitCursor = false; foreach (Control control in Actions) control.Enabled = true; UpdateButtons();
+            }
+        }
+        private void UpdateProgressText()
+        {
+            int seconds = Math.Max(0, (int)(DateTime.UtcNow - phaseBegan).TotalSeconds);
+            operation.Text = progressText + (seconds < 5 ? "" : "（已等待 " + seconds + " 秒）");
+        }
+        protected void ReportProgress(string message)
+        {
+            if (InvokeRequired) { Invoke((MethodInvoker)(() => ReportProgress(message))); return; }
+            if (progressText == message) return;
+            progressText = message; phaseBegan = DateTime.UtcNow;
+            UpdateProgressText(); Output.Text = message; Output.Refresh();
+        }
+        protected void ConfirmOnUi(Action action)
+        {
+            if (InvokeRequired)
+            {
+                try { Invoke((MethodInvoker)(() => ConfirmOnUi(action))); }
+                catch (TargetInvocationException error)
+                {
+                    if (error.InnerException != null) ExceptionDispatchInfo.Capture(error.InnerException).Throw();
+                    throw;
+                }
+                return;
+            }
+            // Windows certificate confirmation needs an active STA window, not the background worker.
+            ReportProgress("等待 Windows 确认：请在“安全警告”中选择“是”或“否”。");
+            bool waiting = UseWaitCursor; UseWaitCursor = false;
+            Cursor.Current = Cursors.Default;
+            Activate(); BringToFront(); operation.Refresh();
+            try { action(); }
+            finally { UseWaitCursor = waiting; }
+        }
+        protected override void Dispose(bool disposing)
+        {
+            if (disposing) progressTimer.Dispose();
+            base.Dispose(disposing);
+        }
+        protected virtual void UpdateButtons() { }
+        protected static string Desktop()
+        {
+            return Paths.Absolute(Environment.GetFolderPath(Environment.SpecialFolder.DesktopDirectory, Environment.SpecialFolderOption.DoNotVerify), false);
+        }
+    }
+
+    internal sealed class HostForm : WizardForm
+    {
+        private readonly ICoreLan core;
+        private readonly bool beginner;
+        private readonly bool firstSetup;
+        private OfficeSelection office;
+        private LanStatus status;
+        private HostState state;
+        private readonly ComboBox adapter = new ComboBox { DropDownStyle = ComboBoxStyle.DropDownList, Width = 820 };
+        private readonly CheckBox domain = new CheckBox { Text = "明确同时允许公司域网络（仅 Private + Domain；永不允许 Public）", AutoSize = true };
+        private readonly CheckBox drafts = new CheckBox { Text = "员工草稿已同步或导出；已通知所有电脑暂停操作，并已停止这套主机", AutoSize = true };
+        private readonly CheckBox firewall = new CheckBox { Text = "同意经 UAC 为本 Node 放行业务 TCP 端口与 UDP 48765 同网发现；仅所选办公子网，停用只撤销自有规则", AutoSize = true };
+        private readonly CheckBox trust = new CheckBox { Text = "同意向主机当前 Windows 用户添加本次 CA；停用仅撤销本工具新增且可证明归属的证书", AutoSize = true };
+        private readonly TextBox share = new TextBox { Width = 650 };
+        private readonly Label context, completion;
+        private readonly Button start, disable, open, close;
+        internal int ExitCode { get; private set; }
+        internal HostForm(ICoreLan core) : this(core, false) { }
+        internal HostForm(ICoreLan core, bool beginner, bool firstSetup = false) : base(beginner ? "园区租赁 · 其他电脑连接" : "园区租赁 · 局域网配置")
+        {
+            this.core = core; this.beginner = beginner; this.firstSetup = firstSetup; ExitCode = 1;
+            if (beginner) { Size = new Size(800, 620); MinimumSize = new Size(750, 570); }
+            Row(LabelText(beginner ? "让办公室的其他电脑连接" : "让同一办公室电脑安全使用原来的账套", true), false);
+            Row(LabelText(beginner ?
+                "设置完成后，同事可在软件中搜索主机并申请加入。" :
+                "建议在路由器为主机保留固定 IP。更换地址前先同步或导出员工草稿；证书一年到期后需停用、重新配置并发送新接入包。", false), false);
+            context = LabelText("正在检查连接……", false); Row(context, false);
+            if (!beginner) { Row(adapter, false); Row(domain, false); Row(drafts, false); Row(firewall, false); Row(trust, false); }
+            var choose = Button("选择接入包父目录", (sender, args) => {
+                using (var picker = new FolderBrowserDialog { Description = "选择父目录，用于新建员工接入文件夹", ShowNewFolderButton = false })
+                    if (picker.ShowDialog(this) == DialogResult.OK)
+                        share.Text = Path.Combine(picker.SelectedPath, "员工电脑接入-" + Guid.NewGuid().ToString("D"));
+            }, true);
+            if (!beginner) Row(Buttons(share, choose), false);
+            Row(Output, true);
+            start = Button(beginner ? "开始设置" : "启用 / 重试未完成步骤", async (sender, args) => await Enable(), true);
+            disable = Button(beginner ? "关闭同事连接" : "停用并恢复原本机配置", async (sender, args) => await Disable(), true);
+            open = Button("打开员工接入文件夹", (sender, args) => {
+                try
+                {
+                    if (state == null || !state.shareReady) throw new IOException("尚未完成接入目录。");
+                    using (var pins = new DirectoryPins(state.shareDirectory))
+                        System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo(
+                            Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.Windows), "explorer.exe"),
+                            Arguments.Quote(state.shareDirectory)) { UseShellExecute = true });
+                }
+                catch (Exception error) { Output.Text = error.Message; }
+            }, true);
+            if (beginner) Row(Buttons(start, Button("重新检测", async (sender, args) => await RefreshStatus(), true), disable), false);
+            else Row(Buttons(start, disable, Button("只读刷新", async (sender, args) => await RefreshStatus(), true), open), false);
+            close = Button("关闭（主机保持停止）", (sender, args) => Close(), false);
+            Row(Buttons(close), false);
+            completion = LabelText("状态尚未确认，关闭后主机将保持停止。", false);
+            Row(completion, false);
+            Row(LabelText(beginner ?
+                "仅在公司的办公网络使用。" :
+                "设置完成后请关闭向导，让主机恢复运行，再由员工验证连接并登录。", false), false);
+            Actions.AddRange(new Control[] { adapter, domain, drafts, firewall, trust, share });
+            Shown += async (sender, args) => await RefreshStatus();
+        }
+        private static HostState LoadState(LanStatus status)
+        {
+            string directory = HostState.JournalDirectory(status.configFile), file = Path.Combine(directory, "state.json");
+            if (!NativeFiles.Exists(directory)) return null;
+            using (var pins = new DirectoryPins(directory))
+            {
+                NativeFiles.AssertPrivateDirectory(directory);
+                if (!NativeFiles.Exists(file)) return null;
+                var state = Json.Decode<HostState>(Product.Utf8.GetString(Paths.Read(file, 65536)));
+                state.Validate(status); return state;
+            }
+        }
+        private void Display()
+        {
+            if (status == null) return;
+            context.Text = beginner ? (office == null ? "" : "当前网络：" + office.name) :
+                "账套：" + (status.serverId ?? "未初始化") + "\r\n配置：" + status.configFile +
+                "\r\n最近查询来源：" + status.sourceOrigin + (status.addressChanged ? "  【地址已变化，须先停用后重配】" : "");
+            var old = adapter.SelectedItem as InterfaceChoice;
+            adapter.Items.Clear(); adapter.Items.AddRange(status.interfaces.Cast<object>().ToArray());
+            if (old != null)
+                adapter.SelectedItem = status.interfaces.FirstOrDefault(value => value.address == old.address && value.prefixLength == old.prefixLength);
+            if (adapter.SelectedIndex < 0 && status.interfaces.Length == 1) adapter.SelectedIndex = 0;
+            if (state != null)
+            {
+                share.Text = state.shareDirectory; domain.Checked = state.firewall.includeDomain;
+                if (!state.coreRestored)
+                    adapter.SelectedItem = status.interfaces.FirstOrDefault(value => value.address == state.firewall.address && value.prefixLength == state.firewall.prefixLength);
+            }
+            UpdateButtons();
+        }
+        protected override void UpdateButtons()
+        {
+            if (start == null) return;
+            if (Busy)
+            {
+                close.Enabled = false;
+                close.Text = "等待设置完成";
+                if (beginner) completion.Text = "";
+                return;
+            }
+            close.Enabled = true;
+            bool ready = ExitCode == 0 && status != null && status.lanEnabled && state != null &&
+                state.phase == "awaiting-host-restart" && state.lastError == null;
+            bool removable = status != null && (status.lanEnabled || status.recoveryAvailable ||
+                state != null && (state.phase != "disabled" || state.lastError != null));
+            start.Enabled = !Busy && (!beginner || !ready) && status != null && status.initialized && !status.addressChanged &&
+                (!beginner || office != null || state != null && state.phase != "disabled") &&
+                (state == null || !state.coreRestored || state.phase == "disabled");
+            disable.Enabled = !Busy && removable;
+            if (beginner)
+            {
+                disable.Visible = removable;
+                start.Text = ready ? "已完成设置" : state != null && state.phase != "disabled" ? "重试设置" : "开始设置";
+            }
+            open.Enabled = !Busy && state != null && state.shareReady;
+            adapter.Enabled = !Busy && (state == null || state.coreRestored);
+            domain.Enabled = adapter.Enabled;
+            close.Text = ExitCode == 0 ? "关闭返回主机" : "关闭（主机保持停止）";
+            completion.Text = ExitCode == 0 ? (state != null && state.phase == "awaiting-host-restart" ?
+                "下一步：关闭返回主机 → 由主机窗口恢复运行 → 把完整员工接入文件夹发给同网电脑验证。本向导不自行启动主机。" :
+                "关闭返回主机后，由父窗口恢复原本机运行。本次没有确认启用局域网，不应把旧接入包当成当前可用入口。") :
+                "本次状态未确认或操作未全部完成；关闭将返回非零退出码，主机保持停止。请重试未完成步骤，或确认草稿后停用恢复，再返回主机。";
+            if (beginner)
+            {
+                close.Text = ExitCode == 0 ? "返回主机" : "关闭，稍后重试";
+                completion.Text = ExitCode == 0 ? (status != null && status.lanEnabled ?
+                    "同事安装时选择“加入已有公司”，然后搜索主机；在“系统管理 → 连接同事电脑”核对配对码。" :
+                    "也可以稍后设置，先使用这台电脑记账。") :
+                    "设置尚未完成。请重试；仍失败时请联系维护人员。";
+            }
+        }
+        private async Task RefreshStatus()
+        {
+            ExitCode = 1;
+            await Run(() => {
+                ReportProgress("正在检查当前设置……");
+                status = core.Status(); state = LoadState(status); office = null;
+                string text = beginner ? "点击“开始设置”。出现 Windows 提示时，请在提示窗口中确认。" :
+                    state == null ? "状态只读查询完成。请选择检测到的办公室网卡并逐项确认。" : state.Summary();
+                if (!status.initialized) text += "\r\n请先返回软件，创建管理员账号。";
+                if (status.interfaces.Length == 0) text += beginner ?
+                    "\r\n未检测到办公网络，请先连接公司的网络。" : "\r\n没有可用的 RFC1918 办公网卡；请先连入可信办公室网络。";
+                if (status.addressChanged) text += beginner ?
+                    "\r\n网络已变化。请让同事同步或导出未同步工作，再关闭同事连接并重新设置。" :
+                    "\r\nDHCP 地址或网段已变化：不要改旧网址清草稿，请先确认同步/导出，再停用后重配。";
+                if (state != null && state.certificateReady)
+                {
+                    Connection connection = state.ReadConnection();
+                    if (!beginner) text += "\r\n\r\nCA SHA-256（请独立核对）：\r\n" + connection.Fingerprint();
+                    if (!state.coreRestored) connection.RequireCurrent();
+                    if (state.phase == "awaiting-host-restart") new WindowsNetworkGate().RequireTrusted(state.firewall);
+                }
+                ExitCode = HostWorkflow.ResumeExitCode(status, state);
+                if (beginner && ExitCode == 0 && status.lanEnabled)
+                    text = "同事连接已设置，请返回软件核对同事的配对申请。";
+                if (beginner && status.initialized && !status.lanEnabled && !status.recoveryAvailable && (state == null || state.phase == "disabled"))
+                {
+                    ReportProgress("正在识别办公室网络……");
+                    office = OfficeNetwork.Detect(status);
+                }
+                return text;
+            });
+            Display();
+        }
+        private async Task Enable()
+        {
+            if (beginner)
+            {
+                string name = office == null ? "原来的办公室连接" : office.name;
+                bool fresh = firstSetup && status != null && !status.lanEnabled && !status.recoveryAvailable && state == null;
+                if (MessageBox.Show(this, OfficeConsent(name, fresh), "确认办公网络", MessageBoxButtons.YesNo, MessageBoxIcon.Question,
+                    MessageBoxDefaultButton.Button2) != DialogResult.Yes) return;
+            }
+            else if (!drafts.Checked || !firewall.Checked || !trust.Checked) { Output.Text = "请先逐项确认草稿/主机停止、防火墙授权以及主机当前用户证书信任。"; return; }
+            var selected = beginner ? (office == null ? null : office.choice) : adapter.SelectedItem as InterfaceChoice;
+            bool includeDomain = beginner ? office != null && office.identity.category == 2 : domain.Checked;
+            string chosenShare = beginner ? null : share.Text;
+            ExitCode = 1;
+            await Run(() => {
+                ReportProgress("正在检查设置……");
+                status = core.Status();
+                HostState previous = LoadState(status);
+                string previousProof = previous == null ? null : Json.Encode(previous);
+                if ((previous == null || previous.phase == "disabled") && (status.lanEnabled || status.recoveryAvailable))
+                    throw new IOException("主机已有恢复记录，但本向导缺少对应归属，请先由维护人员核对并停用原连接配置。");
+                if (previous == null || previous.phase == "disabled")
+                {
+                    if (selected == null) throw new IOException("请选择连接办公室网络的网卡。");
+                    state = HostState.New(status, selected, includeDomain);
+                    if (beginner)
+                    {
+                        if (office == null) throw new IOException("尚未安全确认办公室连接，请点击重新检测。");
+                        state.firewall.officeNetwork = office.identity;
+                        state.firewall.Validate();
+                    }
+                    if (!String.IsNullOrWhiteSpace(chosenShare) && (previous == null || chosenShare != previous.shareDirectory))
+                        state.shareDirectory = Paths.Absolute(chosenShare, false);
+                }
+                else
+                {
+                    state = previous;
+                    if (!String.IsNullOrWhiteSpace(chosenShare) && chosenShare != state.shareDirectory)
+                    {
+                        state.shareDirectory = Paths.Absolute(chosenShare, false); state.shareReady = false;
+                    }
+                }
+                state.CheckDestinations(status);
+                using (var journal = new RecordFile(HostState.JournalDirectory(status.configFile), "state.json"))
+                {
+                    string currentProof = journal.Read() == null ? null : Json.Encode(Json.Decode<HostState>(journal.Read()));
+                    if (currentProof != previousProof) throw new IOException("另一向导窗口已更新归属记录；请刷新后重试，未覆盖。");
+                    if (previous != null && previous.runId != state.runId)
+                    {
+                        string archive = Path.Combine(journal.Directory, "已停用-" + previous.runId + ".json");
+                        byte[] bytes = Product.Utf8.GetBytes(Json.Encode(previous) + "\r\n");
+                        if (!NativeFiles.Exists(archive)) Paths.WriteNew(archive, bytes);
+                        else if (!Product.Equal(Paths.Read(archive, 65536), bytes)) throw new IOException("旧向导归属存档已变化，未覆盖。");
+                    }
+                    journal.Save(state);
+                    HostWorkflow.Continue(state, new WindowsHostEffects(core, new CurrentUserTrustStore(ConfirmOnUi)), true, true, true,
+                        () => { journal.Save(state); ReportProgress(PhaseText(state.phase)); });
+                }
+                status = core.Status();
+                string result = beginner ? "连接已准备。让同事打开软件搜索主机，再到“系统管理 → 连接同事电脑”核对配对码。" :
+                    state.Summary() + "\r\n\r\nCA SHA-256（供员工独立核对）：\r\n" + state.ReadConnection().Fingerprint() +
+                    "\r\n\r\n请关闭返回主机，等待主机恢复；再把完整员工接入文件夹发给员工。";
+                if (HostWorkflow.ResumeExitCode(status, state) != 0)
+                    throw new IOException("操作后回读状态尚不满足恢复主机条件；关闭后主机将保持停止，请刷新核对。\r\n" + state.Summary());
+                ExitCode = 0;
+                return result;
+            });
+            Display();
+            if (beginner && ExitCode == 0 && status != null && status.lanEnabled) Close();
+        }
+        internal static string OfficeConsent(string name, bool firstSetup)
+        {
+            return "确认“" + name + "”是公司的办公网络吗？\r\n\r\n允许其他电脑连接，并为当前 Windows 用户添加并信任本软件的安全证书。" +
+                "\r\n若需改为“专用网络”，原有文件共享也可能随之开启。" +
+                (firstSetup ? "" : "\r\n\r\n请先让同事保存并同步工作；未同步内容请先导出。") +
+                "\r\n\r\n公共场所网络请选“否”。";
+        }
+        internal static string PhaseText(string phase)
+        {
+            switch (phase)
+            {
+                case "checking-office-network": return "1/6 检查办公网络；出现 Windows 授权时请确认。";
+                case "creating-certificate": return "2/6 正在准备安全连接……";
+                case "configuring-https": return "3/6 正在保存连接设置……";
+                case "firewall": return "4/6 允许其他电脑连接；出现 Windows 授权时请确认。";
+                case "host-user-trust": return "5/6 等待 Windows 的“安全警告”确认。";
+                case "public-handoff": return "6/6 正在完成连接设置……";
+                case "awaiting-host-restart": return "正在确认设置结果……";
+                case "restoring-original-configuration": return "正在恢复原来的连接设置……";
+                case "disabled": return "正在确认撤销结果……";
+                default: return "正在保存当前步骤……";
+            }
+        }
+        private async Task Disable()
+        {
+            if (!beginner && (!drafts.Checked || !firewall.Checked || !trust.Checked))
+            {
+                Output.Text = "停用也会改变浏览器来源。须先确认草稿已同步/导出和主机已停止，并明确同意只撤销自有规则与自有信任。"; return;
+            }
+            if (MessageBox.Show(this, beginner ?
+                "关闭后，同事将暂时无法连接。请先让同事同步或导出未同步工作。\r\n\r\n只移除本程序新增的连接规则和证书，账号、账本及办公网络类型不变。员工电脑的图标和证书需在员工电脑上移除。" :
+                "确认恢复原本机网址？所有设备须先同步或导出草稿。\r\n只删除本工具可证明新增且完整匹配的规则/主机用户证书。员工电脑须各自撤销。保留账本、备份、原配置、证书与接入包。",
+                "明确停用局域网", MessageBoxButtons.YesNo, MessageBoxIcon.Warning, MessageBoxDefaultButton.Button2) != DialogResult.Yes) return;
+            ExitCode = 1;
+            await Run(() => {
+                status = core.Status(); state = LoadState(status);
+                if (state == null)
+                {
+                    if (!status.recoveryAvailable && !status.lanEnabled) throw new IOException("没有可恢复的本工具配置。");
+                    core.Disable();
+                    status = core.Status();
+                    ExitCode = HostWorkflow.ResumeExitCode(status, null);
+                    if (ExitCode != 0) throw new IOException("恢复后回读状态不完整，主机将保持停止；没有删除任何归属不明的规则或证书。");
+                    return "原本机网络配置已恢复。\r\n缺少当前用户的向导归属记录：没有删除任何防火墙规则或证书。请维护人员核对原操作用户与记录，不能假定清理完成。";
+                }
+                using (var journal = new RecordFile(HostState.JournalDirectory(status.configFile), "state.json"))
+                {
+                    if (journal.Read() == null || Json.Encode(Json.Decode<HostState>(journal.Read())) != Json.Encode(state))
+                        throw new IOException("另一向导窗口已更新归属记录；请刷新后重试，未覆盖。");
+                    HostWorkflow.Disable(state, new WindowsHostEffects(core, new CurrentUserTrustStore(ConfirmOnUi)), true, true,
+                        () => { journal.Save(state); ReportProgress(PhaseText(state.phase)); });
+                }
+                status = core.Status();
+                if (HostWorkflow.ResumeExitCode(status, state) != 0)
+                    throw new IOException("恢复后回读状态不完整，主机将保持停止，请刷新核对。\r\n" + state.Summary());
+                ExitCode = 0;
+                return beginner ? "同事连接已关闭，返回软件可继续在这台电脑记账。" :
+                    state.Summary() + "\r\n\r\n请关闭返回主机。员工电脑的证书/入口需用各自接入工具撤销；预先存在的信任与规则会保留。";
+            });
+            Display();
+        }
+    }
+
+    internal sealed class ClientForm : WizardForm
+    {
+        private readonly Connection connection;
+        private readonly CheckBox fingerprint = new CheckBox { Text = "已通过当面/电话等独立渠道，向负责人核对完整 CA SHA-256 指纹", AutoSize = true };
+        private readonly CheckBox consent = new CheckBox { Text = "明确同意将此 CA 添加到当前 Windows 用户的“受信任的根证书颁发机构”（不是全机信任）", AutoSize = true };
+        private readonly Button connect, retry, shortcut, browser;
+        private bool verified;
+        internal ClientForm(Connection connection) : base("园区租赁 · 员工电脑接入")
+        {
+            this.connection = connection; Size = new Size(950, 740);
+            Row(LabelText("连接原账套，不复制账本，不重新注册管理员", true), false);
+            Row(new TextBox {
+                ReadOnly = true, Multiline = true, Height = 125, ScrollBars = ScrollBars.Vertical, BackColor = Color.White,
+                Text = "主机地址：" + connection.origin + "\r\n账套标识：" + connection.serverId +
+                    "\r\nCA SHA-256（必须独立核对）：\r\n" + connection.Fingerprint() + "\r\n叶证书到期：" + connection.expiresAt
+            }, false);
+            Row(LabelText("请与负责人独立核对指纹；不认识发件人或指纹不符时请停止。须与主机处于同一办公网段，勿忽略证书警告。", false), false);
+            Row(fingerprint, false); Row(consent, false); Row(Output, true);
+            connect = Button("同意添加证书并验证主机", async (sender, args) => await Connect(true), true);
+            retry = Button("仅重试连接（不添加信任）", async (sender, args) => await Connect(false), true);
+            shortcut = Button("创建桌面入口并打开", async (sender, args) => await Open(true), true);
+            browser = Button("仅打开浏览器", async (sender, args) => await Open(false), true);
+            Row(Buttons(connect, retry, shortcut, browser), false);
+            Row(Buttons(Button("撤销本工具新增的信任和入口", async (sender, args) => await Revoke(), true),
+                Button("关闭", (sender, args) => Close(), false)), false);
+            Row(LabelText("连接成功后，使用已有业务账号登录。IP 变化或证书一年到期时，先同步或导出草稿，再联系负责人重新配置并发包。", false), false);
+            Actions.Add(fingerprint); Actions.Add(consent);
+            Output.Text = "尚未添加证书、创建入口或联系主机。先核对上方地址与指纹。\r\n负责人必须先关闭主机向导，让主机恢复运行。";
+            if (Connection.Time(connection.expiresAt) <= DateTimeOffset.UtcNow)
+                Output.Text = "这个接入包已到期，不能再添加信任或连接。可以明确撤销本工具新增的证书/入口；请联系负责人重新发包。";
+            UpdateButtons();
+        }
+        protected override void UpdateButtons()
+        {
+            if (connect == null) return;
+            bool current = Connection.Time(connection.expiresAt) > DateTimeOffset.UtcNow;
+            connect.Enabled = retry.Enabled = !Busy && current;
+            browser.Enabled = shortcut.Enabled = !Busy && verified && current;
+        }
+        private async Task Connect(bool addTrust)
+        {
+            if (addTrust && (!fingerprint.Checked || !consent.Checked))
+            {
+                Output.Text = "请先核对完整指纹，并勾选同意添加证书。"; return;
+            }
+            verified = false;
+            await Run(() => {
+                connection.Validate(false);
+                using (var record = new RecordFile(ClientRecords.DirectoryFor(connection), "state.json"))
+                {
+                    var state = ClientRecords.Load(record, connection); string trustStatus = "本次未添加信任；仅使用 Windows 既有信任进行验证。";
+                    if (addTrust) trustStatus = Trust.Add(new CurrentUserTrustStore(ConfirmOnUi), connection, state.trust, Product.Sid, true, () => record.Save(state));
+                    ReportProgress("正在连接公司主机……");
+                    state.connectionStatus = "pending"; record.Save(state);
+                    try { new PinnedBootstrapProbe().Check(connection); }
+                    catch (Exception error) { throw new IOException(trustStatus + "\r\n\r\n主机连接：尚未通过。\r\n" + error.Message, error); }
+                    state.connectionStatus = "verified-not-logged-in"; record.Save(state);
+                    verified = true;
+                    return trustStatus + "\r\n\r\n已连接主机。" +
+                        "\r\n请创建桌面入口或打开浏览器，使用已有业务账号登录。";
+                }
+            });
+        }
+        private async Task Open(bool create)
+        {
+            if (!verified) { Output.Text = "请先在此窗口成功验证连接。"; return; }
+            string desktop = create ? Desktop() : null;
+            await Run(() => {
+                if (create)
+                    using (var record = new RecordFile(ClientRecords.DirectoryFor(connection), "state.json"))
+                    {
+                        var state = ClientRecords.Load(record, connection);
+                        ClientEntry.Create(connection, state, desktop, verified, () => record.Save(state));
+                    }
+                ClientEntry.Open(connection, verified);
+                return (create ? "已创建或核对本接入包的当前用户桌面入口，并请求浏览器打开。" : "已请求默认浏览器打开主机网址，没有创建快捷方式。") +
+                    "\r\n业务登录仍由浏览器完成，工具不能声称你已登录。";
+            });
+        }
+        private async Task Revoke()
+        {
+            if (MessageBox.Show(this, "仅撤销本工具为此 Windows 用户新增且仍精确匹配的根证书和桌面入口？\r\n预先存在/管理员安装的信任不删除；浏览器与本机草稿不删除。", "明确撤销员工接入", MessageBoxButtons.YesNo, MessageBoxIcon.Warning) != DialogResult.Yes) return;
+            verified = false; string desktop = Desktop();
+            await Run(() => {
+                string directory = ClientRecords.DirectoryFor(connection);
+                if (!NativeFiles.Exists(directory)) return "没有此 Windows 用户的接入归属记录。未删除任何证书、快捷方式或浏览器数据。";
+                using (var record = new RecordFile(directory, "state.json"))
+                {
+                    var state = ClientRecords.Load(record, connection);
+                    var results = new List<string>(); var failures = new List<string>();
+                    try { results.Add(ClientEntry.Remove(connection, state, desktop, () => record.Save(state))); }
+                    catch (Exception error) { failures.Add("入口撤销未完成：" + error.Message); }
+                    try { results.Add(Trust.Remove(new CurrentUserTrustStore(ConfirmOnUi), connection, state.trust, Product.Sid, () => record.Save(state))); }
+                    catch (Exception error) { failures.Add("信任撤销未完成：" + error.Message); }
+                    state.connectionStatus = "revoked-or-preserved-preexisting"; record.Save(state);
+                    return String.Join("\r\n", results.Concat(failures)) + "\r\n没有删除浏览器配置或任何草稿。";
+                }
+            });
+        }
+    }
+}

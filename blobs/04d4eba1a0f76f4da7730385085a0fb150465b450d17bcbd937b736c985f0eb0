@@ -1,0 +1,95 @@
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Linq;
+using System.Net;
+using System.Net.Security;
+using System.Security.Cryptography.X509Certificates;
+using System.Threading;
+using RentLan;
+
+namespace RentCentre.Client
+{
+    internal static class ClientHttp
+    {
+        internal static string Get(SavedCompany company, string route, string token, int maximum = 65536)
+        {
+            company.Validate();
+            if (route != "/api/bootstrap" && route != "/api/desktop/notifications" && route != "/api/desktop/update-source")
+                throw new IOException("电脑端请求超出授权范围。");
+            if (token != null && route != "/api/desktop/notifications") throw new IOException("通知凭证不能用于业务接口。");
+            ServicePointManager.SecurityProtocol = SecurityProtocolType.Tls12;
+            var request = (HttpWebRequest)WebRequest.Create(company.origin + route);
+            request.AllowAutoRedirect = false; request.Proxy = null; request.CookieContainer = null;
+            request.Credentials = null; request.UseDefaultCredentials = false; request.PreAuthenticate = false;
+            request.Timeout = 10000; request.ReadWriteTimeout = 8000; request.KeepAlive = false;
+            request.Accept = "application/json"; request.UserAgent = "RentWindows/1";
+            if (token != null) request.Headers[HttpRequestHeader.Authorization] = "Bearer " + token;
+            if (company.connection != null)
+                request.ServerCertificateValidationCallback = (sender, certificate, chain, errors) =>
+                    CertificatePin.Accept(company.connection, certificate, chain, errors);
+            using (var deadline = new Timer(ignored => request.Abort(), null, 12000, Timeout.Infinite))
+            try {
+                using (var response = (HttpWebResponse)request.GetResponse()) {
+                    if (response.StatusCode != HttpStatusCode.OK || response.ContentType == null ||
+                        !response.ContentType.Split(';')[0].Trim().Equals("application/json", StringComparison.OrdinalIgnoreCase))
+                        throw new IOException("主机响应格式不受支持，请重试或联系维护人员。");
+                    if (response.ContentLength > maximum) throw new IOException("主机响应超过限制。");
+                    using (var source = response.GetResponseStream()) using (var bytes = new MemoryStream()) {
+                        byte[] buffer = new byte[4096]; int count;
+                        while ((count = source.Read(buffer, 0, buffer.Length)) != 0) {
+                            if (bytes.Length + count > maximum) throw new IOException("主机响应超过限制。");
+                            bytes.Write(buffer, 0, count);
+                        }
+                        return Product.Utf8.GetString(bytes.ToArray());
+                    }
+                }
+            } finally { request.Abort(); }
+        }
+        internal static SavedCompany CheckLocalCompany(string origin)
+        {
+            Uri parsed;
+            if (!Uri.TryCreate(origin, UriKind.Absolute, out parsed) || parsed.UserInfo.Length != 0 ||
+                parsed.GetLeftPart(UriPartial.Authority) != origin) throw new IOException("公司来源地址无效。");
+            if (parsed.Scheme != "http" || parsed.Host != "127.0.0.1") {
+                int port; Network.AddressOf(origin, out port);
+            }
+            var provisional = new SavedCompany { origin = origin, serverId = "00000000-0000-4000-8000-000000000001" };
+            var bootstrap = Json.Object(Get(provisional, "/api/bootstrap", null));
+            provisional.serverId = Json.String(bootstrap, "serverId"); provisional.Validate();
+            if (!Json.Boolean(bootstrap, "initialized")) throw new IOException("请先在主机管理窗口建立管理员账号。");
+            return provisional;
+        }
+    }
+
+    internal sealed class NoticeTarget
+    {
+        public string kind, id;
+        internal void Validate()
+        {
+            if (kind == "notifications") { if (id != null) throw new IOException("提醒目标无效。"); return; }
+            if (kind != "application" && kind != "invoice") throw new IOException("提醒目标无效。");
+            Product.Uuid(id);
+        }
+    }
+
+    internal sealed class NoticePoll
+    {
+        internal static List<Dictionary<string, object>> Validate(string body, SavedCompany company, NoticeBinding binding)
+        {
+            var result = Json.Object(body, 2097152);
+            if (Json.String(result, "serverId") != company.serverId || Json.String(result, "userId") != binding.userId ||
+                Json.String(result, "deviceId") != binding.deviceId) throw new IOException("提醒不属于当前公司或账号，已拒绝显示。");
+            var events = result["events"] as List<object>;
+            if (events == null || events.Count > 3000) throw new IOException("提醒响应格式不正确。");
+            var items = new List<Dictionary<string, object>>();
+            foreach (object raw in events) {
+                var item = raw as Dictionary<string, object>;
+                if (item == null || Json.String(item, "id").Length > 180) throw new IOException("提醒标识无效。");
+                var target = Json.Decode<NoticeTarget>(Json.Encode(item["target"])); target.Validate();
+                if (!binding.seen.Contains(Json.String(item, "id"))) items.Add(item);
+            }
+            return items;
+        }
+    }
+}

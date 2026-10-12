@@ -1,0 +1,147 @@
+(function (root, factory) {
+  "use strict";
+  if (typeof module === "object" && module.exports) {
+    module.exports = factory(require("./business.js"));
+  } else {
+    root.RentReporting = factory(root.RentBusiness);
+  }
+})(globalThis, function (Business) {
+  "use strict";
+
+  function invalid(message) {
+    const error = new Error(message);
+    error.code = "VALIDATION";
+    error.status = 400;
+    error.statusCode = 400;
+    throw error;
+  }
+
+  function filtersFor(snapshot, input = {}) {
+    const filters = {
+      basis: input.basis || "due",
+      month: input.month || snapshot.today.slice(0, 7),
+      kind: input.kind || "rent",
+      status: input.status || "all",
+      q: String(input.q || "").trim().toLocaleLowerCase(),
+    };
+    if (!["due", "cash", "period"].includes(filters.basis)) invalid("请选择有效的报表时间口径。");
+    if (!/^(19|20)\d{2}-(0[1-9]|1[0-2])$/.test(filters.month) && !/^2100-(0[1-9]|1[0-2])$/.test(filters.month)) {
+      invalid("报表月份须为 1900—2100 年内的 YYYY-MM。");
+    }
+    if (filters.kind !== "all" && !Business.feeKinds.includes(filters.kind)) {
+      invalid("请选择有效的费用类别。");
+    }
+    if (!["all", "collected", "outstanding", "settled"].includes(filters.status)) invalid("请选择有效的收款情况。");
+    if (filters.q.length > 300) invalid("搜索词不能超过 300 个字符。");
+    return filters;
+  }
+
+  function locationsText(locations) {
+    return (locations || []).map(location =>
+      [location.park, location.building, location.floor, location.zone].filter(Boolean).join(" / ")
+    ).join("；");
+  }
+  function invoiceMetadata(invoice) {
+    return [Business.lessorText(invoice), invoice.kind === "rent" ? Business.rentTaxText(invoice) : "不适用（非租金）",
+      Business.ownerText(invoice)];
+  }
+
+  function integer(value, label) {
+    if (!Number.isSafeInteger(value) || value < 0) invalid(`${label}不是有效的整数分，不能生成报表。`);
+    return value;
+  }
+
+  function sumInto(totals, key, value) {
+    const next = totals[key] + value;
+    if (!Number.isSafeInteger(next)) invalid("报表合计超出安全金额范围，请缩小筛选范围。");
+    totals[key] = next;
+  }
+
+  function select(snapshot, input = {}) {
+    const filters = filtersFor(snapshot, input);
+    const contracts = new Map(snapshot.contracts.map(contract => [contract.id, contract]));
+    const invoices = new Map(snapshot.invoices.map(invoice => [invoice.id, invoice]));
+    const invoiceIds = [];
+    const paymentIds = [];
+    const totals = { amountCents: 0, paidCents: 0, balanceCents: 0, cashCents: 0 };
+    const labels = { due: "按实际应缴月份", cash: "按实际到账／退款月份", period: "按租期与所选月份交叠" };
+    const statusLabels = { all: "全部", collected: "已有审核收款", outstanding: "尚未收齐", settled: "已收齐" };
+    const kindLabels = { all: "全部费用", rent: "租金", property: "物业／管理费", water: "水费", electricity: "电费", deposit: "押金／保证金", other: "其他费用" };
+    const caption = `${filters.month} · ${labels[filters.basis]} · ${kindLabels[filters.kind]} · ${statusLabels[filters.status]}` +
+      (filters.q ? ` · 搜索：${filters.q}` : "") +
+      (filters.basis === "period" ? "；跨月期次整笔展示一次，不分摊到月" : "") +
+      (filters.basis === "cash" ? "；现金流水不含期初已收" : "；已收含经复核的期初预收和提前收款");
+
+    function matches(invoice, includeHistory = false) {
+      if (!invoice || (!includeHistory && invoice.status !== "active")) return false;
+      if (filters.kind !== "all" && invoice.kind !== filters.kind) return false;
+      const contract = contracts.get(invoice.contractId);
+      const searchable = `${invoice.tenant} ${contract?.data.number || ""} ${locationsText(invoice.locations)} ${invoice.label} ${Business.lessorText(invoice)} ${Business.ownerText(invoice)}`.toLocaleLowerCase();
+      if (filters.q && !searchable.includes(filters.q)) return false;
+      const amount = integer(invoice.amountCents, "应收金额");
+      const paid = integer(invoice.paidCents, "已收金额");
+      if (paid > amount) invalid("存在已收超过应收的项目，请先处理账目异常。");
+      if (filters.status === "collected" && paid === 0) return false;
+      if (filters.status === "outstanding" && amount <= paid) return false;
+      if (filters.status === "settled" && amount !== paid) return false;
+      return true;
+    }
+
+    if (filters.basis === "cash") {
+      const entries = [
+        ...snapshot.payments.filter(payment => payment.status === "active" && payment.payDate.startsWith(filters.month))
+          .map(payment => ({ ...payment, date: payment.payDate, sign: 1, type: "已审核收款" })),
+        ...(snapshot.refunds || []).filter(refund => refund.refundDate.startsWith(filters.month))
+          .map(refund => ({ ...refund, date: refund.refundDate, sign: -1, type: "已审核退款" })),
+      ].filter(entry => matches(invoices.get(entry.invoiceId), true))
+        .sort((a, b) => a.date.localeCompare(b.date) || a.id.localeCompare(b.id));
+      const rows = entries.map(entry => {
+        const invoice = invoices.get(entry.invoiceId);
+        const signedAmount = integer(entry.amountCents, "流水金额") * entry.sign;
+        sumInto(totals, "cashCents", signedAmount);
+        paymentIds.push(entry.id);
+        if (!invoiceIds.includes(invoice.id)) invoiceIds.push(invoice.id);
+        return [
+          entry.date, entry.type, invoice.tenant, contracts.get(invoice.contractId)?.data.number || "",
+          locationsText(invoice.locations), invoice.label, `${invoice.periodStart} — ${invoice.periodEnd}`,
+          signedAmount / 100, entry.method || "", entry.note || entry.reason || "",
+          ...invoiceMetadata(invoice),
+        ];
+      });
+      return {
+        columns: ["到账／退款日期", "流水类型", "承租方", "合同编号", "出租位置", "费用", "所属租期", "金额（元，退款为负）", "方式", "说明", "出租方签约主体", "租金含税口径", "产权主体"],
+        rows, totals, invoiceIds, paymentIds, caption, filters,
+      };
+    }
+
+    const monthStart = `${filters.month}-01`;
+    const [year, month] = filters.month.split("-").map(Number);
+    const endDay = new Date(Date.UTC(year, month, 0)).getUTCDate();
+    const monthEnd = `${filters.month}-${endDay}`;
+    const chosen = snapshot.invoices.filter(invoice => matches(invoice) &&
+      (filters.basis === "due" ? invoice.dueDate.startsWith(filters.month) :
+        invoice.periodStart <= monthEnd && invoice.periodEnd >= monthStart))
+      .sort((a, b) => a.dueDate.localeCompare(b.dueDate) || a.id.localeCompare(b.id));
+    const rows = chosen.map(invoice => {
+      const balance = invoice.amountCents - invoice.paidCents;
+      sumInto(totals, "amountCents", invoice.amountCents);
+      sumInto(totals, "paidCents", invoice.paidCents);
+      sumInto(totals, "balanceCents", balance);
+      invoiceIds.push(invoice.id);
+      return [
+        invoice.tenant, contracts.get(invoice.contractId)?.data.number || "", locationsText(invoice.locations),
+        invoice.label, `${invoice.periodStart} — ${invoice.periodEnd}`, invoice.dueDate,
+        invoice.amountCents / 100, invoice.paidCents / 100, balance / 100,
+        balance === 0 ? "已收齐" : invoice.dueDate < snapshot.today ? "已到缴费日、尚未收齐" : "尚未收齐",
+        invoice.locations.length > 1 && invoice.locations.some(location => !location.allocatedRent) ? "总额未分配到位置" : "",
+        ...invoiceMetadata(invoice),
+      ];
+    });
+    return {
+      columns: ["承租方", "合同编号", "出租位置", "费用", "所属租期", "应缴日期", "应收（元）", "已收（元）", "未收（元）", "状态", "金额分配", "出租方签约主体", "租金含税口径", "产权主体"],
+      rows, totals, invoiceIds, paymentIds, caption, filters,
+    };
+  }
+
+  return Object.freeze({ select, locationsText });
+});

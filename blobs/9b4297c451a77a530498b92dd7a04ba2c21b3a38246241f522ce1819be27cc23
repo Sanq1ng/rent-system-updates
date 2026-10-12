@@ -1,0 +1,229 @@
+(function (root, factory) {
+  "use strict";
+  if (typeof module === "object" && module.exports) module.exports = factory();
+  else root.RentInvitations = factory().createController(root);
+})(globalThis, function () {
+  "use strict";
+
+  const FRAGMENT = /^#join=([0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12})\.([A-Za-z0-9_-]{42}[AEIMQUYcgkosw048])$/;
+  const MEMORY_MS = 15 * 60_000;
+  const metadata = value => ({
+    id: value.id, creatorId: value.creatorId, roles: [...(value.roles || [])], parks: [...(value.parks || [])],
+    allParks: value.allParks === true, canExport: value.canExport === true, receiveReminders: value.receiveReminders === true,
+    createdAt: value.createdAt, expiresAt: value.expiresAt, status: value.status,
+    acceptedUserId: value.acceptedUserId, acceptedAt: value.acceptedAt, revokedAt: value.revokedAt,
+  });
+
+  function createController(environment, { clock = Date.now, memoryMs = MEMORY_MS } = {}) {
+    let join = null, phase = "none", preview = null, signedIn = false, joinTimer = null, epoch = 0, joinEpoch = 0, joinRequest = null, expiryReason = "";
+    const held = new Map(), downloads = new Map();
+    const later = environment.setTimeout?.bind(environment) || setTimeout;
+    const cancel = environment.clearTimeout?.bind(environment) || clearTimeout;
+    // Moving the system clock backwards must not extend a retained invitation.
+    const elapsed = environment.performance?.now?.bind(environment.performance) || clock;
+    const remaining = item => Math.min(item.until - clock(), item.memoryUntil - elapsed());
+    const announce = name => {
+      if (environment.dispatchEvent && environment.Event) environment.dispatchEvent(new environment.Event(name));
+    };
+    const changed = () => announce("rent-invitation-change");
+    function clearJoin(next = "none", notify = true, reason = "") {
+      cancel(joinTimer);
+      joinTimer = null;
+      if (join) join.token = "";
+      if (joinRequest) {
+        joinRequest.body.token = "";
+        if ("password" in joinRequest.body) joinRequest.body.password = "";
+      }
+      join = null; preview = null; signedIn = false; phase = next; joinEpoch++; joinRequest = null;
+      expiryReason = reason;
+      if (notify) changed();
+    }
+    function expireJoin() {
+      if (join && remaining(join) <= 0) {
+        const reason = preview && clock() >= Date.parse(preview.expiresAt) ? "invitation" : "page";
+        clearJoin("expired", true, reason);
+      }
+    }
+    function armJoin() {
+      cancel(joinTimer);
+      joinTimer = later(() => {
+        const reason = preview && clock() >= Date.parse(preview.expiresAt) ? "invitation" : "page";
+        clearJoin("expired", true, reason);
+      }, Math.max(0, remaining(join)));
+      joinTimer?.unref?.();
+    }
+    function capture() {
+      const fragment = environment.location?.hash || "";
+      if (!fragment.startsWith("#join=")) return false;
+      const match = FRAGMENT.exec(fragment);
+      // This runs as the first blocking script, before app/bootstrap/offline code or other resource loads.
+      try {
+        environment.history.replaceState(environment.history.state, "",
+          environment.location.pathname + environment.location.search);
+      } catch {
+        clearJoin("invalid");
+        return true;
+      }
+      clearJoin("invalid", false);
+      if (match) {
+        join = { id: match[1], token: match[2], until: clock() + memoryMs, memoryUntil: elapsed() + memoryMs };
+        phase = "active";
+        armJoin();
+      }
+      changed();
+      return true;
+    }
+    function status() {
+      expireJoin();
+      return { phase, invitation: preview ? metadata(preview) : null, signedIn, revision: joinEpoch, expiryReason };
+    }
+    function proof() {
+      expireJoin();
+      if (!join) throw new Error("邀请已从本页清除，请重新打开管理员发给你的个人邀请。");
+      return { id: join.id, token: join.token };
+    }
+    function assertJoin(version) {
+      expireJoin();
+      if (version !== joinEpoch) throw new DOMException("邀请已切换。", "AbortError");
+    }
+    function beginJoin() {
+      const body = proof();
+      if (joinRequest) {
+        body.token = "";
+        throw Object.assign(new Error("正在检查邀请或创建账号，请稍候。"), { code: "INVITATION_BUSY" });
+      }
+      const operation = { version: joinEpoch, body };
+      joinRequest = operation;
+      return { body, operation };
+    }
+    function finishJoin(operation) {
+      if (joinRequest === operation) joinRequest = null;
+    }
+    async function inspect(send) {
+      const { body, operation } = beginJoin(), version = operation.version;
+      try {
+        const result = await send("/api/invitations/inspect", body);
+        assertJoin(version);
+        if (result?.invitation?.id !== body.id || !Number.isFinite(Date.parse(result.invitation.expiresAt))) {
+          throw new Error("主机返回的邀请资料无法核对，请重新打开邀请。");
+        }
+        preview = metadata(result.invitation);
+        signedIn = result.signedIn === true;
+        join.until = Math.min(join.until, Date.parse(preview.expiresAt));
+        armJoin();
+        return status();
+      } catch (error) {
+        assertJoin(version);
+        if (error.code === "INVITATION_UNAVAILABLE" || error.status === 410 || error.status === 400) clearJoin("unavailable", false);
+        throw error;
+      } finally {
+        body.token = "";
+        finishJoin(operation);
+      }
+    }
+    async function claim(send, username, password) {
+      const { body, operation } = beginJoin(), version = operation.version;
+      body.username = username; body.password = password;
+      try {
+        if (signedIn) throw Object.assign(new Error("已有登录账号，请先保存工作并退出。"), { code: "INVITATION_ACCOUNT_ACTIVE" });
+        const result = await send("/api/invitations/claim", body);
+        assertJoin(version);
+        if (result?.ok !== true || result.username !== username.trim()) {
+          throw Object.assign(new Error("未能核对创建结果，请先返回登录，使用刚才填写的用户名和密码。"),
+            { code: "INVITATION_RESULT_UNCONFIRMED" });
+        }
+        clearJoin("accepted", false);
+        return { ok: true, username: result.username };
+      } catch (error) {
+        assertJoin(version);
+        if (error.code === "INVITATION_UNAVAILABLE" || error.status === 410) clearJoin("unavailable", false);
+        if (error.code === "INVITATION_ACCOUNT_ACTIVE") signedIn = true;
+        throw error;
+      } finally {
+        body.token = ""; body.password = "";
+        finishJoin(operation);
+      }
+    }
+    function forget(id, notify = true) {
+      const item = held.get(id);
+      if (item) { cancel(item.timer); item.token = ""; held.delete(id); }
+      if (notify) announce("rent-invitations-held-change");
+    }
+    function current(id) {
+      const item = held.get(id);
+      if (item && remaining(item) <= 0) { forget(id); return null; }
+      return item || null;
+    }
+    async function issue(send, permissions) {
+      const version = epoch;
+      const result = await send("/api/admin/invitations", permissions);
+      try {
+        if (version !== epoch) throw new DOMException("账号工作区已切换，邀请未留在新账号页面。", "AbortError");
+        const invitation = metadata(result?.invitation || {});
+        const test = `#join=${invitation.id}.${result?.token}`;
+        if (!FRAGMENT.test(test) || !Number.isFinite(Date.parse(invitation.expiresAt))) {
+          throw Object.assign(new Error("创建结果无法核对，请刷新状态；若已有新邀请，请先撤销再新建。"),
+            { code: "INVITATION_ISSUE_UNCONFIRMED" });
+        }
+        const until = Math.min(clock() + memoryMs, Date.parse(invitation.expiresAt));
+        const item = { invitation, token: result.token, until, memoryUntil: elapsed() + memoryMs };
+        item.timer = later(() => forget(invitation.id), Math.max(0, remaining(item)));
+        item.timer?.unref?.();
+        held.set(invitation.id, item);
+        announce("rent-invitations-held-change");
+        return { invitation, delivery: result.delivery };
+      } finally {
+        if (result && typeof result === "object") result.token = "";
+      }
+    }
+    async function packageRequest(request, id) {
+      const item = current(id), version = epoch;
+      if (!item) throw new Error("本页已不再保留这份邀请的下载口令。请撤销后重新签发；不能从主机找回旧口令。");
+      try {
+        const response = await request("/api/admin/invitations/package",
+          { method: "POST", body: JSON.stringify({ id, token: item.token }) });
+        if (epoch !== version || !current(id)) throw new DOMException("邀请工作区已改变，旧下载已取消。", "AbortError");
+        return response;
+      } catch (error) {
+        if (error.status === 410 || error.code === "INVITATION_UNAVAILABLE") forget(id);
+        throw error;
+      }
+    }
+    async function copyLink(id, write) {
+      const item = current(id), version = epoch;
+      if (!item) throw new Error("邀请已从本页清除，请撤销后重新签发。");
+      await write(`${environment.location.origin}/#join=${id}.${item.token}`);
+      if (version !== epoch || current(id) !== item) throw new DOMException("邀请已改变，请刷新状态后再操作。", "AbortError");
+    }
+    function reconcile(invitations) {
+      const visible = new Map(invitations.map(item => [item.id, item]));
+      for (const id of held.keys()) {
+        if (visible.has(id) && visible.get(id).status !== "pending") forget(id, false);
+      }
+    }
+    function releaseDownload(url) {
+      const timer = downloads.get(url);
+      if (timer) cancel(timer);
+      downloads.delete(url);
+      environment.URL.revokeObjectURL(url);
+    }
+    function trackDownload(url) {
+      const timer = later(() => releaseDownload(url), 30_000);
+      timer?.unref?.();
+      downloads.set(url, timer);
+    }
+    function clearAll() {
+      epoch++;
+      clearJoin("none", false);
+      for (const id of held.keys()) forget(id, false);
+      for (const url of downloads.keys()) releaseDownload(url);
+    }
+    environment.addEventListener?.("hashchange", capture);
+    environment.addEventListener?.("pagehide", clearAll);
+    capture();
+    return Object.freeze({ status, inspect, claim, issue, packageRequest, copyLink, reconcile,
+      hasHeld: id => Boolean(current(id)), clearJoin, clearAll, trackDownload });
+  }
+
+  return Object.freeze({ createController, MEMORY_MS });
+});

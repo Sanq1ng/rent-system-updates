@@ -1,0 +1,328 @@
+(function (root, factory) {
+  "use strict";
+  const api = factory();
+  if (typeof module === "object" && module.exports) module.exports = api;
+  else root.RentPush = api;
+})(typeof globalThis === "object" ? globalThis : self, function () {
+  "use strict";
+
+  const OPEN_PATH = "/#notifications";
+  const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+  const SECRET = /^[A-Za-z0-9_-]{43}$/;
+  const CONTENT = {
+    "rent-reminder": "您有新的待处理提醒，请登录查看。",
+    "rent-push-test": "这是一条设备通知测试，不含业务信息。",
+  };
+  function failure(code, message) { const error = new Error(message); error.code = code; return error; }
+  function insist(value, code, message) { if (!value) throw failure(code, message); }
+  function exact(value, fields) {
+    return value && typeof value === "object" && !Array.isArray(value) &&
+      Object.keys(value).length === fields.length && fields.every(key => Object.hasOwn(value, key));
+  }
+
+  function validatePayload(value) {
+    if (value?.kind === "rent-push-enrollment") {
+      insist(exact(value, ["kind", "enrollmentId", "proof"]) && UUID.test(value.enrollmentId) && SECRET.test(value.proof),
+        "PUSH_PAYLOAD", "设备验证消息无效。");
+      return { kind: value.kind, enrollmentId: value.enrollmentId, proof: value.proof };
+    }
+    insist(exact(value, ["kind", "deliveryId", "receiptToken", "title", "body", "url"]) &&
+      Object.hasOwn(CONTENT, value.kind) && UUID.test(value.deliveryId) && SECRET.test(value.receiptToken) &&
+      value.title === "园区租赁" && value.body === CONTENT[value.kind] && value.url === OPEN_PATH,
+    "PUSH_PAYLOAD", "设备通知消息无效。");
+    return { kind: value.kind, deliveryId: value.deliveryId, receiptToken: value.receiptToken,
+      title: "园区租赁", body: CONTENT[value.kind], url: OPEN_PATH };
+  }
+
+  function notificationFor(value) {
+    const payload = validatePayload(value);
+    const enrollment = payload.kind === "rent-push-enrollment";
+    return { title: "园区租赁", options: {
+      body: enrollment ? "请回到应用确认开启设备通知。" : payload.body,
+      tag: `rent-push-${enrollment ? payload.enrollmentId : payload.deliveryId}`,
+      data: payload,
+    } };
+  }
+
+  async function postReceipt(value, stage, fetcher = globalThis.fetch.bind(globalThis)) {
+    const payload = validatePayload(value);
+    insist(payload.kind !== "rent-push-enrollment" && ["received", "opened"].includes(stage),
+      "PUSH_RECEIPT", "通知回执无效。");
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 8000);
+    try {
+      const response = await fetcher("/api/push/receipts", {
+        method: "POST", credentials: "omit", redirect: "error", cache: "no-store", signal: controller.signal,
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ deliveryId: payload.deliveryId, receiptToken: payload.receiptToken, stage }),
+      });
+      insist(response.ok && !response.redirected, "PUSH_RECEIPT_PENDING", "回执尚未由主机确认。");
+      const result = await response.json();
+      insist(result?.ok === true && ["received", "opened"].includes(result.stage), "PUSH_RECEIPT_PENDING", "回执尚未由主机确认。");
+      return result;
+    } finally { clearTimeout(timer); }
+  }
+
+  function features(environment = globalThis) {
+    const navigator = environment.navigator || {};
+    const ios = /iPad|iPhone|iPod/.test(navigator.userAgent || "") ||
+      navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1;
+    const installed = navigator.standalone === true || environment.matchMedia?.("(display-mode: standalone)").matches === true;
+    return {
+      secure: environment.isSecureContext === true,
+      supported: environment.isSecureContext === true && Boolean(environment.Notification && environment.PushManager && navigator.serviceWorker),
+      ios, installed, requiresHomeScreen: ios && !installed,
+      permission: environment.Notification?.permission || "unsupported",
+    };
+  }
+
+  // request is the host application's guarded JSON helper; it must retain cookie/CSRF/version/workspace checks.
+  function createClient({ request, getIdentity, isMaintenance = () => false, environment = globalThis,
+    storage = environment.localStorage, getRegistration = () => environment.navigator.serviceWorker.ready,
+    timeoutMs = 15000, permissionTimeoutMs = 120000 } = {}) {
+    insist(typeof request === "function" && typeof getIdentity === "function", "PUSH_ADAPTER", "缺少受保护的通知请求适配器。");
+    insist([timeoutMs, permissionTimeoutMs].every(value => Number.isSafeInteger(value) && value >= 1 && value <= 300000),
+      "PUSH_ADAPTER", "设备通知等待时间设置无效。");
+    let generation = 0;
+    let operation = null;
+    const proofs = new Map();
+    const waiting = new Map();
+    const storageKey = "rent-push-installation:v1";
+
+    function installationId() {
+      let value = storage.getItem(storageKey);
+      if (!value || !UUID.test(value)) {
+        value = environment.crypto.randomUUID();
+        storage.setItem(storageKey, value);
+      }
+      return value;
+    }
+    function identity() {
+      const current = getIdentity();
+      insist(current && typeof current.serverId === "string" && typeof current.userId === "string",
+        "PUSH_SESSION", "请先在线登录，再开启设备通知。");
+      return `${current.serverId}:${current.userId}`;
+    }
+    function begin() {
+      insist(!operation, "PUSH_BUSY", "设备通知操作尚未结束。");
+      insist(!isMaintenance(), "MAINTENANCE", "主机正在维护，请稍后操作设备通知。");
+      operation = { identity: identity(), generation, controller: new environment.AbortController(), enrollmentId: null };
+      return operation;
+    }
+    function guard(current) {
+      insist(operation === current && !current.controller.signal.aborted &&
+        current.generation === generation && identity() === current.identity,
+        "PUSH_SESSION_CHANGED", "账号或账套已切换，请重新打开通知设置。");
+      insist(!isMaintenance(), "MAINTENANCE", "主机正在维护，请稍后操作设备通知。");
+    }
+    function guardLocal(current) {
+      insist(operation === current && !current.controller.signal.aborted && current.generation === generation,
+        "PUSH_SESSION_CHANGED", "账号或账套已切换，请重新打开通知设置。");
+      const owner = getIdentity();
+      insist(!current.identity || !owner || `${owner.serverId}:${owner.userId}` === current.identity,
+        "PUSH_SESSION_CHANGED", "账号或账套已切换，请重新打开通知设置。");
+    }
+    function step(current, action, { local = false, timeout = timeoutMs } = {}) {
+      const check = local ? guardLocal : guard;
+      check(current);
+      return new Promise((resolve, reject) => {
+        let settled = false, timer;
+        const signal = current.controller.signal;
+        const finish = (succeeded, value) => {
+          if (succeeded) {
+            try { check(current); }
+            catch (error) { succeeded = false; value = error; }
+          }
+          if (settled) return;
+          settled = true;
+          clearTimeout(timer);
+          signal.removeEventListener("abort", aborted);
+          if (succeeded) resolve(value);
+          else reject(value);
+        };
+        const aborted = () => finish(false, failure("PUSH_SESSION_CHANGED", "设备通知操作已取消。"));
+        signal.addEventListener("abort", aborted, { once: true });
+        timer = setTimeout(() => finish(false,
+          failure("PUSH_TIMEOUT", "设备通知操作等待超时，请核对网络、浏览器权限和设备状态后重试。")), timeout);
+        if (signal.aborted) { aborted(); return; }
+        // Invoke synchronously so the browser permission prompt retains the user's click gesture.
+        try { Promise.resolve(action()).then(value => finish(true, value), error => finish(false, error)); }
+        catch (error) { finish(false, error); }
+      });
+    }
+    async function call(current, path, method = "GET", body) {
+      guard(current);
+      const result = await step(current, () => request(path, {
+        method, signal: current.controller.signal,
+        headers: { "X-Rent-Installation-Id": installationId(), ...(body === undefined ? {} : { "Content-Type": "application/json" }) },
+        ...(body === undefined ? {} : { body: JSON.stringify(body) }),
+      }));
+      guard(current);
+      return result;
+    }
+    function finish(current) {
+      current.controller.abort();
+      if (operation === current) {
+        operation = null;
+        proofs.clear();
+      }
+    }
+    function invalidate() {
+      generation++;
+      operation?.controller.abort();
+      operation = null;
+      for (const entry of waiting.values()) {
+        clearTimeout(entry.timer);
+        entry.reject(failure("PUSH_SESSION_CHANGED", "账号或账套已切换，设备验证已停止。"));
+      }
+      waiting.clear();
+      proofs.clear();
+    }
+    function handleMessage(event) {
+      if (!operation || event?.data?.type !== "rent-push" || event.origin !== environment.location.origin) return false;
+      let source;
+      try { source = new URL(event.source?.scriptURL); }
+      catch { return false; }
+      if (source.origin !== environment.location.origin || source.pathname !== "/sw.js") return false;
+      let payload;
+      try { payload = validatePayload(event.data.payload); }
+      catch { return false; }
+      if (payload.kind !== "rent-push-enrollment") return false;
+      try { guard(operation); }
+      catch { return false; }
+      if (operation.enrollmentId && payload.enrollmentId !== operation.enrollmentId) return false;
+      if (proofs.size >= 8 && !proofs.has(payload.enrollmentId)) return false;
+      proofs.set(payload.enrollmentId, payload.proof);
+      const pending = waiting.get(payload.enrollmentId);
+      if (pending) {
+        clearTimeout(pending.timer);
+        waiting.delete(payload.enrollmentId);
+        pending.resolve(payload.proof);
+      }
+      return true;
+    }
+    function waitForProof(current, id, expiresAt) {
+      guard(current);
+      if (proofs.has(id)) return Promise.resolve(proofs.get(id));
+      const milliseconds = Math.min(300_000, Date.parse(expiresAt) - Date.now());
+      insist(Number.isFinite(milliseconds) && milliseconds > 0, "PUSH_ENROLLMENT_EXPIRED", "设备验证已过期，请重新发起。");
+      return new Promise((resolve, reject) => {
+        const timer = setTimeout(() => {
+          waiting.delete(id);
+          reject(failure("PUSH_ENROLLMENT_TIMEOUT", "尚未收到设备验证，请检查通知权限和网络后重试；设备尚未启用。"));
+        }, milliseconds);
+        waiting.set(id, { resolve, reject, timer });
+      });
+    }
+    function applicationKey(value) {
+      insist(typeof value === "string" && /^[A-Za-z0-9_-]{87}$/.test(value), "PUSH_UNAVAILABLE", "浏览器通知公钥尚未配置。");
+      const bytes = environment.atob(value.replace(/-/g, "+").replace(/_/g, "/") + "=");
+      insist(bytes.length === 65 && bytes.charCodeAt(0) === 4, "PUSH_UNAVAILABLE", "浏览器通知公钥无效。");
+      return Uint8Array.from(bytes, character => character.charCodeAt(0));
+    }
+
+    async function enable({ consent, status, label = "浏览器设备" } = {}) {
+      const capabilities = features(environment);
+      insist(consent === true, "PUSH_CONSENT", "需要先明确同意使用设备通知。");
+      insist(capabilities.supported, "PUSH_UNSUPPORTED", "当前浏览器或访问方式不支持标准设备通知。");
+      insist(!capabilities.requiresHomeScreen, "PUSH_IOS_HOME_SCREEN", "iPhone/iPad 请先添加到主屏幕，再从主屏幕打开。");
+      insist(environment.navigator.userActivation?.isActive !== false, "PUSH_GESTURE", "请直接点击开启通知按钮。");
+      insist(status?.protocolVersion === 1 && status.publicOrigin === environment.location.origin &&
+        status.channels?.webpush?.configured === true, "PUSH_UNAVAILABLE", "主机的浏览器通知通道尚未配置。");
+      const key = applicationKey(status.channels.webpush.publicKey);
+      const current = begin();
+      try {
+        const permission = environment.Notification.permission === "granted" ? "granted" :
+          await step(current, () => environment.Notification.requestPermission(), { timeout: permissionTimeoutMs });
+        guard(current);
+        insist(permission === "granted", "PUSH_PERMISSION", "未获得浏览器通知权限，设备尚未启用。");
+        const worker = await step(current, getRegistration);
+        guard(current);
+        insist(worker?.pushManager, "PUSH_UNSUPPORTED", "离线服务尚未准备好，请刷新后再试。");
+        let subscription = await step(current, () => worker.pushManager.getSubscription());
+        guard(current);
+        const previousKey = subscription?.options?.applicationServerKey;
+        if (previousKey && (previousKey.byteLength !== key.byteLength ||
+          !new Uint8Array(previousKey).every((byte, index) => byte === key[index]))) {
+          insist(await step(current, () => subscription.unsubscribe()), "PUSH_UNSUBSCRIBE", "旧浏览器订阅尚未撤销，请先关闭通知后重试。");
+          guard(current);
+          subscription = null;
+        }
+        if (!subscription) subscription = await step(current,
+          () => worker.pushManager.subscribe({ userVisibleOnly: true, applicationServerKey: key }));
+        guard(current);
+        const enrollment = await call(current, "/api/push/enrollments", "POST", {
+          requestId: environment.crypto.randomUUID(), installationId: installationId(),
+          channel: "webpush", label, subscription: subscription.toJSON(),
+        });
+        insist(UUID.test(enrollment?.id) && enrollment.status === "pending", "PUSH_ENROLLMENT", "主机尚未接受设备验证。");
+        current.enrollmentId = enrollment.id;
+        const proof = await waitForProof(current, enrollment.id, enrollment.expiresAt);
+        guard(current);
+        const result = await call(current, `/api/push/enrollments/${enrollment.id}/confirm`, "POST", { proof });
+        insist(result?.device?.status === "active" && result.device.installationId === installationId(),
+          "PUSH_ENROLLMENT", "主机尚未确认设备绑定。");
+        return result.device;
+      } finally { finish(current); }
+    }
+
+    async function unsubscribeLocal(current) {
+      guardLocal(current);
+      const manager = environment.navigator.serviceWorker;
+      const worker = await step(current,
+        () => typeof manager?.getRegistration === "function" ? manager.getRegistration() : getRegistration(), { local: true });
+      guardLocal(current);
+      if (!worker?.pushManager) return;
+      const subscription = await step(current, () => worker.pushManager.getSubscription(), { local: true });
+      guardLocal(current);
+      if (subscription) {
+        await step(current, () => subscription.unsubscribe(), { local: true });
+        guardLocal(current);
+        const remaining = await step(current, () => worker.pushManager.getSubscription(), { local: true });
+        guardLocal(current);
+        insist(!remaining, "PUSH_UNSUBSCRIBE", "浏览器仍保留订阅，请在系统设置中关闭通知。");
+      }
+    }
+
+    async function disableLocal() {
+      invalidate();
+      const owner = getIdentity();
+      const current = { identity: owner ? `${owner.serverId}:${owner.userId}` : null, generation,
+        controller: new environment.AbortController(), enrollmentId: null };
+      operation = current;
+      try {
+        await unsubscribeLocal(current);
+        return { unsubscribed: true, serverRevocationConfirmed: false };
+      } finally { finish(current); }
+    }
+
+    async function disable() {
+      invalidate();
+      const current = begin();
+      let serverError = null;
+      try {
+        try {
+          const result = await call(current, "/api/push/devices");
+          insist(Array.isArray(result?.devices), "PUSH_ADAPTER", "主机返回的设备列表无效。");
+          for (const device of result.devices.filter(device => device.installationId === installationId() &&
+            device.channel === "webpush" && device.status === "active")) {
+            insist(UUID.test(device.id), "PUSH_ADAPTER", "主机返回的设备标识无效。");
+            await call(current, `/api/push/devices/${device.id}`, "DELETE");
+          }
+        } catch (error) { serverError = error; }
+        await unsubscribeLocal(current);
+        if (serverError) throw serverError;
+        return { revoked: true, unsubscribed: true };
+      } finally { finish(current); }
+    }
+
+    function dispose() {
+      invalidate();
+      environment.navigator.serviceWorker?.removeEventListener("message", handleMessage);
+    }
+    environment.navigator.serviceWorker?.addEventListener("message", handleMessage);
+    return { enable, disable, disableLocal, installationId, invalidate, dispose, handleMessage, features: () => features(environment) };
+  }
+
+  return { protocolVersion: 1, OPEN_PATH, features, validatePayload, notificationFor, postReceipt, createClient };
+});

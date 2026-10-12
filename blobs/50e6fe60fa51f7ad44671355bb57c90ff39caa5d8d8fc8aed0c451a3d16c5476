@@ -1,0 +1,322 @@
+using System;
+using System.Collections.Generic;
+using System.Diagnostics;
+using System.IO;
+using System.Linq;
+using System.Net;
+using System.Net.Security;
+using System.Security.Cryptography;
+using System.Security.Cryptography.X509Certificates;
+
+namespace RentLan
+{
+    internal interface ITrustStore
+    {
+        bool Contains(byte[] certificate);
+        bool AddIfAbsent(byte[] certificate);
+        void RemoveExact(byte[] certificate);
+    }
+    internal sealed class CurrentUserTrustStore : ITrustStore
+    {
+        private readonly Action<Action> confirm;
+        internal CurrentUserTrustStore(Action<Action> confirm)
+        {
+            if (confirm == null) throw new ArgumentNullException("confirm");
+            this.confirm = confirm;
+        }
+        private static bool Contains(X509Store store, byte[] certificate)
+        {
+            bool found = false;
+            foreach (X509Certificate2 item in store.Certificates)
+            {
+                try { if (Product.Equal(item.RawData, certificate)) found = true; }
+                finally { item.Dispose(); }
+            }
+            return found;
+        }
+        public bool Contains(byte[] certificate)
+        {
+            using (var store = new X509Store(StoreName.Root, StoreLocation.CurrentUser))
+            {
+                store.Open(OpenFlags.ReadOnly | OpenFlags.OpenExistingOnly);
+                return Contains(store, certificate);
+            }
+        }
+        public bool AddIfAbsent(byte[] certificate)
+        {
+            bool added = false;
+            confirm(() => {
+                using (var store = new X509Store(StoreName.Root, StoreLocation.CurrentUser))
+                using (var ca = new X509Certificate2(certificate))
+                {
+                    store.Open(OpenFlags.ReadWrite | OpenFlags.OpenExistingOnly);
+                    if (Contains(store, certificate)) return;
+                    store.Add(ca);
+                    if (!Contains(store, certificate)) throw new IOException("未获 Windows 确认。请在“安全警告”中选择“是”后重试。");
+                    added = true;
+                }
+            });
+            return added;
+        }
+        public void RemoveExact(byte[] certificate)
+        {
+            confirm(() => {
+                using (var store = new X509Store(StoreName.Root, StoreLocation.CurrentUser))
+                {
+                    store.Open(OpenFlags.ReadWrite | OpenFlags.OpenExistingOnly);
+                    foreach (X509Certificate2 item in store.Certificates)
+                    {
+                        try
+                        {
+                            if (!Product.Equal(item.RawData, certificate)) continue;
+                            if (item.HasPrivateKey) throw new IOException("同证书包含其他安装关联的私钥，未移除。请管理员核对。");
+                            store.Remove(item);
+                        }
+                        finally { item.Dispose(); }
+                    }
+                    if (Contains(store, certificate)) throw new IOException("当前用户仍可见该根证书，可能由策略或管理员管理；未声称撤销成功。");
+                }
+            });
+        }
+    }
+
+    internal sealed class TrustReceipt
+    {
+        public string ownerSid;
+        public string caSha256;
+        public string state = "none";
+        internal void Validate(Connection connection, string sid)
+        {
+            if (ownerSid != sid || caSha256 != connection.caSha256 ||
+                !new[] { "none", "planned", "added", "preexisting", "uncertain", "removed" }.Contains(state))
+                throw new IOException("证书归属记录不属于当前用户或此接入证书，不能接管或删除。");
+        }
+    }
+    internal static class Trust
+    {
+        internal static string Add(ITrustStore store, Connection connection, TrustReceipt receipt, string sid, bool consent, Action save)
+        {
+            if (!consent) throw new IOException("必须明确同意向当前 Windows 用户的受信任根证书库添加证书。");
+            connection.Validate(false); receipt.Validate(connection, sid);
+            bool present = store.Contains(connection.CaBytes);
+            if (present)
+            {
+                if (receipt.state != "added")
+                {
+                    receipt.state = receipt.state == "planned" ? "uncertain" : receipt.state == "uncertain" ? "uncertain" : "preexisting";
+                    save();
+                }
+                return receipt.state == "added" ? "接入证书已受信任。" :
+                    "此证书的新增归属未确认，撤销时将保留。";
+            }
+            receipt.state = "planned"; save();
+            bool added;
+            try { added = store.AddIfAbsent(connection.CaBytes); }
+            catch (Exception error)
+            {
+                throw new IOException("添加证书未能确认，请保留现有证书并重试核验：" + error.Message, error);
+            }
+            if (!store.Contains(connection.CaBytes)) throw new IOException("未能读回精确证书；保留待核对记录，不认为信任已完成。");
+            receipt.state = added ? "added" : "preexisting";
+            try { save(); }
+            catch (Exception error)
+            {
+                receipt.state = "uncertain";
+                throw new IOException("证书信任已配置，但归属记录未能保存，不能安全自动撤销。请保留接入文件与错误，按 SHA-256 核对 Windows 证书：" + error.Message, error);
+            }
+            return added ? "已向当前 Windows 用户添加精确 CA；尚未验证主机连接或业务登录。" : "证书在添加前已存在，保留原归属。";
+        }
+        internal static string Remove(ITrustStore store, Connection connection, TrustReceipt receipt, string sid, Action save)
+        {
+            connection.Validate(true); receipt.Validate(connection, sid);
+            if (receipt.state != "added")
+                return receipt.state == "removed" ? "本工具新增的证书已撤销。" : "未删除预先存在、管理员安装或无法证明归属的证书。";
+            store.RemoveExact(connection.CaBytes);
+            if (store.Contains(connection.CaBytes)) throw new IOException("证书仍被 Windows 信任，不能声称已移除。");
+            receipt.state = "removed"; save();
+            return "已撤销本工具为当前用户新增的精确 CA；未改动其他用户或管理员证书。";
+        }
+    }
+
+    internal interface IBootstrapProbe { void Check(Connection connection); }
+    internal static class CertificatePin
+    {
+        internal static bool Accept(Connection connection, X509Certificate certificate, X509Chain chain, SslPolicyErrors errors)
+        {
+            if (errors != SslPolicyErrors.None || certificate == null || chain == null || chain.ChainElements.Count < 2) return false;
+            if (chain.ChainStatus.Any(status => status.Status != X509ChainStatusFlags.NoError)) return false;
+            if (!Product.Equal(chain.ChainElements[chain.ChainElements.Count - 1].Certificate.RawData, connection.CaBytes)) return false;
+            try
+            {
+                connection.RequireCurrent();
+                using (var leaf = new X509Certificate2(certificate))
+                using (var root = new X509Certificate2(connection.CaBytes))
+                using (var rsa = root.GetRSAPublicKey())
+                {
+                    int port;
+                    byte[] san = Der.Tag(0x30, Der.Tag(0x87, Network.PrivateV4(Network.AddressOf(connection.origin, out port))));
+                    var actualSan = leaf.Extensions.Cast<X509Extension>().Where(extension => extension.Oid.Value == "2.5.29.17").ToArray();
+                    return rsa != null && actualSan.Length == 1 && Product.Equal(san, actualSan[0].RawData) &&
+                        leaf.NotAfter.ToUniversalTime() == Connection.Time(connection.expiresAt).UtcDateTime &&
+                        Der.VerifyCertificate(leaf.RawData, rsa);
+                }
+            }
+            catch (CryptographicException) { return false; }
+            catch (IOException) { return false; }
+        }
+    }
+    internal sealed class PinnedBootstrapProbe : IBootstrapProbe
+    {
+        internal static void ValidateResponse(Connection connection, int status, string contentType, string body)
+        {
+            if (status != 200 || contentType == null ||
+                !contentType.Split(';')[0].Trim().Equals("application/json", StringComparison.OrdinalIgnoreCase))
+                throw new IOException("主机没有返回正常的 JSON 接入状态；不接受重定向、网页登录跳转或其他服务。");
+            var value = Json.Object(body);
+            if (Json.String(value, "serverId") != connection.serverId) throw new IOException("接入包与主机账套不符，请联系负责人重新获取接入文件。");
+            if (!Json.Boolean(value, "initialized")) throw new IOException("此主机尚未完成本机管理员初始化；员工端不能创建或重置账号。");
+        }
+        internal static HttpWebRequest Request(Connection connection)
+        {
+            connection.Validate(false);
+            // Process-local protocol floor only; certificate validation remains the normal Windows
+            // validator plus the request-specific rejecting pin, never a global validation override.
+            ServicePointManager.SecurityProtocol = SecurityProtocolType.Tls12;
+            var request = (HttpWebRequest)WebRequest.Create(connection.origin + "/api/bootstrap");
+            request.Method = "GET"; request.AllowAutoRedirect = false; request.CookieContainer = null;
+            request.UseDefaultCredentials = false; request.Credentials = null; request.PreAuthenticate = false;
+            request.Proxy = null; request.Timeout = 12000; request.ReadWriteTimeout = 8000;
+            request.KeepAlive = false; request.ConnectionGroupName = "RentLan-" + Guid.NewGuid().ToString("N");
+            request.Accept = "application/json"; request.UserAgent = "IndustrialRent-LAN/1";
+            request.ServerCertificateValidationCallback = (sender, certificate, chain, errors) => CertificatePin.Accept(connection, certificate, chain, errors);
+            return request;
+        }
+        public void Check(Connection connection)
+        {
+            var request = Request(connection);
+            using (var deadline = new System.Threading.Timer(ignored => request.Abort(), null, 15000, System.Threading.Timeout.Infinite))
+            try
+            {
+                using (var response = (HttpWebResponse)request.GetResponse())
+                {
+                    if (response.ContentLength > 32768) throw new IOException("主机接入响应超过 32 KiB，已拒绝。");
+                    using (var source = response.GetResponseStream())
+                    using (var bytes = new MemoryStream())
+                    {
+                        var buffer = new byte[4096]; int count;
+                        while ((count = source.Read(buffer, 0, buffer.Length)) != 0)
+                        {
+                            if (bytes.Length + count > 32768) throw new IOException("主机接入响应超过 32 KiB，已中止。");
+                            bytes.Write(buffer, 0, count);
+                        }
+                        ValidateResponse(connection, (int)response.StatusCode, response.ContentType, Product.Utf8.GetString(bytes.ToArray()));
+                    }
+                }
+            }
+            catch (WebException error)
+            {
+                if (error.Response != null) error.Response.Dispose();
+                throw new IOException("尚未连接主机（" + error.Status + "）。证书信任与联网是两回事：请先让负责人关闭向导、恢复主机，核对同一局域网、防火墙、固定 IP 和证书有效期。不能忽略 HTTPS 错误。", error);
+            }
+            finally { request.Abort(); }
+        }
+    }
+
+    internal sealed class ClientState
+    {
+        public string format = "industrial-rent-lan-client-state";
+        public int formatVersion = 1;
+        public string serverId, origin, caSha256, ownerSid;
+        public TrustReceipt trust;
+        public string shortcutPath, shortcutSha256;
+        public bool shortcutOwned;
+        public string connectionStatus = "not-checked";
+        internal static ClientState New(Connection connection)
+        {
+            return new ClientState { serverId = connection.serverId, origin = connection.origin, caSha256 = connection.caSha256,
+                ownerSid = Product.Sid, trust = new TrustReceipt { ownerSid = Product.Sid, caSha256 = connection.caSha256 } };
+        }
+        internal void Validate(Connection connection)
+        {
+            if (format != "industrial-rent-lan-client-state" || formatVersion != 1 || ownerSid != Product.Sid ||
+                serverId != connection.serverId || caSha256 != connection.caSha256 || origin != connection.origin || trust == null)
+                throw new IOException("员工接入记录的用户、账套、来源或证书身份不符，请联系维护人员核对。");
+            trust.Validate(connection, Product.Sid);
+            if (shortcutPath != null) Paths.Absolute(shortcutPath, false);
+            if (shortcutSha256 != null) Product.Sha256(shortcutSha256);
+            if (shortcutOwned && (shortcutPath == null || shortcutSha256 == null)) throw new IOException("快捷方式归属记录不完整。");
+        }
+    }
+    internal static class ClientRecords
+    {
+        internal static string DirectoryFor(Connection connection)
+        {
+            string local = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData, Environment.SpecialFolderOption.DoNotVerify);
+            Paths.Absolute(local, false);
+            return Path.Combine(local, "IndustrialRentLan-" + connection.serverId + "-" + connection.caSha256.Substring(0, 12));
+        }
+        internal static ClientState Load(RecordFile file, Connection connection)
+        {
+            string text = file.Read();
+            var state = text == null ? ClientState.New(connection) : Json.Decode<ClientState>(text);
+            state.Validate(connection);
+            return state;
+        }
+    }
+    internal static class ClientEntry
+    {
+        internal static string Name(Connection connection) { return "园区租赁-" + connection.serverId + ".url"; }
+        internal static byte[] Bytes(Connection connection, string sid)
+        {
+            return Product.Utf8.GetBytes("[InternetShortcut]\r\nURL=" + connection.origin + "/\r\n; industrial-rent-lan:" +
+                connection.serverId + ":" + sid + ":" + connection.caSha256 + "\r\n");
+        }
+        internal static string Create(Connection connection, ClientState state, string desktop, bool verifiedThisSession, Action save)
+        {
+            if (!verifiedThisSession) throw new IOException("必须在本次窗口成功验证 HTTPS 和账套身份后才能创建或打开入口。");
+            connection.Validate(false); state.Validate(connection); Paths.Absolute(desktop, false);
+            string path = Path.Combine(desktop, Name(connection));
+            Paths.Absolute(path, false);
+            byte[] bytes = Bytes(connection, Product.Sid);
+            using (var pins = new DirectoryPins(desktop))
+            {
+                if (NativeFiles.Exists(path))
+                {
+                    if (!state.shortcutOwned || state.shortcutPath != path || state.shortcutSha256 != Product.Hash(bytes) ||
+                        !Product.Equal(Paths.Read(path, 4096), bytes))
+                        throw new IOException("桌面已有同名入口，但不能证明是本接入包创建的精确内容。未覆盖；可用“仅打开浏览器”。");
+                    return path;
+                }
+                state.shortcutPath = path; state.shortcutSha256 = Product.Hash(bytes); state.shortcutOwned = false; save();
+                Paths.WriteNew(path, bytes);
+                state.shortcutOwned = true;
+                try { save(); }
+                catch (Exception error)
+                {
+                    state.shortcutOwned = false;
+                    throw new IOException("入口已创建，但归属记录未保存，请联系维护人员核对：" + error.Message, error);
+                }
+                return path;
+            }
+        }
+        internal static string Remove(Connection connection, ClientState state, string desktop, Action save)
+        {
+            state.Validate(connection); Paths.Absolute(desktop, false);
+            string expected = Path.Combine(desktop, Name(connection));
+            if (!state.shortcutOwned) return "没有可证明归属的桌面入口，未删除其他快捷方式。";
+            byte[] bytes = Bytes(connection, Product.Sid);
+            if (state.shortcutPath != expected || state.shortcutSha256 != Product.Hash(bytes))
+                throw new IOException("入口归属路径或目标与预期不符，未删除。");
+            using (var pins = new DirectoryPins(desktop))
+                if (NativeFiles.Exists(expected)) Paths.DeleteExact(expected, bytes);
+            state.shortcutOwned = false; save();
+            return "已移除本接入包创建的精确桌面入口。";
+        }
+        internal static void Open(Connection connection, bool verifiedThisSession)
+        {
+            if (!verifiedThisSession) throw new IOException("请先成功验证主机连接。");
+            connection.Validate(false);
+            Process.Start(new ProcessStartInfo(connection.origin + "/") { UseShellExecute = true });
+        }
+    }
+}

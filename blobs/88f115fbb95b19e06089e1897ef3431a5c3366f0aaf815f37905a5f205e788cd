@@ -1,0 +1,102 @@
+(function (root, factory) {
+  "use strict";
+  if (typeof module === "object" && module.exports) module.exports = factory(require("./ui.js"));
+  else root.RentInvitationPanel = factory(root.RentUI);
+})(globalThis, function (UI) {
+  "use strict";
+  const { html, note, button, field, passwordField } = UI;
+  const roleNames = { operator: "业务经办", reviewer: "财务复核", viewer: "业务查看" };
+  const statusNames = { pending: "等待同事开通", accepted: "账号已开通", revoked: "已撤销", expired: "已过期", unavailable: "暂不可用" };
+  const date = value => value ? new Date(value).toLocaleString("zh-CN") : "";
+  const leave = () => button("返回登录", "invitation-login");
+
+  function join(state, message = "") {
+    let body;
+    if (state.signedIn) {
+      body = `${note("已有登录账号。请先在原窗口保存工作并退出，再回来检查。", "warning")}
+        <div class="button-row">${button("退出后重新检查", "invitation-inspect")}${leave()}</div>
+        <details class="top-gap"><summary>说明</summary><p class="hint">也可用另一浏览器打开邀请，原账号不必退出。</p></details>`;
+    } else if (state.phase === "accepted") {
+      body = `${note("账号已创建，请登录。")}${leave()}`;
+    } else if (state.phase !== "active") {
+      const explanation = state.phase === "expired" ? state.expiryReason === "invitation" ?
+        "邀请已过期，请向管理员索取新邀请。" : "此页面已超时，请重新打开原邀请。" :
+        state.phase === "unavailable" ? "这份邀请已无法使用。已创建账号的请登录；否则请向管理员索取新邀请。" :
+          "未找到有效邀请，请重新打开管理员发来的邀请。";
+      body = `${note(explanation, "warning")}${leave()}`;
+    } else if (!state.invitation) {
+      body = `<p>${message ? "检查邀请后即可创建账号。" : "正在检查邀请……"}</p>
+        <div class="button-row">${button("重新检查", "invitation-inspect", message ? "" : "disabled")}${leave()}</div>`;
+    } else {
+      body = `<p>设置用户名和密码，随后用它们登录。</p>
+        <p class="hint">岗位：${html(state.invitation.roles.map(role => roleNames[role] || role).join(" / "))}</p>
+        <form id="join-form" class="form-grid" autocomplete="on" novalidate>
+          <div id="join-feedback" class="notice danger full" role="alert" hidden></div>
+          ${field("用户名（可用中文）", "join-username", "", "text", 'required maxlength="80" autocomplete="username"')}
+          ${passwordField("密码（10 至 128 位）", "join-password", 'required minlength="10" maxlength="128" autocomplete="new-password"')}
+          ${passwordField("确认密码", "join-confirm-password", 'required minlength="10" maxlength="128" autocomplete="new-password"')}
+          <p id="caps-lock-hint" class="hint full" hidden>大写锁定已开启，请留意密码中的大小写。</p>
+          <button type="submit" class="button primary">创建我的账号</button>
+        </form><div class="top-gap">${leave()}</div>
+        <details class="top-gap"><summary>说明</summary>
+          <p class="hint">用户名也会显示为你的称呼。一份邀请只能创建一个账号，有效至 ${html(date(state.invitation.expiresAt))}。</p>
+          <p class="hint">工作范围：${state.invitation.allParks ? "全部园区" : html(state.invitation.parks.join("、"))}。</p>
+          <p class="hint">打开邀请后请在 15 分钟内提交；刷新或离开页面后，请重新打开原邀请。</p>
+          <p class="hint">${state.invitation.canExport ? "可导出报表" : "不可导出报表"} · ${state.invitation.receiveReminders ? "接收到期及月度提醒" : "不接收到期及月度提醒"}</p>
+          ${button("重新检查邀请", "invitation-inspect")}
+        </details>`;
+    }
+    return `<div class="card auth-card"><div class="eyebrow">园区租赁 · 个人邀请</div><h1>创建工作账号</h1>
+      ${message ? note(message, "warning") : ""}${body}</div>`;
+  }
+
+  function renderAdmin(state, hasHeld = () => false, feedback = {}, message = "") {
+    if (!state) return "<h3>邀请同事</h3><p class='hint'>正在读取邀请……</p>";
+    const { invitations = [], delivery = {}, historyLimited } = state;
+    return `<div class="card-header"><div><h3>邀请同事</h3>
+      <p>选择岗位，生成邀请，再发给这位同事。</p></div>
+      ${button("新建邀请", "invitation-create", delivery.linkAvailable ? "" : "disabled", "primary")}</div>
+      ${message ? `<div id="invitation-admin-feedback" class="notice warning" role="alert">${html(message)}</div>` : ""}
+      ${delivery.reason && !delivery.linkAvailable ? note(delivery.reason, "warning") : ""}
+      <p class="hint">每人单独一份，请勿发到群里。</p>
+      ${invitations.length ? invitations.map(item => {
+        const active = item.status === "pending", retained = active && hasHeld(item.id);
+        return `<div class="list-row" data-invitation-id="${html(item.id)}"><div>
+          <strong>${html(item.roles.map(role => roleNames[role] || role).join(" / "))}</strong>
+          <small>${html(statusNames[item.status] || "状态待核对")} · 有效至 ${html(date(item.expiresAt))}</small>
+          ${active && feedback[item.id] ? `<small data-invitation-feedback role="status">${html(feedback[item.id])}</small>` : ""}
+          ${active && !retained ? `<small>本页已不能${delivery.packageAvailable ? "下载或复制" : "复制"}。需要新邀请时，请先撤销再新建。</small>` : ""}
+          <details><summary>邀请详情</summary><small>创建：${html(date(item.createdAt))} · 编号：${html(item.id.slice(0, 8))}</small>
+            <small>工作范围：${item.allParks ? "全部园区" : html(item.parks.join("、"))}</small>
+            <small>${item.canExport ? "可导出报表" : "不可导出报表"} · ${item.receiveReminders ? "接收提醒" : "不接收提醒"}</small></details>
+          </div><div class="button-row">
+            ${retained && delivery.packageAvailable ? button("下载安装包", "invitation-download", `data-id="${html(item.id)}"`, "small") : ""}
+            ${retained && delivery.linkAvailable ? button("复制邀请链接",
+              "invitation-copy", `data-id="${html(item.id)}"`, "small") : ""}
+            ${["pending", "expired", "unavailable"].includes(item.status) ? button("撤销邀请", "invitation-revoke", `data-id="${html(item.id)}"`, "small") : ""}
+          </div></div>`;
+      }).join("") : "<p class='hint'>还没有邀请，点击“新建邀请”开始。</p>"}
+      ${historyLimited ? "<p class='hint'>显示全部未过期邀请及最近的历史记录。</p>" : ""}
+      <div class="button-row top-gap">${button("刷新状态", "invitation-refresh")}</div>
+      <details class="top-gap"><summary>说明</summary>
+        <p class="hint">邀请 24 小时有效，只能创建一个账号；同事自行设置用户名和密码。</p>
+        <p class="hint">本页可下载或复制 15 分钟；刷新、退出或超时后，需要新文件或链接时，请先撤销再新建。已保存的安装包仍以邀请有效期为准。</p>
+        ${delivery.reason && delivery.linkAvailable ? `<p class="hint">${html(delivery.reason)}</p>` : ""}
+      </details>`;
+  }
+
+  function issueForm() {
+    return `<form id="invitation-form">
+      <div id="invitation-feedback" class="notice danger" role="alert" hidden></div>
+      <fieldset><legend>选择岗位</legend><div class="selection-grid">
+        ${Object.entries(roleNames).map(([role, name]) => `<label><input name="roles" type="checkbox" value="${role}" ${role === "viewer" ? "checked" : ""}>${name}</label>`).join("")}
+      </div><p class="hint">默认只查看，需要经办或复核再勾选。</p></fieldset>
+      <div class="selection-grid"><label><input name="canExport" type="checkbox">允许导出报表</label>
+        <label><input name="receiveReminders" type="checkbox">接收到期及月度提醒</label></div>
+      <p class="hint">按岗位处理全部园区。同事自行设置用户名和密码。</p>
+      <details><summary>说明</summary><p class="hint">岗位可以组合，但不能审核自己的申请。此处不能邀请系统管理员。</p></details>
+    </form>`;
+  }
+
+  return Object.freeze({ join, renderAdmin, issueForm });
+});

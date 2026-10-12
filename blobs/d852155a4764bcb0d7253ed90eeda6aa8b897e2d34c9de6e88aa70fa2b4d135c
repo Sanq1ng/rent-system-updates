@@ -1,0 +1,144 @@
+(function (root, factory) {
+  "use strict";
+  if (typeof module === "object" && module.exports) module.exports = factory();
+  else root.RentMobile = factory();
+})(globalThis, function () {
+  "use strict";
+
+  function platform({ userAgent = "", platform = "", maxTouchPoints = 0, standalone = false } = {}) {
+    const ios = /iPad|iPhone|iPod/.test(userAgent) || (platform === "MacIntel" && maxTouchPoints > 1);
+    return { ios, android: /Android/i.test(userAgent),
+      nativeAndroid: /Rent(?:Native|Android)\//.test(userAgent), standalone: Boolean(standalone) };
+  }
+
+  function installHelp(info, available = false) {
+    if (info.nativeAndroid) return {
+      title: "已安装安卓客户端",
+      text: "后台提醒请在客户端的通知设置中启用，并确认主机和推送通道已就绪。",
+    };
+    if (info.standalone) return {
+      title: "已从桌面打开",
+      text: "有新版时，请按页面提示保存后刷新。",
+    };
+    if (info.ios) return {
+      title: "在 iPhone 上添加到主屏幕",
+      text: "在 Safari 中打开这个网址，点“分享”→“添加到主屏幕”，再从桌面图标进入。后台通知需要 iOS / iPadOS 16.4 或更新系统、主动授权及主机完成推送配置。",
+    };
+    if (available) return {
+      title: "添加园区租赁到桌面",
+      text: "点击下方“安装到桌面”，在浏览器弹窗中确认。安装只是增加入口，不代表已经启用后台通知。",
+    };
+    return {
+      title: info.android ? "在安卓手机上添加入口" : "添加常用入口",
+      text: "可在浏览器菜单中查找“安装应用”或“添加到主屏幕”。若浏览器没有此功能，仍可收藏网址直接使用。网页版与安卓安装包共用主机账本，本机尚未同步的草稿不会自动跨设备搬迁。",
+    };
+  }
+
+  function createController({ window: win, document: doc }) {
+    const sidebar = doc.getElementById("main-navigation");
+    const toggle = doc.getElementById("mobile-menu-button");
+    const backdrop = doc.getElementById("mobile-menu-backdrop");
+    const help = doc.getElementById("install-help");
+    const install = doc.getElementById("install-app-button");
+    const narrow = win.matchMedia("(max-width: 800px)");
+    let opened = false, paused = false, prompt = null, installing = false, returnFocus = null;
+
+    function environment() {
+      return platform({ userAgent: win.navigator.userAgent, platform: win.navigator.platform,
+        maxTouchPoints: win.navigator.maxTouchPoints,
+        standalone: win.navigator.standalone || win.matchMedia("(display-mode: standalone)").matches });
+    }
+    function setOpen(value, restore = true) {
+      opened = Boolean(value && narrow.matches && !paused);
+      doc.body.classList.toggle("mobile-menu-open", opened);
+      toggle.setAttribute("aria-expanded", String(opened));
+      backdrop.hidden = !opened;
+      sidebar.inert = paused || (narrow.matches && !opened);
+      if (opened) sidebar.querySelector("button, a")?.focus();
+      else if (restore && narrow.matches && doc.activeElement && sidebar.contains(doc.activeElement)) toggle.focus();
+    }
+    function refreshHelp() {
+      const content = installHelp(environment(), Boolean(prompt));
+      doc.getElementById("install-help-title").textContent = content.title;
+      doc.getElementById("install-help-text").textContent = content.text;
+      install.hidden = !prompt || environment().standalone || environment().nativeAndroid;
+      install.disabled = paused || installing;
+    }
+    function showHelp() {
+      if (paused) return;
+      setOpen(false, false);
+      returnFocus = doc.activeElement;
+      refreshHelp();
+      if (!help.open) help.showModal();
+    }
+    function click(event) {
+      const control = event.target.closest("[data-mobile-action]");
+      if (!control) {
+        if (opened && event.target.closest("#main-navigation [data-action]")) setOpen(false, false);
+        return;
+      }
+      if (paused || control.disabled) return;
+      switch (control.dataset.mobileAction) {
+        case "menu": setOpen(!opened); break;
+        case "close-menu": setOpen(false); break;
+        case "install-help": showHelp(); break;
+        case "close-help": help.close(); break;
+        case "install":
+          if (!prompt || installing) return;
+          installing = true;
+          install.disabled = true;
+          const current = prompt;
+          prompt = null;
+          current.prompt().then(() => current.userChoice).then(choice => {
+            doc.getElementById("install-help-text").textContent = choice.outcome === "accepted"
+              ? "已确认安装。若浏览器完成安装，可从桌面图标进入；通知仍须单独启用。"
+              : "这次没有安装，网页和已保存草稿不受影响。也可通过浏览器菜单添加入口。";
+          }).catch(error => {
+            doc.getElementById("install-help-text").textContent = `未能打开安装窗口：${error.message}。可使用浏览器菜单添加入口。`;
+          }).finally(() => { installing = false; install.hidden = true; });
+          break;
+      }
+    }
+    doc.addEventListener("click", click, true);
+    doc.addEventListener("keydown", event => {
+      if (!opened) return;
+      if (event.key === "Escape") { event.preventDefault(); setOpen(false); return; }
+      if (event.key !== "Tab") return;
+      const controls = [...sidebar.querySelectorAll("a[href], button:not(:disabled), [tabindex='0']")]
+        .filter(element => element.getClientRects().length && !element.closest("[inert]"));
+      if (!controls.length) return;
+      const first = controls[0], last = controls.at(-1);
+      if (event.shiftKey && (doc.activeElement === first || !sidebar.contains(doc.activeElement))) {
+        event.preventDefault(); last.focus();
+      } else if (!event.shiftKey && doc.activeElement === last) {
+        event.preventDefault(); first.focus();
+      }
+    });
+    help.addEventListener("close", () => {
+      if (returnFocus?.isConnected && !returnFocus.closest("[inert]")) returnFocus.focus();
+      returnFocus = null;
+    });
+    narrow.addEventListener("change", () => setOpen(false, false));
+    win.addEventListener("beforeinstallprompt", event => {
+      event.preventDefault();
+      prompt = event;
+      if (help.open) refreshHelp();
+    });
+    win.addEventListener("appinstalled", () => { prompt = null; if (help.open) refreshHelp(); });
+    setOpen(false, false);
+    return Object.freeze({
+      close: () => setOpen(false, false),
+      reset: () => { setOpen(false, false); if (help.open) help.close(); },
+      setPaused: value => {
+        paused = Boolean(value);
+        toggle.disabled = paused;
+        if (paused) setOpen(false, false);
+        else sidebar.inert = narrow.matches && !opened;
+        if (help.open) refreshHelp();
+      },
+      isBusy: () => installing || help.open,
+      showHelp,
+    });
+  }
+  return Object.freeze({ platform, installHelp, createController });
+});

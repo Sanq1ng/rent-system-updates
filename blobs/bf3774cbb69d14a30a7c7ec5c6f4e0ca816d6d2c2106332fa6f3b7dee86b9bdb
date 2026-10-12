@@ -1,0 +1,32 @@
+{
+    "format":  "industrial-rent-windows-client",
+    "formatVersion":  1,
+    "protocolVersion":  1,
+    "sources":  {
+                    "ClientWindow.cs":  "1dcac20fc87695c5817982f3bfc090ad3ea1f95c0be7e500135634a943c92921",
+                    "ClientUpdates.cs":  "407c164991dcf2a9141ba686e1e67fe090e76a2495ee04b6399c6ba79d4434b7",
+                    "ClientState.cs":  "5d3f667ba635bee110e1a99bf60eaecbaa37936a6ca46cfdde450b6e22d5a78a",
+                    "Pairing.cs":  "1fc8e7dcd41520dbeef9820dc85c83fd218cbbd7ae9b3092af158464faaae183",
+                    "NoticeService.cs":  "04d4eba1a0f76f4da7730385085a0fb150465b450d17bcbd937b736c985f0eb0",
+                    "WindowsNotices.cs":  "dee49b98575d0eae2105e25bce6d03e61d24d9f791cd9a58993e7f3f883849e5",
+                    "RuntimeSetup.cs":  "eb7065a357bbb12022b1a970cdf07ff459bd28edcf63d5f866f0135274486fc6",
+                    "Program.cs":  "654939736070c371dfa19959221ce48006188c05b4a1dd5460cb393f746a82fc",
+                    "dependencies.json":  "1e740a359f51f96d9afb2daa1819d042c6b88b254b4701f8bae3042db260a97a",
+                    "app.manifest":  "2dd6aab12082b23a26431c961989eeacaa2f88f92cd35a32befdf6935e519c5c",
+                    "Client.exe.config":  "3433960a86a16d195e7ad10e3f92979bbdb0a6689e03498b9bcee2e28688ceef",
+                    "build.ps1":  "e9a37899e01dc259b005fce845d597560247da701ecb70aee98487ba036c15c1",
+                    "artifact.cjs":  "23bb1190c898085468c9bd1b4d3a65d443e7be317c036bac9b1fd0bbc3b41f42",
+                    "..\\lan-windows\\Protocol.cs":  "0c748bd3aed9d8633e1e52ed100debd273c97acc4df0ff0d2880544a00c58098",
+                    "..\\lan-windows\\Safety.cs":  "6ebc64453c6ea58a2ddcefdeff9e51db56b98602d420377220157b809d8977f8",
+                    "..\\lan-windows\\Certificates.cs":  "1fdb454004ad35623864c3b97a6ddaa750e18780163ad1e48b159c7b98db173d",
+                    "..\\lan-windows\\TrustClient.cs":  "50e6fe60fa51f7ad44671355bb57c90ff39caa5d8d8fc8aed0c451a3d16c5476"
+                },
+    "files":  {
+                  "园区租赁.exe":  "4b8ac791803f44de85ff9cdfb85ce8c9e90640108f58a77d136b91048969fb7c",
+                  "园区租赁.exe.config":  "3433960a86a16d195e7ad10e3f92979bbdb0a6689e03498b9bcee2e28688ceef",
+                  "Microsoft.Web.WebView2.Core.dll":  "d60e6e94245078cb56e44ebd5f360dc04bf18e460136be93bfc4cfca43b98505",
+                  "Microsoft.Web.WebView2.WinForms.dll":  "6a9e6856f23c463783c3afb0ca5d78f56324c86657162ccb16d5227b3233b32a",
+                  "WebView2Loader.dll":  "3426dcc55fdfb8b5e7ac623cf33b4ccf283fbf68a0c5a65bddfdb4d749a8abee",
+                  "WEBVIEW2-LICENSE.txt":  "0af8f1b807512aae39c2ac1aa4d0cae65cabecb6fd554b8439a5162a0d6eca55"
+              }
+}
