@@ -1,0 +1,26 @@
+{
+  "name": "industrial-rent-system",
+  "version": "0.4.10",
+  "private": true,
+  "description": "Portable, centrally stored industrial rental ledger",
+  "engines": {
+    "node": ">=24.15.0 <25"
+  },
+  "scripts": {
+    "start": "node host.cjs",
+    "test": "node --test --test-concurrency=2 \"tests/*.test.cjs\"",
+    "test:browser": "node tests/browser-smoke.cjs",
+    "test:mobile": "node tests/mobile-smoke.cjs",
+    "test:desktop": "node tests/desktop-gui-smoke.cjs",
+    "test:portable": "node --test tests/desktop-package.test.cjs",
+    "test:linux": "node --test tests/linux-config.test.cjs tests/linux-package.test.cjs tests/linux-supervisor.test.cjs",
+    "build:push": "node scripts/build-push.cjs",
+    "test:push": "node --test \"tests/push-*.test.cjs\" tests/notification-ui.test.cjs tests/notification-restore.test.cjs tests/runtime-secrets.test.cjs"
+  },
+  "dependencies": {
+    "web-push": "3.6.7"
+  },
+  "devDependencies": {
+    "esbuild": "0.25.9"
+  }
+}

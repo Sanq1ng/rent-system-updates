@@ -1,0 +1,202 @@
+"use strict";
+
+const fs = require("node:fs");
+const fsp = require("node:fs/promises");
+const path = require("node:path");
+const crypto = require("node:crypto");
+const {
+  COMPATIBILITY, MAX_FILES, MAX_FILE_BYTES, MAX_MANIFEST_BYTES,
+  fail, digest, hashFile, regularFile, syncDirectory, ensureDirectory, assertDirectory, writeFile, writeJSON, readJSON,
+  versionParts, payloadPath, validateManifest, decodeBase64,
+} = require("./files.cjs");
+const { ROOT_FILES, BUNDLE_DIRECTORIES, bundlePath } = require("./bundle-layout.cjs");
+
+function stateDirectory(program) { return path.join(program, "update-state"); }
+
+function assertBundledDependencies(directory, dependencies = {}) {
+  if (!dependencies || typeof dependencies !== "object" || Array.isArray(dependencies)) {
+    fail("UPDATE_PACKAGE", "运行依赖声明无效。");
+  }
+  for (const [name, version] of Object.entries(dependencies)) {
+    // This audited bundle is part of the signed business inventory, not an npm install on the host.
+    if (name !== "web-push" || typeof version !== "string" || !/^\d+\.\d+\.\d+$/.test(version)) {
+      fail("UPDATE_PACKAGE", "业务程序需要未随完整业务包提供的运行依赖。");
+    }
+    const vendor = path.join(directory, "server", "vendor");
+    assertDirectory(vendor);
+    regularFile(path.join(vendor, "web-push.cjs"), MAX_FILE_BYTES);
+    const license = readJSON(path.join(vendor, "web-push-licenses.json"));
+    if (license.bundler?.name !== "esbuild" || !Array.isArray(license.packages) ||
+        !license.packages.some(entry => entry.name === name && entry.version === version && entry.notices?.length)) {
+      fail("UPDATE_PACKAGE", "预构建运行依赖缺少匹配的完整版本与许可证记录。");
+    }
+  }
+}
+
+function packageVersion(directory) {
+  const value = readJSON(path.join(directory, "package.json"), 65536);
+  versionParts(value.version);
+  if (value.name !== "industrial-rent-system") {
+    fail("UPDATE_PACKAGE", "业务程序名称不符，或需要未随稳定主机提供的依赖。");
+  }
+  assertBundledDependencies(directory, value.dependencies);
+  return value.version;
+}
+
+function slotDirectory(program, id) {
+  if (!/^[a-f0-9]{64}$/.test(id || "")) fail("UPDATE_STATE", "更新版本目录标识无效。");
+  return path.join(program, "releases", id);
+}
+
+function resolveRelease(program, updateDirectory = program) {
+  const pointer = path.join(stateDirectory(updateDirectory), "active.json");
+  if (!fs.existsSync(pointer)) return { root: program, releaseId: null, version: packageVersion(program) };
+  const active = readJSON(pointer, 1024);
+  if (active.formatVersion !== 1) fail("UPDATE_STATE", "当前程序指针格式不受支持。");
+  const root = slotDirectory(updateDirectory, active.releaseId);
+  assertDirectory(root);
+  return { root, releaseId: active.releaseId, version: packageVersion(root) };
+}
+
+function setActive(program, releaseId) {
+  slotDirectory(program, releaseId);
+  writeJSON(path.join(stateDirectory(program), "active.json"), { formatVersion: 1, releaseId });
+}
+
+async function inventory(directory, bundle = false) {
+  assertDirectory(directory);
+  const files = [];
+  async function visit(relative) {
+    const source = path.join(directory, ...relative.split("/"));
+    const stat = fs.lstatSync(source);
+    if (stat.isSymbolicLink()) fail("UPDATE_PATH", "业务程序不能包含链接。");
+    if (stat.isDirectory()) {
+      for (const name of fs.readdirSync(source).sort()) await visit(`${relative}/${name}`);
+    } else {
+      payloadPath(relative, bundle);
+      regularFile(source, MAX_FILE_BYTES);
+      files.push({ path: relative, bytes: stat.size, sha256: await hashFile(source) });
+      if (files.length > MAX_FILES) fail("UPDATE_SIZE", "业务程序文件数量超过限制。");
+    }
+  }
+  for (const name of ["package.json", "public", "server", "shared"]) await visit(name);
+  if (bundle) {
+    for (const name of ROOT_FILES) if (fs.existsSync(path.join(directory, name))) await visit(name);
+    for (const name of BUNDLE_DIRECTORIES) {
+      assertDirectory(path.join(directory, name));
+      for (const entry of fs.readdirSync(path.join(directory, name)).sort()) {
+        const relative = `${name}/${entry}`;
+        if (relative === "deployment/installation-required.json") continue;
+        if (bundlePath(relative)) await visit(relative);
+        else fail("UPDATE_PATH", `整程序目录含未允许的内容：${relative}。请从无数据交付程序目录发布。`);
+      }
+    }
+  }
+  return files.sort((a, b) => a.path.localeCompare(b.path, "en"));
+}
+
+function makeManifest(version, sequence, files, compatibility = COMPATIBILITY, bundle = false, migrateFrom = [compatibility.schema]) {
+  return validateManifest({
+    format: "industrial-rent-update", formatVersion: 1, application: "industrial-rent-system",
+    version, sequence, compatibility: { ...compatibility }, files,
+    ...(bundle ? { packageKind: "windows-program", migrateFrom } : {}),
+  }, sequence === 0, compatibility);
+}
+
+async function verifySlot(program, releaseId) {
+  const root = slotDirectory(program, releaseId);
+  assertDirectory(root);
+  const seal = readJSON(path.join(root, "release.json"), MAX_MANIFEST_BYTES * 2);
+  if (seal.format !== "industrial-rent-release" || seal.formatVersion !== 1) fail("UPDATE_STATE", "程序版本封存记录无效。");
+  const bytes = decodeBase64(seal.payload, MAX_MANIFEST_BYTES);
+  if (digest(bytes) !== releaseId) fail("UPDATE_HASH", "程序版本封存记录与目录不符。");
+  let manifest;
+  try { manifest = JSON.parse(bytes.toString("utf8")); }
+  catch { fail("UPDATE_MANIFEST", "程序版本清单损坏。"); }
+  validateManifest(manifest, true);
+  if (packageVersion(root) !== manifest.version) fail("UPDATE_VERSION", "版本文件与发布清单不一致。");
+  const bundle = manifest.packageKind === "windows-program";
+  const actual = await inventory(root, bundle);
+  const expected = [...manifest.files].sort((a, b) => a.path.localeCompare(b.path, "en"));
+  if (JSON.stringify(actual) !== JSON.stringify(expected)) fail("UPDATE_HASH", "业务程序文件不完整或校验值已变化。");
+  const top = fs.readdirSync(root).sort();
+  const expectedTop = [...new Set([...manifest.files.map(file => file.path.split("/")[0]), "release.json"])].sort();
+  if (JSON.stringify(top) !== JSON.stringify(expectedTop)) {
+    fail("UPDATE_PATH", "业务版本目录含有清单之外的文件。");
+  }
+  return { root, manifest, releaseId };
+}
+
+async function finishSlot(program, temporary, bytes) {
+  const releaseId = digest(bytes);
+  const destination = slotDirectory(program, releaseId);
+  writeJSON(path.join(temporary, "release.json"), {
+    format: "industrial-rent-release", formatVersion: 1, payload: bytes.toString("base64"),
+  });
+  fs.renameSync(temporary, destination);
+  syncDirectory(path.dirname(destination));
+  return verifySlot(program, releaseId);
+}
+
+async function snapshotRelease(program, source, bundle = false) {
+  const manifest = makeManifest(packageVersion(source), 0, await inventory(source, bundle), COMPATIBILITY, bundle);
+  const bytes = Buffer.from(JSON.stringify(manifest), "utf8");
+  const releaseId = digest(bytes);
+  if (fs.existsSync(slotDirectory(program, releaseId))) return verifySlot(program, releaseId);
+  const temporary = path.join(program, "releases", `incomplete-${crypto.randomUUID()}`);
+  ensureDirectory(temporary);
+  for (const file of manifest.files) {
+    const relative = payloadPath(file.path, bundle);
+    const destination = path.join(temporary, ...relative);
+    ensureDirectory(path.dirname(destination));
+    await fsp.copyFile(path.join(source, ...relative), destination, fs.constants.COPYFILE_EXCL);
+    const handle = fs.openSync(destination, "r+");
+    try { fs.fsyncSync(handle); } finally { fs.closeSync(handle); }
+    syncDirectory(path.dirname(destination));
+  }
+  return finishSlot(program, temporary, bytes);
+}
+
+async function stageRelease(program, verified, feedUrl, download, signal, localProgram = null) {
+  const existing = slotDirectory(program, verified.releaseId);
+  if (fs.existsSync(existing)) return verifySlot(program, verified.releaseId);
+  const temporary = path.join(program, "releases", `incomplete-${verified.releaseId}`);
+  ensureDirectory(temporary);
+  const disk = fs.statfsSync(temporary, { bigint: true });
+  const total = verified.manifest.files.reduce((sum, file) => sum + file.bytes, 0);
+  if (disk.bavail * disk.bsize < BigInt(total + 16 * 1024 * 1024)) fail("UPDATE_SPACE", "程序磁盘空间不足，未开始安装。");
+  for (const file of verified.manifest.files) {
+    signal.throwIfAborted();
+    const parts = payloadPath(file.path, verified.manifest.packageKind === "windows-program");
+    const destination = path.join(temporary, ...parts);
+    if (fs.existsSync(destination)) {
+      const stat = regularFile(destination);
+      if (stat.size === file.bytes && await hashFile(destination) === file.sha256) continue;
+      fs.unlinkSync(destination);
+    }
+    const local = localProgram && path.join(localProgram, ...parts);
+    if (local && fs.existsSync(local) && regularFile(local).size === file.bytes && await hashFile(local) === file.sha256) {
+      const target = path.join(temporary, ...parts);
+      ensureDirectory(path.dirname(target));
+      await fsp.copyFile(local, target, fs.constants.COPYFILE_EXCL);
+      if (await hashFile(target) !== file.sha256) fail("UPDATE_HASH", "复用本机程序时文件发生变化。");
+      const handle = fs.openSync(target, "r+");
+      try { fs.fsyncSync(handle); } finally { fs.closeSync(handle); }
+      continue;
+    }
+    const url = new URL(`blobs/${file.sha256}`, feedUrl).href;
+    const bytes = await download(url, { maxBytes: file.bytes, signal, expectedSha256: file.sha256,
+      resumeDirectory: path.join(program, "downloads") });
+    if (!Buffer.isBuffer(bytes) || bytes.length !== file.bytes || digest(bytes) !== file.sha256) {
+      fail("UPDATE_HASH", "更新文件长度或 SHA-256 校验失败。");
+    }
+    writeFile(path.join(temporary, ...payloadPath(file.path, verified.manifest.packageKind === "windows-program")), bytes);
+  }
+  signal.throwIfAborted();
+  return finishSlot(program, temporary, decodeBase64(verified.envelope.payload, MAX_MANIFEST_BYTES));
+}
+
+module.exports = {
+  stateDirectory, packageVersion, slotDirectory, resolveRelease, setActive,
+  inventory, makeManifest, verifySlot, snapshotRelease, stageRelease,
+};
