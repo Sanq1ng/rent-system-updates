@@ -1,0 +1,57 @@
+"use strict";
+
+const fs = require("node:fs");
+const path = require("node:path");
+const crypto = require("node:crypto");
+
+const EXECUTABLES = ["局域网配置.exe", "员工电脑接入.exe"];
+const SOURCE_FILES = ["Safety.cs", "Protocol.cs", "Certificates.cs", "Firewall.cs", "OfficeNetwork.cs", "TrustClient.cs",
+  "CoreBridge.cs", "HostWorkflow.cs", "Forms.cs", "InvitationPacket.cs", "InvitationForm.cs", "Programs.cs", "app.manifest", "build.ps1", "artifact.cjs", "README.md"];
+const PACKAGE_FILES = [...SOURCE_FILES, ...EXECUTABLES, "build.json"];
+const hash = bytes => crypto.createHash("sha256").update(bytes).digest("hex");
+
+function checkedFile(file, maximum) {
+  const stat = fs.lstatSync(file);
+  if (!stat.isFile() || stat.isSymbolicLink() || stat.nlink !== 1 || stat.size > maximum) throw new Error(`不是受支持的单链接普通文件：${file}`);
+  const bytes = fs.readFileSync(file);
+  if (bytes.length !== stat.size) throw new Error(`核对期间文件长度变化：${file}`);
+  return bytes;
+}
+function sameKeys(value, expected) {
+  return value && typeof value === "object" && !Array.isArray(value) &&
+    JSON.stringify(Object.keys(value).sort()) === JSON.stringify([...expected].sort());
+}
+function verifyLanArtifacts(programDirectory = path.resolve(__dirname, "..")) {
+  const directory = path.join(programDirectory, "lan-windows");
+  try {
+    if (!fs.lstatSync(directory).isDirectory() || fs.lstatSync(directory).isSymbolicLink()) throw new Error("工具目录不是真实文件夹");
+    const build = JSON.parse(checkedFile(path.join(directory, "build.json"), 32768).toString("utf8"));
+    if (build.format !== "industrial-rent-lan-windows" || build.formatVersion !== 1 || build.protocolVersion !== 1 ||
+        build.framework !== "net48" || build.architecture !== "x64" || build.applicationVersion !== "0.4.11" ||
+        !sameKeys(build.sourceSha256, SOURCE_FILES) || !sameKeys(build.executableSha256, EXECUTABLES)) throw new Error("构建记录字段或协议不符");
+    for (const file of SOURCE_FILES)
+      if (hash(checkedFile(path.join(directory, file), 512 * 1024)) !== build.sourceSha256[file]) throw new Error(`源码与构建记录不同：${file}`);
+    const executables = {};
+    for (const file of EXECUTABLES) {
+      const full = path.join(directory, file), bytes = checkedFile(full, 32 * 1024 * 1024);
+      if (hash(bytes) !== build.executableSha256[file]) throw new Error(`工具程序散列不符：${file}`);
+      if (bytes.length < 512) throw new Error(`程序太短：${file}`);
+      const offset = bytes.readUInt32LE(0x3c);
+      if (offset < 64 || offset + 96 > bytes.length || bytes.readUInt16LE(0) !== 0x5a4d ||
+          bytes.readUInt32LE(offset) !== 0x4550 || bytes.readUInt16LE(offset + 4) !== 0x8664 ||
+          bytes.readUInt16LE(offset + 24) !== 0x20b || bytes.readUInt16LE(offset + 24 + 68) !== 2)
+        throw new Error(`不是 Windows x64 无控制台 GUI：${file}`);
+      executables[file] = { executable: full, sha256: build.executableSha256[file] };
+    }
+    return { directory, protocolVersion: 1, executables, executableSha256: build.executableSha256, sourceSha256: build.sourceSha256 };
+  } catch (error) {
+    throw new Error("Windows 局域网工具缺失、损坏或源码改变。请维护人员在开发机运行 " +
+      "powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\\lan-windows\\build.ps1 后重新打包；部署电脑无需编译。\n原因：" + error.message, { cause: error });
+  }
+}
+
+if (require.main === module) {
+  try { console.log(JSON.stringify({ verified: true, ...verifyLanArtifacts() })); }
+  catch (error) { console.error(error.message); process.exitCode = 1; }
+}
+module.exports = { EXECUTABLES, SOURCE_FILES, PACKAGE_FILES, verifyLanArtifacts };

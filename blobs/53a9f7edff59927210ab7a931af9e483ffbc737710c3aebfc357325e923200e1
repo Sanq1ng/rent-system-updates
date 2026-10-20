@@ -1,0 +1,115 @@
+"use strict";
+
+const fs = require("node:fs");
+const path = require("node:path");
+const crypto = require("node:crypto");
+const { assertDirectory, regularFile, digest } = require("../updates/files.cjs");
+
+const MAGIC = Buffer.from("INDUSTRIAL-RENT-INVITE-1\n", "ascii");
+const VERSION = "0.4.11";
+const MAX_PAYLOAD = 65536;
+const MAX_EXECUTABLE = 32 * 1024 * 1024;
+const UUID = /^[a-f0-9]{8}-[a-f0-9]{4}-[1-5][a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/;
+
+function fail(message) {
+  const error = new Error(message);
+  error.code = "INVITATION_PACKAGE";
+  error.status = 409;
+  throw error;
+}
+
+function keys(value, expected) {
+  return value && typeof value === "object" && !Array.isArray(value) &&
+    Object.keys(value).sort().join(",") === [...expected].sort().join(",");
+}
+
+function read(file, maximum) {
+  assertDirectory(path.dirname(file));
+  regularFile(file, maximum);
+  const bytes = fs.readFileSync(file);
+  if (bytes.length > maximum) fail("员工邀请资料过大，未生成安装文件。");
+  return bytes;
+}
+
+function connectionFor(config, serverId) {
+  if (!config.lan || !config.tls || config.lan.serverId !== serverId ||
+      new URL(config.publicOrigin).protocol !== "https:") {
+    fail("请先在主机窗口设置“让同事连接”，再下载员工邀请安装包。");
+  }
+  const directory = path.dirname(config.tls.certFile);
+  let descriptor;
+  try { descriptor = JSON.parse(read(path.join(directory, "connection.rent-lan"), MAX_PAYLOAD).toString("utf8")); }
+  catch (error) {
+    if (!(error instanceof SyntaxError)) throw error;
+    fail("主机连接资料不完整，请由负责人重新打开同事访问向导。");
+  }
+  if (!keys(descriptor, ["format", "formatVersion", "serverId", "origin", "caCertificate", "caSha256", "createdAt", "expiresAt"]) ||
+      descriptor.format !== "industrial-rent-lan-connection" || descriptor.formatVersion !== 1 ||
+      descriptor.serverId !== serverId || descriptor.origin !== config.publicOrigin ||
+      descriptor.caSha256 !== config.lan.caSha256) fail("主机连接资料与当前账套不一致，未发出邀请。");
+  const caBytes = read(path.join(directory, "ca.cer"), MAX_PAYLOAD);
+  const ca = new crypto.X509Certificate(caBytes);
+  const leaf = new crypto.X509Certificate(read(config.tls.certFile, MAX_PAYLOAD));
+  if (descriptor.caCertificate !== caBytes.toString("base64") || digest(caBytes) !== descriptor.caSha256 ||
+      !ca.ca || !ca.verify(ca.publicKey) || leaf.ca || !leaf.verify(ca.publicKey) ||
+      leaf.checkIP(config.lan.address) !== config.lan.address ||
+      Date.parse(descriptor.expiresAt) !== Date.parse(leaf.validTo) ||
+      Date.parse(descriptor.expiresAt) <= Date.now() || Date.parse(ca.validTo) <= Date.now()) {
+    fail("主机的安全连接资料需要更新，暂不能生成员工邀请；请联系维护人员。");
+  }
+  return descriptor;
+}
+
+function invitationOf(value, connection, now = Date.now()) {
+  if (!keys(value, ["id", "token", "expiresAt"]) || typeof value.id !== "string" || !UUID.test(value.id) ||
+      typeof value.token !== "string" || typeof value.expiresAt !== "string" || !/^[A-Za-z0-9_-]{43}$/.test(value.token) ||
+      Buffer.from(value.token, "base64url").length !== 32 ||
+      Buffer.from(value.token, "base64url").toString("base64url") !== value.token) {
+    fail("员工邀请资料不完整，请重新生成邀请。");
+  }
+  const expiry = Date.parse(value.expiresAt);
+  if (!Number.isFinite(expiry) || expiry <= now || expiry > now + 7 * 86400000 ||
+      expiry > Date.parse(connection.expiresAt)) fail("邀请已过期或超出安全连接有效期，请重新生成。");
+  return { id: value.id, token: value.token, expiresAt: new Date(expiry).toISOString() };
+}
+
+function encodePacket(template, connection, invitation) {
+  if (!Buffer.isBuffer(template) || template.length < 512 || template.length > MAX_EXECUTABLE ||
+      template.readUInt16LE(0) !== 0x5a4d) fail("员工安装组件不完整，请联系维护人员更新主机。");
+  const offset = template.readUInt32LE(0x3c);
+  if (offset < 64 || offset + 96 > template.length || template.readUInt32LE(offset) !== 0x4550 ||
+      template.readUInt16LE(offset + 4) !== 0x8664 || template.readUInt16LE(offset + 24) !== 0x20b ||
+      template.readUInt16LE(offset + 24 + 68) !== 2) fail("员工安装组件不是受支持的 Windows 程序。");
+  const payload = Buffer.from(JSON.stringify({
+    format: "industrial-rent-employee-invitation", formatVersion: 1, applicationVersion: VERSION,
+    connection, invitation: invitationOf(invitation, connection),
+  }), "utf8");
+  const footer = Buffer.alloc(MAGIC.length + 4 + 64);
+  MAGIC.copy(footer);
+  footer.writeUInt32LE(payload.length, MAGIC.length);
+  Buffer.from(digest(payload), "hex").copy(footer, MAGIC.length + 4);
+  Buffer.from(digest(template), "hex").copy(footer, MAGIC.length + 36);
+  if (payload.length > MAX_PAYLOAD || template.length + payload.length + footer.length > MAX_EXECUTABLE) {
+    fail("员工邀请文件超过大小限制，未生成。");
+  }
+  return Buffer.concat([template, payload, footer]);
+}
+
+function createInvitationPackageBuilder(config, programDirectory = path.resolve(__dirname, "..")) {
+  if (process.platform !== "win32" || !config.lan || !config.tls) return undefined;
+  return async input => {
+    if (!keys(input, ["serverId", "origin", "invitation"]) ||
+        input.serverId !== config.lan.serverId || input.origin !== config.publicOrigin) {
+      fail("邀请与当前公司主机不一致，未生成员工安装文件。");
+    }
+    const connection = connectionFor(config, input.serverId);
+    const { verifyLanArtifacts } = require(path.join(programDirectory, "lan-windows", "artifact.cjs"));
+    const artifacts = verifyLanArtifacts(programDirectory);
+    const component = artifacts.executables["员工电脑接入.exe"];
+    const template = read(component.executable, MAX_EXECUTABLE);
+    if (digest(template) !== component.sha256) fail("员工安装组件在生成期间发生变化，请重试。");
+    return encodePacket(template, connection, input.invitation);
+  };
+}
+
+module.exports = { MAGIC, VERSION, MAX_PAYLOAD, MAX_EXECUTABLE, connectionFor, invitationOf, encodePacket, createInvitationPackageBuilder };

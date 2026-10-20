@@ -1,0 +1,1098 @@
+using System;
+using System.Collections.Generic;
+using System.Diagnostics;
+using System.Drawing;
+using System.IO;
+using System.Reflection;
+using System.Text;
+using System.Text.RegularExpressions;
+using System.Threading;
+using System.Threading.Tasks;
+using System.Web.Script.Serialization;
+using System.Windows.Forms;
+
+[assembly: AssemblyTitle("园区租赁 · 主机管理")]
+[assembly: AssemblyDescription("园区租赁便携中心的 Windows 图形管理窗口")]
+[assembly: AssemblyProduct("园区租赁")]
+[assembly: AssemblyVersion("0.4.11.0")]
+[assembly: AssemblyFileVersion("0.4.11.0")]
+
+namespace RentCentre.Desktop
+{
+    internal sealed class LaunchOptions
+    {
+        public string ConfigFile;
+        public bool NoBrowser;
+        public bool Minimized;
+        public bool AdvancedSetup;
+        public bool BackgroundClient;
+        public string UpdateJob;
+
+        public static LaunchOptions Parse(string[] args)
+        {
+            var result = new LaunchOptions();
+            for (int i = 0; i < args.Length; i++)
+            {
+                if (args[i] == "--no-browser") result.NoBrowser = true;
+                else if (args[i] == "--minimized") result.Minimized = true;
+                else if (args[i] == "--background-client") result.BackgroundClient = true;
+                else if (args[i] == "--advanced-setup") result.AdvancedSetup = true;
+                else if (args[i] == "--config" && result.ConfigFile == null && i + 1 < args.Length && !args[i + 1].StartsWith("--"))
+                    result.ConfigFile = Path.GetFullPath(args[++i]);
+                else if (args[i] == "--update-job" && result.UpdateJob == null && i + 1 < args.Length &&
+                    Regex.IsMatch(args[i + 1], "^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$")) result.UpdateJob = args[++i];
+                else throw new ArgumentException("不支持或不完整的启动参数。图形入口支持 --config 配置文件、--no-browser 和 --minimized。诊断检查请使用 启动主机.cmd --check。");
+            }
+            return result;
+        }
+
+        public static string FindApplication()
+        {
+            string home = AppDomain.CurrentDomain.BaseDirectory;
+            string[] candidates = { home, Path.Combine(home, "程序"), Path.Combine(home, "交付", "园区租赁-v0.1", "程序") };
+            foreach (string candidate in candidates)
+            {
+                if (!File.Exists(Path.Combine(candidate, "host.cjs"))) continue;
+                if (!File.Exists(Path.Combine(candidate, "runtime", "node.exe")))
+                    throw new IOException("已找到程序，但缺少随包运行组件 runtime\\node.exe。请使用完整交付包，不要只复制启动图标。");
+                return Path.GetFullPath(candidate);
+            }
+            throw new IOException("未找到完整交付程序。请保留根目录下的“交付\\园区租赁-v0.1\\程序”，或直接打开交付包“程序”目录中的“园区租赁主机.exe”。");
+        }
+
+        public static string Quote(string value)
+        {
+            var result = new StringBuilder("\"");
+            int slashes = 0;
+            foreach (char character in value)
+            {
+                if (character == '\\') { slashes++; continue; }
+                result.Append('\\', character == '"' ? slashes * 2 + 1 : slashes);
+                result.Append(character);
+                slashes = 0;
+            }
+            return result.Append('\\', slashes * 2).Append('"').ToString();
+        }
+        internal static ProcessStartInfo ClientStart(string program, string config, string origin, bool background)
+        {
+            string root = Directory.GetParent(program).FullName;
+            if (config != null) root = Directory.GetParent(Path.GetDirectoryName(config)).FullName;
+            string executable = Path.Combine(program, "client-windows", "园区租赁.exe");
+            if (!File.Exists(executable)) throw new IOException("缺少业务窗口组件，请使用完整安装包修复。");
+            return new ProcessStartInfo(executable, "--state " + Quote(Path.Combine(root, "电脑端资料")) +
+                (origin == null ? "" : " --origin " + Quote(origin)) + (background ? " --background" : "")) {
+                UseShellExecute = false, WorkingDirectory = Path.GetDirectoryName(executable)
+            };
+        }
+        internal static bool RunJoinedComputer(LaunchOptions options)
+        {
+            string program = FindApplication(), root = Directory.GetParent(program).FullName;
+            string role = Path.Combine(root, "配置", "电脑角色.json");
+            if (!File.Exists(role)) return false;
+            if (new FileInfo(role).Length > 2048) throw new IOException("电脑职责配置无效。");
+            var serializer = new JavaScriptSerializer();
+            var record = serializer.Deserialize<Dictionary<string, object>>(File.ReadAllText(role, Encoding.UTF8));
+            var installation = serializer.Deserialize<Dictionary<string, object>>(File.ReadAllText(Path.Combine(root, "installation.json"), Encoding.UTF8));
+            if (record.Count != 4 || (string)record["format"] != "industrial-rent-machine-role" ||
+                Convert.ToInt32(record["formatVersion"]) != 1 || !Equals(record["installationId"], installation["installationId"]))
+                throw new IOException("电脑职责不属于此安装，未创建账本。");
+            if ((string)record["mode"] == "host") return false;
+            if ((string)record["mode"] != "client") throw new IOException("电脑职责配置无效，未创建账本。");
+            using (var client = Process.Start(ClientStart(program, options.ConfigFile, null, options.BackgroundClient || options.Minimized)))
+                client.WaitForExit();
+            return true;
+        }
+    }
+
+    internal sealed class HostRun : IDisposable
+    {
+        private static readonly Encoding InputEncoding = new UTF8Encoding(false, true);
+        public readonly Process Process;
+        public readonly OwnedJob Job;
+        public readonly DateTime Began = DateTime.UtcNow;
+        public DateTime LastReply = DateTime.UtcNow;
+        public DateTime StopBegan;
+        public bool ExpectedStop;
+        public bool ReportedError;
+        public bool Ready;
+        public string UpdateJobId;
+        public bool UpdateRestart;
+        public bool UpdateRecovery;
+        public string LastError = "";
+        private readonly object writing = new object();
+        private int statusPending;
+        private int disposed;
+
+        public HostRun(Process process, OwnedJob job) { Process = process; Job = job; }
+
+        public void Send(string command, Action failed)
+        {
+            bool status = command == "status";
+            SendFrame(command == "start" ? "{\"command\":\"start\",\"protocol\":2}" : "{\"command\":\"" + command + "\"}", status, failed);
+        }
+
+        public void SendUpdate(string command, string jobId)
+        {
+            Guid id;
+            if (!Guid.TryParse(jobId, out id)) throw new InvalidDataException("Invalid update job identifier.");
+            SendFrame("{\"command\":\"" + command + "\",\"jobId\":\"" + id.ToString("D") + "\"}", false, null);
+        }
+        public void SendAccountSetup(string frame, Action failed) { SendFrame(frame, false, failed); }
+
+        private void SendFrame(string frame, bool status, Action failed)
+        {
+            if (status && Interlocked.Exchange(ref statusPending, 1) != 0) return;
+            Task.Run(delegate {
+                byte[] bytes = null;
+                try
+                {
+                    bytes = InputEncoding.GetBytes(frame + "\n");
+                    lock (writing)
+                    {
+                        if (Volatile.Read(ref disposed) != 0) return;
+                        // The Framework text writer uses the console code page, not the host's UTF-8 protocol.
+                        Stream input = Process.StandardInput.BaseStream;
+                        input.Write(bytes, 0, bytes.Length);
+                        input.Flush();
+                    }
+                }
+                catch (IOException) { if (failed != null) failed(); }
+                catch (InvalidOperationException) { if (failed != null) failed(); }
+                catch (EncoderFallbackException) { if (failed != null) failed(); }
+                finally
+                {
+                    if (bytes != null) Array.Clear(bytes, 0, bytes.Length);
+                    if (status) Interlocked.Exchange(ref statusPending, 0);
+                }
+            });
+        }
+
+        public void Dispose()
+        {
+            if (Interlocked.Exchange(ref disposed, 1) != 0) return;
+            Job.Dispose();
+            Process.Dispose();
+        }
+    }
+
+    internal enum HostState { Stopped, Starting, Running, Stopping, Blocked, Error, Unresponsive }
+
+    internal sealed partial class Manager : Form
+    {
+        private const string Prefix = "@rent-desktop ";
+        private readonly LaunchOptions options;
+        private readonly JavaScriptSerializer json = new JavaScriptSerializer { MaxJsonLength = 16384, RecursionLimit = 8 };
+        private readonly Queue<string> activity = new Queue<string>();
+        private readonly ToolTip tips = new ToolTip { AutoPopDelay = 16000, InitialDelay = 450 };
+        private readonly System.Windows.Forms.Timer timer = new System.Windows.Forms.Timer { Interval = 1000 };
+        private readonly NotifyIcon tray = new NotifyIcon();
+        private Label stateLabel, stateDetail, ownership, runMeta, activityLabel, setupTitle, setupHint, initializedNote, versionLabel;
+        private TextBox address, dataPath, backupPath, tokenBox;
+        private ActionButton openButton, startButton, stopButton, restartButton, showToken, copyToken, dataButton, backupButton;
+        private TableLayoutPanel tokenRow;
+        private ToolStripMenuItem trayOpen, trayStop, trayRestart;
+        private HostRun current;
+        private HostState state = HostState.Stopped;
+        private string applicationDirectory, businessUrl, setupToken, clipboardToken;
+        private DateTime copiedUntil, revealUntil;
+        private bool allowExit, exitAfterStop, restartAfterStop, firstBrowser = true, balloonShown, initialized;
+        private int tick;
+        private float uiScale;
+
+        public Manager(LaunchOptions options)
+        {
+            SuspendLayout();
+            this.options = options;
+            startupUpdateJob = options.UpdateJob;
+            Text = "园区租赁 · 主机管理";
+            Name = "rentHostManager";
+            Font = new Font("Microsoft YaHei UI", 9.5f);
+            BackColor = Theme.Background;
+            ForeColor = Theme.Ink;
+            AutoScaleMode = AutoScaleMode.None;
+            StartPosition = FormStartPosition.CenterScreen;
+            MinimumSize = new Size(920, 600);
+            Size available = Screen.PrimaryScreen.WorkingArea.Size;
+            float scale = Native.StartupScale();
+            var logicalClient = new Size(Math.Max(920, Math.Min(1140, (int)(available.Width / scale) - 64)),
+                Math.Max(560, Math.Min(792, (int)(available.Height / scale) - 80)));
+            ClientSize = logicalClient;
+            Icon = Icon.ExtractAssociatedIcon(Application.ExecutablePath);
+            BuildView();
+            BuildTray();
+            // Framework DPI opt-in normally depends on an adjacent .exe.config.
+            // Scale explicitly so the same single-file entry also works after being renamed at the project root.
+            Scale(new SizeF(scale, scale));
+            uiScale = scale;
+            ClientSize = new Size((int)(logicalClient.Width * scale), (int)(logicalClient.Height * scale));
+            MinimumSize = new Size((int)(920 * scale), (int)(600 * scale));
+            ResumeLayout(false);
+            PerformLayout();
+            timer.Tick += TimerTick;
+            timer.Start();
+            Shown += delegate {
+                StartHost();
+                if (options.Minimized) HideToTray();
+            };
+            Resize += delegate { if (WindowState == FormWindowState.Minimized) HideToTray(); };
+            Deactivate += delegate { MaskToken(); };
+        }
+
+        private TableLayoutPanel Rows(params int[] heights)
+        {
+            var panel = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 1, RowCount = heights.Length, BackColor = Color.White, Margin = Padding.Empty };
+            panel.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
+            foreach (int height in heights) panel.RowStyles.Add(new RowStyle(SizeType.Absolute, height));
+            return panel;
+        }
+
+        private void BuildView()
+        {
+            var shell = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 2, RowCount = 1, Margin = Padding.Empty, Padding = Padding.Empty };
+            shell.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 212));
+            shell.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
+            shell.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
+            Controls.Add(shell);
+
+            var sidebar = new Sidebar { Dock = DockStyle.Fill, Margin = Padding.Empty, Padding = new Padding(22, 28, 22, 22) };
+            shell.Controls.Add(sidebar, 0, 0);
+            var mark = new BrandMark { Location = new Point(23, 29) };
+            sidebar.Controls.Add(mark);
+            var brand = Theme.Label("园区租赁", 17, Color.White, true);
+            brand.SetBounds(78, 27, 122, 34);
+            sidebar.Controls.Add(brand);
+            var english = Theme.Label("RENTAL CENTRE", 7.5f, Color.FromArgb(165, 189, 195), false);
+            english.SetBounds(79, 59, 118, 22);
+            sidebar.Controls.Add(english);
+            var category = Theme.Label("中心工作台", 8.5f, Color.FromArgb(126, 154, 166), false);
+            category.SetBounds(25, 116, 160, 24);
+            sidebar.Controls.Add(category);
+            var active = Theme.Label("  ◉    主机概览", 10.5f, Color.White, true);
+            active.BackColor = Color.FromArgb(44, 81, 86);
+            active.SetBounds(16, 150, 180, 44);
+            sidebar.Controls.Add(active);
+            lanButton = new ActionButton("让同事连接", "lanButton", false) { Dark = true };
+            lanButton.SetBounds(16, 203, 180, 40);
+            lanButton.Click += delegate { ConfigureLan(); };
+            sidebar.Controls.Add(lanButton);
+            var intro = Theme.Label("账本在主机上\n业务在软件中", 11, Color.FromArgb(194, 217, 217), true);
+            intro.SetBounds(27, 267, 158, 60);
+            sidebar.Controls.Add(intro);
+            var introDetail = Theme.Label("这台电脑保管公司账本。", 8.5f, Color.FromArgb(135, 161, 173), false);
+            introDetail.SetBounds(27, 334, 160, 68);
+            sidebar.Controls.Add(introDetail);
+            sidebar.Resize += delegate { introDetail.Visible = sidebar.Height >= 620 * Native.StartupScale(); };
+            var bottom = new Panel { Dock = DockStyle.Bottom, Height = 192, BackColor = Color.Transparent };
+            sidebar.Controls.Add(bottom);
+            var quiet = Theme.Label("保持主机运行", 10, Color.FromArgb(199, 223, 218), true);
+            quiet.SetBounds(2, 0, 164, 25);
+            bottom.Controls.Add(quiet);
+            var hint = Theme.Label("点 × 收起到右下角托盘。\n需要停机，请“停止并退出”。", 8, Color.FromArgb(143, 171, 180), false);
+            hint.SetBounds(2, 31, 166, 42);
+            bottom.Controls.Add(hint);
+            var hide = new ActionButton("收起到托盘", "hideButton", false) { Dark = true };
+            hide.SetBounds(0, 92, 168, 38);
+            hide.Click += delegate { HideToTray(); };
+            bottom.Controls.Add(hide);
+            var exit = new ActionButton("停止并退出", "exitButton", false) { Dark = true };
+            exit.SetBounds(0, 144, 168, 38);
+            exit.Click += delegate { RequestExit(); };
+            bottom.Controls.Add(exit);
+
+            var scroll = new Panel { Dock = DockStyle.Fill, AutoScroll = true, Padding = new Padding(26, 20, 26, 16), Margin = Padding.Empty };
+            shell.Controls.Add(scroll, 1, 0);
+            var content = Rows(76, 214, 162, 142, 106, 32);
+            content.Dock = DockStyle.Top;
+            content.Height = 732;
+            content.MinimumSize = new Size(650, 732);
+            content.BackColor = Theme.Background;
+            scroll.Controls.Add(content);
+            var header = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 2, RowCount = 2, BackColor = Color.Transparent, Margin = Padding.Empty };
+            header.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
+            header.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 188));
+            header.RowStyles.Add(new RowStyle(SizeType.Absolute, 40));
+            header.RowStyles.Add(new RowStyle(SizeType.Absolute, 28));
+            var title = Theme.Label("主机管理", 23, Theme.Ink, true);
+            title.Dock = DockStyle.Fill;
+            header.Controls.Add(title, 0, 0);
+            versionLabel = Theme.Label("WINDOWS 便携中心", 8.5f, Theme.Muted, false);
+            versionLabel.TextAlign = ContentAlignment.MiddleRight;
+            versionLabel.Dock = DockStyle.Fill;
+            header.Controls.Add(versionLabel, 1, 0);
+            var subtitle = Theme.Label("日常记账请打开业务页面。", 9, Theme.Muted, false);
+            subtitle.Dock = DockStyle.Fill;
+            header.Controls.Add(subtitle, 0, 1);
+            header.SetColumnSpan(subtitle, 2);
+            content.Controls.Add(header, 0, 0);
+
+            var statusCard = new Surface { Dock = DockStyle.Fill, Margin = new Padding(0, 0, 0, 14), Padding = new Padding(20, 14, 20, 12) };
+            var statusRows = Rows(39, 43, 24, 47, 20);
+            statusCard.Controls.Add(statusRows);
+            content.Controls.Add(statusCard, 0, 1);
+            var statusHeading = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 2, Margin = Padding.Empty };
+            statusHeading.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
+            statusHeading.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 158));
+            stateLabel = Theme.Label("●  主机已停止", 18, Theme.Muted, true);
+            stateLabel.Name = "stateLabel";
+            stateLabel.Dock = DockStyle.Fill;
+            statusHeading.Controls.Add(stateLabel, 0, 0);
+            ownership = Theme.Label("尚未启动", 8.5f, Theme.Muted, false);
+            ownership.Name = "ownershipLabel";
+            ownership.Dock = DockStyle.Fill;
+            ownership.TextAlign = ContentAlignment.MiddleRight;
+            statusHeading.Controls.Add(ownership, 1, 0);
+            statusRows.Controls.Add(statusHeading, 0, 0);
+            stateDetail = Theme.Label("请先启动主机。", 9, Theme.Muted, false);
+            stateDetail.Name = "stateDetail";
+            stateDetail.Dock = DockStyle.Fill;
+            statusRows.Controls.Add(stateDetail, 0, 1);
+            address = ReadOnlyValue("businessAddress", "业务地址将在配置检查后显示");
+            address.ForeColor = Theme.Teal;
+            address.Multiline = false;
+            statusRows.Controls.Add(address, 0, 2);
+            var controls = new FlowLayoutPanel { Dock = DockStyle.Fill, WrapContents = false, Margin = Padding.Empty, Padding = new Padding(0, 6, 0, 0), BackColor = Color.White };
+            openButton = new ActionButton("打开业务页面  ↗", "openBusinessButton", true) { Width = 169 };
+            startButton = new ActionButton("启动主机", "startButton", false);
+            stopButton = new ActionButton("停止主机", "stopButton", false);
+            restartButton = new ActionButton("重启主机", "restartButton", false);
+            controls.Controls.AddRange(new Control[] { openButton, startButton, stopButton, restartButton });
+            openButton.Click += delegate { OpenBusiness(); };
+            startButton.Click += delegate { StartHost(); };
+            stopButton.Click += delegate { StopHost(false); };
+            restartButton.Click += delegate { StopHost(true); };
+            statusRows.Controls.Add(controls, 0, 3);
+            runMeta = Theme.Label("", 8, Theme.Muted, false);
+            runMeta.Name = "runMeta";
+            runMeta.Dock = DockStyle.Fill;
+            statusRows.Controls.Add(runMeta, 0, 4);
+
+            var locations = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 2, RowCount = 1, Margin = Padding.Empty, BackColor = Color.Transparent };
+            locations.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 50));
+            locations.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 50));
+            content.Controls.Add(locations, 0, 2);
+            locations.Controls.Add(PathCard("业务数据", "账本和合同原件", "dataPath", false, out dataPath, out dataButton), 0, 0);
+            locations.Controls.Add(PathCard("备份文件", "请另存一份到其他磁盘", "backupPath", true, out backupPath, out backupButton), 1, 0);
+            dataButton.Click += async delegate { await OpenDirectory(dataPath.Text, false); };
+            backupButton.Click += async delegate { await OpenDirectory(backupPath.Text, true); };
+
+            var setup = new Surface { Dock = DockStyle.Fill, Margin = new Padding(0, 0, 0, 14), Padding = new Padding(20, 12, 20, 12) };
+            var setupRows = Rows(27, 35, 42);
+            setup.Controls.Add(setupRows);
+            content.Controls.Add(setup, 0, 3);
+            setupTitle = Theme.Label("账号设置", 11, Theme.Ink, true);
+            setupTitle.Name = "setupTitle";
+            setupTitle.Dock = DockStyle.Fill;
+            setupRows.Controls.Add(setupTitle, 0, 0);
+            setupHint = Theme.Label("首次使用请设置管理员账号。", 8.5f, Theme.Muted, false);
+            setupHint.Dock = DockStyle.Fill;
+            setupRows.Controls.Add(setupHint, 0, 1);
+            var tokenArea = new Panel { Dock = DockStyle.Fill, Margin = Padding.Empty, BackColor = Color.White };
+            setupRows.Controls.Add(tokenArea, 0, 2);
+            tokenRow = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 3, RowCount = 1, Margin = Padding.Empty, BackColor = Color.White, Visible = false };
+            // An implicit AutoSize row can retain a taller button size and clip its centered text.
+            tokenRow.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
+            tokenRow.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
+            tokenRow.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 84));
+            tokenRow.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 114));
+            tokenBox = new TextBox {
+                Name = "setupToken", AccessibleName = "首次初始化口令（默认隐藏）", ReadOnly = true, UseSystemPasswordChar = true,
+                BorderStyle = BorderStyle.FixedSingle, Font = new Font("Consolas", 11), BackColor = Theme.TealSoft,
+                Dock = DockStyle.Fill, Margin = new Padding(0, 7, 14, 0), TabStop = false, ShortcutsEnabled = false
+            };
+            showToken = new ActionButton("显示", "showTokenButton", false) { Dock = DockStyle.Fill, Margin = new Padding(0, 0, 10, 2) };
+            copyToken = new ActionButton("复制口令", "copyTokenButton", true) { Dock = DockStyle.Fill, Margin = new Padding(0, 0, 0, 2) };
+            showToken.Click += delegate { RevealToken(); };
+            copyToken.Click += delegate { CopyToken(); };
+            tokenRow.Controls.Add(tokenBox, 0, 0);
+            tokenRow.Controls.Add(showToken, 1, 0);
+            tokenRow.Controls.Add(copyToken, 2, 0);
+            tokenArea.Controls.Add(tokenRow);
+            initializedNote = Theme.Label("", 9, Theme.Teal, false);
+            initializedNote.Dock = DockStyle.Fill;
+            tokenArea.Controls.Add(initializedNote);
+            setupAccountButton = new ActionButton("设置管理员账号", "setupAccountButton", true) {
+                Dock = DockStyle.Fill, Visible = false
+            };
+            setupAccountButton.Click += delegate { OpenAccountSetup(); };
+            tokenArea.Controls.Add(setupAccountButton);
+
+            var eventsCard = new Surface { Dock = DockStyle.Fill, Margin = new Padding(0, 0, 0, 8), Padding = new Padding(20, 10, 20, 10) };
+            var eventRows = Rows(24, 51);
+            eventsCard.Controls.Add(eventRows);
+            var recent = Theme.Label("最近状态", 9.5f, Theme.Ink, true);
+            recent.Dock = DockStyle.Fill;
+            eventRows.Controls.Add(recent, 0, 0);
+            activityLabel = Theme.Label("等待启动…", 8.5f, Theme.Muted, false);
+            activityLabel.Name = "activityLabel";
+            activityLabel.Dock = DockStyle.Fill;
+            eventRows.Controls.Add(activityLabel, 0, 1);
+            content.Controls.Add(eventsCard, 0, 4);
+            var footer = Theme.Label("主机睡眠、关机或停止后，同事暂时无法同步。", 8, Theme.Muted, false);
+            footer.Dock = DockStyle.Fill;
+            content.Controls.Add(footer, 0, 5);
+            RefreshControls();
+        }
+
+        private TextBox ReadOnlyValue(string name, string initial)
+        {
+            return new TextBox {
+                Name = name, Text = initial, ReadOnly = true, Multiline = true, WordWrap = true,
+                Dock = DockStyle.Fill, BorderStyle = BorderStyle.None, BackColor = Color.White, ForeColor = Theme.Ink,
+                Font = new Font("Microsoft YaHei UI", 9), Margin = new Padding(0, 3, 0, 0), TabStop = false
+            };
+        }
+
+        private Surface PathCard(string title, string hint, string name, bool right, out TextBox value, out ActionButton button)
+        {
+            var card = new Surface { Dock = DockStyle.Fill, Margin = new Padding(right ? 7 : 0, 0, right ? 0 : 7, 14), Padding = new Padding(18, 12, 18, 10) };
+            var rows = Rows(25, 37, 19, 35);
+            card.Controls.Add(rows);
+            var label = Theme.Label(title, 11, Theme.Ink, true);
+            label.Dock = DockStyle.Fill;
+            rows.Controls.Add(label, 0, 0);
+            value = ReadOnlyValue(name, "等待本次配置解析");
+            rows.Controls.Add(value, 0, 1);
+            var caption = Theme.Label(hint, 7.5f, Theme.Muted, false);
+            caption.Dock = DockStyle.Fill;
+            rows.Controls.Add(caption, 0, 2);
+            button = new ActionButton(right ? "打开备份目录  ↗" : "打开数据目录  ↗", right ? "openBackupButton" : "openDataButton", false) { Width = 152, Height = 32, Margin = new Padding(0, 2, 0, 0), Font = new Font("Microsoft YaHei UI", 8.5f) };
+            rows.Controls.Add(button, 0, 3);
+            return card;
+        }
+
+        private void BuildTray()
+        {
+            tray.Icon = Icon;
+            tray.Text = "园区租赁 · 主机管理";
+            var menu = new ContextMenuStrip();
+            menu.Font = new Font("Microsoft YaHei UI", 9);
+            menu.Items.Add("显示管理窗口", null, delegate { ShowManager(); });
+            trayOpen = new ToolStripMenuItem("打开业务页面", null, delegate { OpenBusiness(); });
+            trayStop = new ToolStripMenuItem("停止主机", null, delegate { StopHost(false); });
+            trayRestart = new ToolStripMenuItem("重启主机", null, delegate { StopHost(true); });
+            menu.Items.Add(trayOpen);
+            menu.Items.Add(new ToolStripSeparator());
+            menu.Items.Add(trayStop);
+            menu.Items.Add(trayRestart);
+            menu.Items.Add(new ToolStripSeparator());
+            menu.Items.Add("停止并退出", null, delegate { RequestExit(); });
+            tray.ContextMenuStrip = menu;
+            tray.DoubleClick += delegate { ShowManager(); };
+            tray.BalloonTipClicked += delegate { ShowManager(); };
+            tray.Visible = true;
+            RefreshControls();
+        }
+
+        private void Ui(Action action)
+        {
+            if (IsDisposed || Disposing || !IsHandleCreated) return;
+            try { BeginInvoke(new Action(delegate { if (!IsDisposed && !Disposing) action(); })); }
+            catch (InvalidOperationException) { }
+        }
+
+        private string Clean(string value, int maximum)
+        {
+            string text = Regex.Replace(value ?? "", "[\\x00-\\x1f\\x7f]+", " ");
+            if (!String.IsNullOrEmpty(setupToken)) text = text.Replace(setupToken, "[口令已隐藏]");
+            text = Regex.Replace(text, "[A-Za-z0-9_-]{40,}", "[敏感长串已隐藏]");
+            return text.Length <= maximum ? text : text.Substring(0, maximum) + "…";
+        }
+
+        private void AddActivity(string text)
+        {
+            string message = DateTime.Now.ToString("HH:mm:ss") + "  " + Clean(text, 180);
+            activity.Enqueue(message);
+            while (activity.Count > 3) activity.Dequeue();
+            activityLabel.Text = String.Join(Environment.NewLine, activity.ToArray());
+            tips.SetToolTip(activityLabel, activityLabel.Text);
+        }
+
+        private void SetState(HostState value, string detail)
+        {
+            state = value;
+            string heading;
+            Color color;
+            switch (value)
+            {
+                case HostState.Starting: heading = "正在启动主机"; color = Theme.Teal; break;
+                case HostState.Running: heading = "主机运行中"; color = Theme.Teal; break;
+                case HostState.Stopping: heading = "正在安全停止"; color = Theme.Amber; break;
+                case HostState.Blocked: heading = "账本正在使用"; color = Theme.Amber; break;
+                case HostState.Unresponsive: heading = "响应超时 · 待确认"; color = Theme.Amber; break;
+                case HostState.Error: heading = "主机未就绪"; color = Theme.Red; break;
+                default: heading = "主机已停止"; color = Theme.Muted; break;
+            }
+            stateLabel.Text = "●  " + heading;
+            stateLabel.ForeColor = color;
+            stateDetail.Text = Clean(detail, 600);
+            tips.SetToolTip(stateDetail, stateDetail.Text);
+            ownership.Text = value == HostState.Blocked ? "请检查原主机或维护窗口" : "";
+            tray.Text = "园区租赁 · " + heading;
+            RefreshControls();
+        }
+
+        private void RefreshControls()
+        {
+            bool owned = current != null && current.Ready && !current.ExpectedStop && !current.ReportedError;
+            bool usable = !String.IsNullOrEmpty(businessUrl) && (state == HostState.Running || state == HostState.Unresponsive || state == HostState.Blocked);
+            openButton.Enabled = usable;
+            openButton.Text = state == HostState.Blocked ? "尝试打开业务页  ↗" : "打开业务页面  ↗";
+            startButton.Enabled = current == null && !exitAfterStop && !updating && !configuringLan;
+            stopButton.Enabled = current != null && !current.ExpectedStop && !current.ReportedError && (owned || state == HostState.Starting);
+            restartButton.Enabled = owned && !configuringLan;
+            if (lanButton != null) lanButton.Enabled = !configuringLan && !updating && !exitAfterStop &&
+                !creatingAccount &&
+                state != HostState.Blocked &&
+                (current == null || owned && initialized);
+            if (setupAccountButton != null) setupAccountButton.Enabled = owned && !initialized && !creatingAccount;
+            dataButton.Enabled = !String.IsNullOrEmpty(businessUrl);
+            backupButton.Enabled = !String.IsNullOrEmpty(businessUrl);
+            if (trayOpen != null) { trayOpen.Enabled = usable; trayStop.Enabled = stopButton.Enabled; trayRestart.Enabled = restartButton.Enabled; }
+        }
+
+        private void StartHost()
+        {
+            if (current != null || exitAfterStop || updating || configuringLan) return;
+            ClearToken();
+            initialized = false;
+            businessUrl = null;
+            address.Text = "正在解析实际访问地址…";
+            dataPath.Text = backupPath.Text = "等待本次配置解析";
+            UpdateSetup();
+            SetState(HostState.Starting, "正在检查程序与配置，随后打开账本。请稍候。");
+            OwnedJob job = null;
+            HostRun run = null;
+            Process process = null;
+            try
+            {
+                applicationDirectory = LaunchOptions.FindApplication();
+                ReadVersion();
+                job = new OwnedJob();
+                var info = new ProcessStartInfo {
+                    FileName = Path.Combine(applicationDirectory, "runtime", "node.exe"),
+                    Arguments = "--disable-warning=ExperimentalWarning " + LaunchOptions.Quote(Path.Combine(applicationDirectory, "host.cjs")) +
+                        " --desktop --no-browser" + (options.ConfigFile == null ? "" : " --config " + LaunchOptions.Quote(options.ConfigFile)) +
+                        (startupUpdateJob == null ? "" : " --update-job " + LaunchOptions.Quote(startupUpdateJob)),
+                    WorkingDirectory = applicationDirectory, UseShellExecute = false, CreateNoWindow = true,
+                    RedirectStandardInput = true, RedirectStandardOutput = true, RedirectStandardError = true,
+                    StandardOutputEncoding = new UTF8Encoding(false), StandardErrorEncoding = new UTF8Encoding(false)
+                };
+                info.EnvironmentVariables.Remove("NODE_OPTIONS");
+                info.EnvironmentVariables.Remove("NODE_PATH");
+                process = new Process { StartInfo = info, EnableRaisingEvents = true };
+                run = new HostRun(process, job);
+                run.UpdateJobId = startupUpdateJob;
+                HostRun captured = run;
+                process.OutputDataReceived += delegate(object sender, DataReceivedEventArgs e) {
+                    if (e.Data != null) Ui(delegate { Receive(captured, e.Data); });
+                };
+                process.ErrorDataReceived += delegate(object sender, DataReceivedEventArgs e) {
+                    if (e.Data != null) Ui(delegate {
+                        if (current != captured) return;
+                        captured.LastError = Clean(e.Data, 500);
+                        AddActivity("主机提示：" + captured.LastError);
+                    });
+                };
+                process.Exited += delegate {
+                    Task.Run(delegate {
+                        int code;
+                        try { captured.Process.WaitForExit(); code = captured.Process.ExitCode; }
+                        catch (InvalidOperationException) { return; }
+                        Ui(delegate { HostExited(captured, code); });
+                    });
+                };
+                current = run;
+                if (!process.Start()) throw new IOException("无法创建随包主机进程。");
+                job.Assign(process);
+                process.BeginOutputReadLine();
+                process.BeginErrorReadLine();
+                run.Send("start", delegate { Ui(delegate { CommunicationLost(captured); }); });
+                AddActivity("已启动受托管进程；等待账本与访问端口就绪。");
+                RefreshControls();
+            }
+            catch (Exception error)
+            {
+                current = null;
+                if (job != null) job.Dispose();
+                // No start handshake is sent before job assignment succeeds.
+                if (process != null)
+                {
+                    Process failed = process;
+                    Task.Run(delegate {
+                        try {
+                            failed.StandardInput.Close();
+                            if (!failed.WaitForExit(5000)) failed.Kill();
+                        } catch (InvalidOperationException) { } catch (IOException) { } catch (System.ComponentModel.Win32Exception) { }
+                        finally { failed.Dispose(); }
+                    });
+                }
+                SetState(HostState.Error, error.Message);
+                AddActivity("启动未完成：" + error.Message);
+                if (startupUpdateJob != null && !rollbackAttempted) CoordinateUpdate("rollback", startupUpdateJob);
+            }
+        }
+
+        private void ReadVersion()
+        {
+            string file = ActivePackageFile();
+            if (new FileInfo(file).Length > 65536) throw new InvalidDataException("程序版本文件异常过大，请恢复完整交付包后启动。");
+            var package = json.Deserialize<Dictionary<string, object>>(File.ReadAllText(file, Encoding.UTF8));
+            if (package == null) throw new InvalidDataException("程序版本文件格式不正确，尚未打开账本。");
+            string version = Value(package, "version");
+            if (!Regex.IsMatch(version, "^\\d+\\.\\d+\\.\\d+$"))
+                throw new InvalidDataException("程序版本号缺失或格式不正确，请恢复完整交付包后启动。");
+            versionLabel.Text = "WINDOWS 主机 · v" + version;
+            selectedVersion = version;
+        }
+
+        private static string Value(Dictionary<string, object> message, string key)
+        {
+            object value;
+            return message.TryGetValue(key, out value) && value is string ? (string)value : "";
+        }
+
+        private void Receive(HostRun run, string line)
+        {
+            if (current != run || !line.StartsWith(Prefix, StringComparison.Ordinal)) return;
+            try
+            {
+                if (line.Length > 16384) throw new InvalidDataException();
+                var message = json.Deserialize<Dictionary<string, object>>(line.Substring(Prefix.Length));
+                if (message == null || !message.ContainsKey("protocol") || Convert.ToInt32(message["protocol"]) != 2) throw new InvalidDataException();
+                run.LastReply = DateTime.UtcNow;
+                string type = Value(message, "type");
+                if (type == "starting" || type == "ready")
+                {
+                    if (!message.ContainsKey("pid") || Convert.ToInt32(message["pid"]) != run.Process.Id) throw new InvalidDataException();
+                    Uri origin;
+                    string url = Value(message, "url");
+                    string data = Value(message, "dataDir"), backup = Value(message, "backupDir");
+                    if (!Uri.TryCreate(url, UriKind.Absolute, out origin) || (origin.Scheme != "http" && origin.Scheme != "https") ||
+                        origin.UserInfo.Length != 0 || origin.Query.Length != 0 || origin.Fragment.Length != 0 ||
+                        !Path.IsPathRooted(data) || !Path.IsPathRooted(backup)) throw new InvalidDataException();
+                    businessUrl = url;
+                    address.Text = "业务地址  " + url;
+                    dataPath.Text = data;
+                    backupPath.Text = backup;
+                    tips.SetToolTip(dataPath, data);
+                    tips.SetToolTip(backupPath, backup);
+                    if (type == "ready")
+                    {
+                        run.Ready = true;
+                        CompleteUpdateStart(run);
+                        initialized = message.ContainsKey("initialized") && message["initialized"] is bool && (bool)message["initialized"];
+                        setupToken = initialized ? null : Value(message, "setupToken");
+                        if (!initialized && !Regex.IsMatch(setupToken ?? "", "^[A-Za-z0-9_-]{43}$")) throw new InvalidDataException();
+                        MaskToken();
+                        if (!run.ExpectedStop)
+                        {
+                            SetState(HostState.Running, "可以打开业务页面开始工作。");
+                            AddActivity("中心主机已就绪；数据由本次配置指定的目录保存。");
+                            if (firstBrowser && !options.NoBrowser)
+                            {
+                                if (!initialized && !options.AdvancedSetup) BeginInvoke((MethodInvoker)OpenAccountSetup);
+                                else OpenBusiness(options.BackgroundClient);
+                            }
+                            firstBrowser = false;
+                        }
+                        UpdateSetup();
+                    }
+                    RefreshControls();
+                }
+                else if (ReceiveUpdate(run, message, type)) { }
+                else if (ReceiveAccountSetup(message, type)) { }
+                else if (type == "status")
+                {
+                    if (message.ContainsKey("initialized") && message["initialized"] is bool && (bool)message["initialized"] && !initialized)
+                    {
+                        initialized = true;
+                        ClearToken();
+                        UpdateSetup();
+                        RefreshControls();
+                        AddActivity("管理员账号已创建。");
+                    }
+                    if (Value(message, "state") == "running" && state == HostState.Unresponsive && !run.ExpectedStop)
+                        SetState(HostState.Running, "主机已恢复响应，业务页面可正常访问。");
+                }
+                else if (type == "error")
+                {
+                    run.ReportedError = true;
+                    run.LastError = Clean(Value(message, "message"), 600);
+                    ClearToken();
+                    SetState(Value(message, "code") == "HOST_IN_USE" ? HostState.Blocked : HostState.Error, run.LastError);
+                    AddActivity(run.LastError);
+                    UpdateSetup();
+                }
+                else if (type == "notice") AddActivity(Value(message, "message"));
+                else if (type == "stopping")
+                {
+                    if (!run.ReportedError) SetState(HostState.Stopping, "正在完成保存和备份，请不要关机或拔盘。");
+                }
+                else if (type != "hello" && type != "stopped") throw new InvalidDataException();
+            }
+            catch (Exception)
+            {
+                run.ReportedError = true;
+                run.LastError = "管理窗口与主机的通信格式不一致。已请求停止；请维护人员重新生成完整的同一版交付包。";
+                SetState(HostState.Error, run.LastError);
+                ClearToken();
+                run.Send("stop", null);
+                AddActivity(run.LastError);
+            }
+        }
+
+        private void CommunicationLost(HostRun run)
+        {
+            if (current != run || run.ExpectedStop) return;
+            SetState(HostState.Unresponsive, "主机连接中断，正在确认是否已停止。请稍候。");
+        }
+
+        private void HostExited(HostRun run, int code)
+        {
+            if (current != run) return;
+            if (accountSetupReply != null) accountSetupReply.TrySetException(new IOException("本机主机已退出，请启动后再设置账号。"));
+            bool restart = restartAfterStop && run.ExpectedStop && code == 0 && !run.ReportedError;
+            restartAfterStop = false;
+            current = null;
+            ClearToken();
+            run.Dispose();
+            if (ContinueUpdateAfterExit(run, code)) return;
+            if (ContinueLanAfterExit(run, code)) return;
+            if (code == 0 && run.ExpectedStop && !run.ReportedError)
+            {
+                SetState(HostState.Stopped, "主机已停止，继续工作时请点击“启动主机”。");
+                AddActivity("主机已停止。");
+            }
+            else if (!run.ReportedError)
+            {
+                SetState(HostState.Error, "中心进程已退出（代码 " + code + "）。" +
+                    (String.IsNullOrEmpty(run.LastError) ? "请检查程序完整性、配置和数据目录权限，再尝试启动。" : run.LastError));
+                AddActivity("主机进程退出，代码 " + code + "。");
+            }
+            else RefreshControls();
+            runMeta.Text = "";
+            UpdateSetup();
+            if (exitAfterStop)
+            {
+                if (code != 0 || run.ReportedError)
+                    MessageBox.Show(this, "主机已退出，但停止过程报告了异常。请维护人员检查业务数据目录中的 logs 文件夹后再使用。\n\n" + Clean(run.LastError, 400),
+                        "停止时有异常", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                FinishExit();
+            }
+            else if (restart) StartHost();
+        }
+
+        private void StopHost(bool restart)
+        {
+            if (creatingAccount) { ShowNotice("请先完成或关闭账号设置窗口，再停止主机。"); return; }
+            HostRun run = current;
+            if (run == null || run.ExpectedStop) return;
+            if (state == HostState.Blocked || run.ReportedError) return;
+            restartAfterStop = restart;
+            run.ExpectedStop = true;
+            run.StopBegan = DateTime.UtcNow;
+            ClearToken();
+            SetState(HostState.Stopping, "正在等待当前请求与备份完成，随后释放账本。" + (restart ? "完成后会重新启动。" : "停止期间其他设备暂时无法同步。"));
+            AddActivity(restart ? "已请求安全重启。" : "已请求安全停止。");
+            run.Send("stop", null);
+            UpdateSetup();
+        }
+
+        private void RequestExit()
+        {
+            if (creatingAccount) { ShowNotice("请先完成或关闭账号设置窗口。"); return; }
+            if (configuringLan)
+            {
+                if (pendingLan && current != null && current.ExpectedStop &&
+                    (DateTime.UtcNow - current.StopBegan).TotalSeconds >= 30)
+                {
+                    pendingLan = configuringLan = resumeAfterLan = false;
+                    AddActivity("已取消尚未打开的局域网向导；正在处理停止超时。");
+                }
+                else { ShowNotice("请先完成或关闭局域网向导，再退出主机窗口。"); return; }
+            }
+            if (updating) { ShowNotice("正在更新，请等待完成后再停止并退出。需要暂时离开时可收起窗口。"); return; }
+            if (current == null || (current.ReportedError && !current.Ready)) { FinishExit(); return; }
+            if (current.ExpectedStop && (DateTime.UtcNow - current.StopBegan).TotalSeconds >= 30)
+            {
+                if (MessageBox.Show(this, "主机仍在等待请求或备份完成，建议继续等待。\n\n强制退出可能中断备份，未完成的备份不能用于恢复。仍要退出？",
+                    "仍在安全停止", MessageBoxButtons.YesNo, MessageBoxIcon.Warning, MessageBoxDefaultButton.Button2) == DialogResult.Yes)
+                    FinishExit();
+                return;
+            }
+            if (exitAfterStop) return;
+            if (MessageBox.Show(this, "停止中心主机后，其他设备将暂时无法同步。\n\n是否等待当前请求和备份完成，然后停止并退出？",
+                "停止并退出", MessageBoxButtons.YesNo, MessageBoxIcon.Question, MessageBoxDefaultButton.Button2) != DialogResult.Yes) return;
+            exitAfterStop = true;
+            restartAfterStop = false;
+            if (current.ReportedError)
+            {
+                current.ExpectedStop = true;
+                current.StopBegan = DateTime.UtcNow;
+                current.Send("stop", null);
+            }
+            else StopHost(false);
+        }
+
+        private void FinishExit()
+        {
+            allowExit = true;
+            Close();
+        }
+
+        private void TimerTick(object sender, EventArgs e)
+        {
+            tick++;
+            HostRun run = current;
+            if (run != null)
+            {
+                if (tick % 2 == 0 && !run.ExpectedStop) run.Send("status", delegate { Ui(delegate { CommunicationLost(run); }); });
+                if (run.Ready && !run.ExpectedStop)
+                {
+                    TimeSpan uptime = DateTime.UtcNow - run.Began;
+                    runMeta.Text = "已运行 " + ((int)uptime.TotalHours).ToString("00") + ":" +
+                        uptime.Minutes.ToString("00") + ":" + uptime.Seconds.ToString("00");
+                    tips.SetToolTip(runMeta, "主机进程 " + run.Process.Id + "；每 2 秒检查连接。");
+                    if ((DateTime.UtcNow - run.LastReply).TotalSeconds > 10 && state == HostState.Running)
+                        SetState(HostState.Unresponsive, "主机暂未响应，请稍等；仍无响应可点击“停止主机”。");
+                }
+                if (run.ExpectedStop && (DateTime.UtcNow - run.StopBegan).TotalSeconds > 30)
+                {
+                    stateDetail.Text = "仍在完成保存或备份，请继续等待。强制退出可能损坏数据。";
+                    tips.SetToolTip(stateDetail, stateDetail.Text);
+                }
+            }
+            if (revealUntil != DateTime.MinValue && DateTime.UtcNow >= revealUntil)
+                MaskToken();
+            if (clipboardToken != null && DateTime.UtcNow >= copiedUntil) ClearClipboard();
+        }
+
+        private void UpdateSetup()
+        {
+            bool available = !String.IsNullOrEmpty(setupToken) && current != null && !current.ExpectedStop && state == HostState.Running;
+            tokenRow.Visible = available && options.AdvancedSetup;
+            if (setupAccountButton != null) setupAccountButton.Visible = available && !options.AdvancedSetup;
+            initializedNote.Visible = !available;
+            if (available)
+            {
+                if (options.AdvancedSetup) tokenRow.BringToFront();
+                else setupAccountButton.BringToFront();
+                setupTitle.Text = "首次使用 · 创建账号";
+                setupHint.Text = options.AdvancedSetup ?
+                    "维护模式：初始化口令只交给首位管理员，请勿发群或截图。" :
+                    "设置自己的用户名和密码。";
+            }
+            else if (initialized)
+            {
+                setupTitle.Text = "管理员账号已创建";
+                setupHint.Text = "在业务页面登录。";
+                initializedNote.Text = "添加同事：系统管理 → 连接同事电脑。";
+            }
+            else
+            {
+                setupTitle.Text = "管理员账号";
+                setupHint.Text = state == HostState.Blocked ? "这份账目已在另一个窗口打开，请使用原窗口。" :
+                    "主机启动后，可以在这里设置账号。";
+                initializedNote.Text = "";
+            }
+        }
+
+        private void RevealToken()
+        {
+            if (String.IsNullOrEmpty(setupToken)) return;
+            if (!tokenBox.UseSystemPasswordChar) { MaskToken(); return; }
+            tokenBox.Text = setupToken;
+            tokenBox.UseSystemPasswordChar = false;
+            showToken.Text = "隐藏";
+            revealUntil = DateTime.UtcNow.AddSeconds(30);
+        }
+
+        private void MaskToken()
+        {
+            tokenBox.UseSystemPasswordChar = true;
+            tokenBox.Text = String.IsNullOrEmpty(setupToken) ? "" : new string('●', 24);
+            showToken.Text = "显示";
+            revealUntil = DateTime.MinValue;
+        }
+
+        private void CopyToken()
+        {
+            if (String.IsNullOrEmpty(setupToken)) return;
+            try
+            {
+                var data = new DataObject();
+                data.SetText(setupToken, TextDataFormat.UnicodeText);
+                data.SetData("CanIncludeInClipboardHistory", false, new MemoryStream(new byte[4]));
+                data.SetData("CanUploadToCloudClipboard", false, new MemoryStream(new byte[4]));
+                data.SetData("ExcludeClipboardContentFromMonitorProcessing", false, new MemoryStream(new byte[4]));
+                Clipboard.SetDataObject(data, true);
+                clipboardToken = setupToken;
+                copiedUntil = DateTime.UtcNow.AddSeconds(60);
+                AddActivity("口令已复制；60 秒后尽力清除本次剪贴板内容，请及时完成初始化。");
+            }
+            catch (Exception) { ShowNotice("剪贴板正被其他程序占用，请稍后重试，或点击“显示”后手动输入。"); }
+        }
+
+        private void ClearClipboard()
+        {
+            if (clipboardToken == null) return;
+            try
+            {
+                if (Clipboard.ContainsText() && Clipboard.GetText(TextDataFormat.UnicodeText) == clipboardToken) Clipboard.Clear();
+                clipboardToken = null;
+            }
+            catch (Exception) { copiedUntil = DateTime.UtcNow.AddSeconds(2); }
+        }
+
+        private void ClearToken()
+        {
+            setupToken = null;
+            tokenBox.Text = "";
+            tokenBox.UseSystemPasswordChar = true;
+            showToken.Text = "显示";
+            revealUntil = DateTime.MinValue;
+            ClearClipboard();
+        }
+
+        private void OpenBusiness()
+        { OpenBusiness(false); }
+        private void OpenBusiness(bool background)
+        {
+            if (!initialized && !options.AdvancedSetup) { OpenAccountSetup(); return; }
+            if (String.IsNullOrEmpty(businessUrl)) return;
+            try { Process.Start(LaunchOptions.ClientStart(applicationDirectory, options.ConfigFile, businessUrl, background)); }
+            catch (Exception error) { ShowNotice("独立业务窗口未能打开。\n" + Clean(error.Message, 240)); }
+        }
+
+        private async Task OpenDirectory(string directory, bool backup)
+        {
+            if (String.IsNullOrEmpty(businessUrl)) return;
+            try
+            {
+                bool exists = await Task.Run(delegate { return Directory.Exists(directory); });
+                if (IsDisposed || Disposing) return;
+                if (!exists)
+                {
+                    if (!backup || state == HostState.Blocked) { ShowNotice("目录不存在或无法访问，请核对路径与权限。"); return; }
+                    if (MessageBox.Show(this, "备份目录尚不存在。是否创建并打开这个空文件夹？\n\n" + directory +
+                        "\n\n这只会创建空目录。生成备份请到“系统管理”操作。", "打开备份目录", MessageBoxButtons.YesNo,
+                        MessageBoxIcon.Question, MessageBoxDefaultButton.Button2) != DialogResult.Yes) return;
+                    await Task.Run(delegate { Directory.CreateDirectory(directory); });
+                    if (IsDisposed || Disposing) return;
+                }
+                string explorer = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.Windows), "explorer.exe");
+                Process.Start(new ProcessStartInfo(explorer, LaunchOptions.Quote(directory)) { UseShellExecute = true });
+            }
+            catch (Exception error) { ShowNotice("目录无法打开：" + Clean(error.Message, 450)); }
+        }
+
+        private void ShowNotice(string message)
+        {
+            AddActivity(message);
+            MessageBox.Show(this, Clean(message, 600), "园区租赁 · 提示", MessageBoxButtons.OK, MessageBoxIcon.Information);
+        }
+
+        private void HideToTray()
+        {
+            MaskToken();
+            Hide();
+            ShowInTaskbar = false;
+            if (!balloonShown)
+            {
+                balloonShown = true;
+                tray.ShowBalloonTip(4000, "园区租赁已收起", current != null && current.Ready
+                    ? "主机继续运行。双击此图标返回；需要停机请右键“停止并退出”。"
+                    : "双击此图标查看主机状态。", ToolTipIcon.Info);
+            }
+        }
+
+        private void ShowManager()
+        {
+            ShowInTaskbar = true;
+            Show();
+            WindowState = FormWindowState.Normal;
+            Activate();
+        }
+
+        protected override void OnFormClosing(FormClosingEventArgs e)
+        {
+            if (!allowExit && e.CloseReason == CloseReason.UserClosing)
+            {
+                e.Cancel = true;
+                HideToTray();
+                return;
+            }
+            if (!allowExit && current != null) current.Send("stop", null);
+            base.OnFormClosing(e);
+        }
+
+        protected override void WndProc(ref Message message)
+        {
+            if (message.Msg == 0x02e0 && uiScale > 0)
+            {
+                float nextScale = (message.WParam.ToInt64() & 0xffff) / 96f;
+                Rectangle suggested = Native.SuggestedBounds(message.LParam);
+                base.WndProc(ref message);
+                if (nextScale > 0 && Math.Abs(nextScale - uiScale) > 0.01f)
+                {
+                    SuspendLayout();
+                    float factor = nextScale / uiScale;
+                    foreach (Control control in Controls) control.Scale(new SizeF(factor, factor));
+                    uiScale = nextScale;
+                    MinimumSize = new Size((int)(920 * uiScale), (int)(600 * uiScale));
+                    Bounds = suggested;
+                    ResumeLayout(true);
+                }
+                return;
+            }
+            base.WndProc(ref message);
+        }
+
+        protected override void Dispose(bool disposing)
+        {
+            if (disposing)
+            {
+                timer.Stop();
+                timer.Dispose();
+                ClearClipboard();
+                tray.Visible = false;
+                if (tray.ContextMenuStrip != null) tray.ContextMenuStrip.Dispose();
+                tray.Dispose();
+                tips.Dispose();
+                if (current != null) { current.Dispose(); current = null; }
+                if (updateProcessJob != null) { updateProcessJob.Dispose(); updateProcessJob = null; }
+                if (lanProcessJob != null) { lanProcessJob.Dispose(); lanProcessJob = null; }
+            }
+            base.Dispose(disposing);
+        }
+    }
+
+    internal static class Program
+    {
+        [STAThread]
+        private static void Main(string[] args)
+        {
+            AppContext.SetSwitch("Switch.UseLegacyAccessibilityFeatures", false);
+            AppContext.SetSwitch("Switch.UseLegacyAccessibilityFeatures.2", false);
+            AppContext.SetSwitch("Switch.UseLegacyAccessibilityFeatures.3", false);
+            Native.EnableDpiAwareness();
+            Application.EnableVisualStyles();
+            Application.SetCompatibleTextRenderingDefault(false);
+            Application.SetUnhandledExceptionMode(UnhandledExceptionMode.ThrowException);
+            try
+            {
+                var options = LaunchOptions.Parse(args);
+                if (FullUpdateLaunch.Resume(options)) return;
+                if (LaunchOptions.RunJoinedComputer(options)) return;
+                using (var manager = new Manager(options)) Application.Run(manager);
+            }
+            catch (Exception error)
+            {
+                string message = Regex.Replace(error.Message ?? "未知错误", "[\\x00-\\x1f\\x7f]+", " ");
+                if (message.Length > 600) message = message.Substring(0, 600);
+                MessageBox.Show("管理窗口异常，主机已停止。请记录错误并联系维护人员。\n\n" + message,
+                    "园区租赁 · 主机管理", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            }
+        }
+    }
+}
