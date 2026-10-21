@@ -1,0 +1,60 @@
+"use strict";
+const fs = require("node:fs");
+const path = require("node:path");
+function fail(message) {
+  const error = new Error(message);
+  error.code = "BACKUP";
+  throw error;
+}
+function sameOrInside(parent, child) {
+  const relative = path.relative(path.resolve(parent), path.resolve(child));
+  return relative === "" || (!relative.startsWith(`..${path.sep}`) && relative !== ".." && !path.isAbsolute(relative));
+}
+function assertRegularFile(file) {
+  const stat = fs.lstatSync(file);
+  if (!stat.isFile() || stat.isSymbolicLink()) fail(`不是可备份的普通文件：${file}`);
+  return stat;
+}
+function checkedFile(file, maximum = Number.MAX_SAFE_INTEGER) {
+  const stat = assertRegularFile(file);
+  if (stat.nlink !== 1 || stat.size > maximum) fail("备份记录含有硬链接或超过大小限制。");
+  return stat;
+}
+function directoryChain(directory, create) {
+  const target = path.resolve(directory);
+  const root = path.parse(target).root;
+  let current = root;
+  for (const component of ["", ...path.relative(root, target).split(path.sep).filter(Boolean)]) {
+    if (component) current = path.join(current, component);
+    if (create && !fs.existsSync(current)) fs.mkdirSync(current, { mode: 0o700 });
+    const stat = fs.lstatSync(current);
+    if (!stat.isDirectory() || stat.isSymbolicLink()) fail("备份目录不能含有链接或特殊文件。");
+  }
+  return target;
+}
+const ensureDirectory = directory => directoryChain(directory, true);
+const assertDirectory = directory => directoryChain(directory, false);
+function writeFile(file, bytes) {
+  const handle = fs.openSync(file, "wx", 0o600);
+  try { fs.writeFileSync(handle, bytes); fs.fsyncSync(handle); }
+  finally { fs.closeSync(handle); }
+}
+function writeDurableJSON(file, value) {
+  writeFile(file, `${JSON.stringify(value, null, 2)}\n`);
+}
+function backupIoMessage(error) {
+  if (error.code === "ERR_SQLITE_ERROR" && Number.isInteger(error.errcode)) {
+    const code = error.errcode & 0xff;
+    if (code === 13) return "备份时磁盘空间不足，请负责人检查主机数据盘和备份盘，保留现有资料。";
+    if (code === 8 || code === 14) return "备份文件无法写入或打开，请负责人检查主机数据盘、备份位置和只读权限。";
+    if (code === 10) return "备份时发生磁盘读写错误，请检查连接并保留现有资料。";
+    if (code === 5 || code === 6) return "账本或备份文件正被占用，备份未完成，请稍后重试。";
+  }
+  if (["ENOENT", "ENOTDIR", "EEXIST"].includes(error.code)) return "备份目录找不到、不可访问或已不是文件夹，请负责人检查备份位置。";
+  if (error.code === "ENOSPC") return "备份盘空间不足，请负责人腾出空间或更换备份位置。";
+  if (["EACCES", "EPERM", "EROFS"].includes(error.code)) return "无法访问备份目录，请负责人检查权限和备份盘的只读状态。";
+  if (["EIO", "ENXIO", "ENODEV"].includes(error.code)) return "备份盘读写失败或连接已中断，请检查磁盘并保留现有备份。";
+  if (error.code === "ENAMETOOLONG") return "备份文件地址太长，请负责人检查主机备份目录位置。";
+  return null;
+}
+module.exports = { sameOrInside, assertRegularFile, checkedFile, ensureDirectory, assertDirectory, writeFile, writeDurableJSON, backupIoMessage };

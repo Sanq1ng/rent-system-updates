@@ -1,0 +1,37 @@
+﻿param()
+$ErrorActionPreference = 'Stop'
+Import-Module -Name (Join-Path $PSHOME 'Modules\Microsoft.PowerShell.Utility') -ErrorAction Stop
+$compiler = Join-Path $env:SystemRoot 'Microsoft.NET\Framework64\v4.0.30319\csc.exe'
+if (-not (Test-Path -LiteralPath $compiler -PathType Leaf)) {
+    throw '需要维护开发机的 .NET Framework 4.8 x64 C# 编译器；不下载新工具包，部署电脑无需编译。'
+}
+$sources = @('Safety.cs', 'Protocol.cs', 'Certificates.cs', 'Firewall.cs', 'OfficeNetwork.cs', 'TrustClient.cs', 'CoreBridge.cs',
+    'HostWorkflow.cs', 'Forms.cs', 'InvitationPacket.cs', 'InvitationForm.cs', 'Programs.cs', 'app.manifest', 'build.ps1', 'artifact.cjs', 'README.md')
+$executables = [ordered]@{ '局域网配置.exe' = 'RentLan.HostProgram'; '员工电脑接入.exe' = 'RentLan.ClientProgram' }
+$references = @('/reference:System.dll', '/reference:System.Core.dll', '/reference:System.Security.dll',
+    '/reference:System.Drawing.dll', '/reference:System.Windows.Forms.dll', '/reference:System.Web.Extensions.dll',
+    '/reference:Microsoft.CSharp.dll', '/reference:System.Management.dll')
+$hashes = [ordered]@{}
+foreach ($source in $sources) { $hashes[$source] = (Get-FileHash -LiteralPath (Join-Path $PSScriptRoot $source) -Algorithm SHA256).Hash.ToLowerInvariant() }
+foreach ($name in $executables.Keys) {
+    $arguments = @('/nologo', '/target:winexe', '/platform:x64', '/optimize+', '/codepage:65001',
+        ('/main:' + $executables[$name]), ('/out:' + (Join-Path $PSScriptRoot $name)),
+        ('/win32manifest:' + (Join-Path $PSScriptRoot 'app.manifest'))) + $references +
+        @($sources | Where-Object { $_.EndsWith('.cs') } | ForEach-Object { Join-Path $PSScriptRoot $_ })
+    & $compiler @arguments
+    if ($LASTEXITCODE -ne 0) { throw ('编译失败，未更新构建清单，不得用旧程序交付：' + $name) }
+}
+foreach ($source in $sources) {
+    if ($hashes[$source] -ne (Get-FileHash -LiteralPath (Join-Path $PSScriptRoot $source) -Algorithm SHA256).Hash.ToLowerInvariant()) {
+        throw ('构建期间源码改变，未更新清单：' + $source)
+    }
+}
+$exeHashes = [ordered]@{}
+foreach ($name in $executables.Keys) { $exeHashes[$name] = (Get-FileHash -LiteralPath (Join-Path $PSScriptRoot $name) -Algorithm SHA256).Hash.ToLowerInvariant() }
+$record = [ordered]@{
+    format = 'industrial-rent-lan-windows'; formatVersion = 1; protocolVersion = 1
+    applicationVersion = '0.4.16'; framework = 'net48'; architecture = 'x64'
+    executableSha256 = $exeHashes; sourceSha256 = $hashes
+}
+[IO.File]::WriteAllText((Join-Path $PSScriptRoot 'build.json'), ($record | ConvertTo-Json -Depth 5) + "`r`n", (New-Object Text.UTF8Encoding($false)))
+Write-Host '已构建两款自包含 .NET 4.8 x64 无控制台 GUI，并记录源码与 EXE SHA-256；未改动证书库、防火墙、注册表或用户入口。'

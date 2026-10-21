@@ -1,0 +1,526 @@
+using System;
+using System.Collections.Generic;
+using System.Diagnostics;
+using System.Drawing;
+using System.IO;
+using System.Linq;
+using System.Net;
+using System.Threading;
+using System.Threading.Tasks;
+using System.Windows.Forms;
+using Microsoft.Web.WebView2.Core;
+using Microsoft.Web.WebView2.WinForms;
+using RentLan;
+
+namespace RentCentre.Client
+{
+    internal sealed class ClientWindow : Form
+    {
+        private readonly Options options;
+        private readonly ClientState state;
+        private readonly WindowsNotices notices;
+        private WebView2 browser = new WebView2 { Dock = DockStyle.Fill, Visible = false };
+        private readonly Label status = new Label { Dock = DockStyle.Fill, Height = 32, Padding = new Padding(10, 7, 10, 0), Text = "正在打开……" };
+        private readonly Button update = new Button { Dock = DockStyle.Right, Width = 140, Text = "更新软件", Visible = false };
+        private readonly Button recover = new Button { Dock = DockStyle.Right, Width = 140, Text = "恢复业务窗口", Visible = false };
+        private readonly ClientUpdates clientUpdates;
+        private readonly Func<PairingSession, Offer[]> discover;
+        private bool discovering, joining, discoveryStarted;
+        private bool checkingUpdate;
+        private DateTime nextUpdate = DateTime.MinValue;
+        private Dictionary<string, object> readyUpdate;
+        private readonly Panel onboarding = new Panel { Dock = DockStyle.Fill, Padding = new Padding(36) };
+        private readonly ListBox hosts = new ListBox { Dock = DockStyle.Top, Height = 130 };
+        private readonly Label pairingCode = new Label { Dock = DockStyle.Top, Height = 100, TextAlign = ContentAlignment.MiddleCenter };
+        private readonly Button search = new Button { Text = "搜索公司主机", AutoSize = true };
+        private readonly Button connect = new Button { Text = "加入所选公司", AutoSize = true, Enabled = false };
+        private readonly NotifyIcon tray = new NotifyIcon { Icon = SystemIcons.Application, Text = "园区租赁", Visible = true };
+        private readonly System.Windows.Forms.Timer pollTimer = new System.Windows.Forms.Timer { Interval = 15000 };
+        private readonly CancellationTokenSource cancellation = new CancellationTokenSource();
+        private PairingSession pairing;
+        private bool startingBrowser, browserReady, polling, exitPending, canExit;
+        private bool browserFailed, browserUnresponsive;
+        private bool resourcesDisposed;
+        private string notificationStatus = "登录后接收 Windows 通知。", lastErrorType = "", notificationFailure;
+        private NoticeTarget pendingTarget;
+        private int bindingGeneration;
+        private bool exitRequestIds, legacyExitOutstanding;
+        private string exitRequestId;
+        private TaskCompletionSource<bool> exitReply;
+        internal ClientWindow(Options options, ClientState state, WindowsNotices notices, Func<PairingSession, Offer[]> discover = null)
+        {
+            this.options = options; this.state = state; this.notices = notices;
+            this.discover = discover ?? (session => session.Discover());
+            clientUpdates = new ClientUpdates(options.Isolated);
+            Text = "园区租赁"; Font = new Font("Microsoft YaHei UI", 10);
+            StartPosition = FormStartPosition.CenterScreen; Size = new Size(1180, 790); MinimumSize = new Size(850, 600);
+            var footer = new Panel { Dock = DockStyle.Bottom, Height = 36 };
+            footer.Controls.Add(status); footer.Controls.Add(update); footer.Controls.Add(recover);
+            Controls.Add(browser); Controls.Add(onboarding); Controls.Add(footer);
+            var heading = new Label { Dock = DockStyle.Top, Height = 80, Text = "加入公司\r\n\r\n先连上公司的 Wi-Fi，或插好公司的网线。", AutoSize = false };
+            var actions = new FlowLayoutPanel { Dock = DockStyle.Top, AutoSize = true, Padding = new Padding(0, 16, 0, 16) };
+            actions.Controls.Add(search); actions.Controls.Add(connect);
+            onboarding.Controls.Add(pairingCode); onboarding.Controls.Add(actions); onboarding.Controls.Add(hosts); onboarding.Controls.Add(heading);
+            var menu = new ContextMenuStrip();
+            menu.Items.Add("打开园区租赁", null, (sender, e) => OpenTarget(null));
+            menu.Items.Add("测试 Windows 通知", null, (sender, e) => TestNotice());
+            menu.Items.Add("导出故障信息", null, (sender, e) => ExportSupport());
+            menu.Items.Add("退出软件", null, async (sender, e) => await ExitSafely());
+            tray.ContextMenuStrip = menu; tray.DoubleClick += (sender, e) => OpenTarget(null);
+            search.Click += async (sender, e) => await Search();
+            connect.Click += async (sender, e) => await Join();
+            hosts.SelectedIndexChanged += (sender, e) => connect.Enabled =
+                hosts.SelectedItem is Offer && !discovering && !joining && state.Company == null;
+            update.Click += async (sender, e) => await ApplyDownloadedUpdate();
+            recover.Click += async (sender, e) => {
+                try { await StartBrowser(null); } catch (Exception error) { Fail(error); }
+            };
+            pollTimer.Tick += async (sender, e) => {
+                await Poll();
+                if (clientUpdates.Enabled && state.Company != null && !checkingUpdate && DateTime.UtcNow >= nextUpdate) await CheckUpdate();
+            };
+            Shown += async (sender, e) => {
+                try {
+                    if (options.Origin != null) {
+                        if (state.Company == null) state.SetCompany(await Task.Run(() => ClientHttp.CheckLocalCompany(options.Origin)));
+                        else if (state.Company.origin != options.Origin) throw new IOException("主机地址与已保存的公司不同，请先保护原草稿并由负责人迁移。");
+                    }
+                    if (options.Background) Hide();
+                    else if (state.Company != null) await StartBrowser(null);
+                    else if (options.Isolated) SetStatus("隔离测试不修改同网连接。", null);
+                    else await Search();
+                    if (IsDisposed) return;
+                    pollTimer.Start(); await Poll();
+                } catch (Exception error) { Fail(error); }
+            };
+        }
+        internal void SetStatus(string text, Exception error)
+        {
+            status.Text = text;
+            if (error != null) lastErrorType = error.GetType().Name;
+        }
+        private void Fail(Exception error)
+        {
+            SetStatus(Program.Safe(error.Message), error);
+            if (Visible) MessageBox.Show(this, Program.Safe(error.Message), "园区租赁", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+        }
+        internal static string NavigationFailure(CoreWebView2WebErrorStatus kind)
+        {
+            if (kind == CoreWebView2WebErrorStatus.OperationCanceled) return null;
+            if (new[] { CoreWebView2WebErrorStatus.CertificateCommonNameIsIncorrect, CoreWebView2WebErrorStatus.CertificateExpired,
+                CoreWebView2WebErrorStatus.ClientCertificateContainsErrors, CoreWebView2WebErrorStatus.CertificateRevoked,
+                CoreWebView2WebErrorStatus.CertificateIsInvalid }.Contains(kind))
+                return "公司连接证书无法通过检查。请联系负责人，不要忽略此错误。";
+            if (new[] { CoreWebView2WebErrorStatus.ServerUnreachable, CoreWebView2WebErrorStatus.Timeout,
+                CoreWebView2WebErrorStatus.ConnectionAborted, CoreWebView2WebErrorStatus.ConnectionReset,
+                CoreWebView2WebErrorStatus.Disconnected, CoreWebView2WebErrorStatus.CannotConnect,
+                CoreWebView2WebErrorStatus.HostNameNotResolved }.Contains(kind))
+                return "暂时打不开公司系统。先看看保管账本的电脑是否开着，再检查公司网络。";
+            return "公司页面暂时打不开，请重试。一直不行的话，请联系负责人。";
+        }
+        private async Task Search()
+        {
+            if (resourcesDisposed || discovering || joining || state.Company != null) return;
+            if (options.Isolated) { Fail(new IOException("隔离测试不修改同网连接。")); return; }
+            discovering = discoveryStarted = true;
+            search.Enabled = connect.Enabled = hosts.Enabled = false; hosts.Items.Clear(); pairingCode.Text = "";
+            try {
+                if (pairing != null) pairing.Dispose();
+                pairing = new PairingSession(cancellation.Token);
+                SetStatus("正在找公司主机……", null);
+                var session = pairing;
+                Offer[] found = await Task.Run(() => discover(session));
+                if (IsDisposed || resourcesDisposed) return;
+                hosts.Items.AddRange(found); if (found.Length == 1) hosts.SelectedIndex = 0;
+                SetStatus(found.Length == 0 ? "没找到主机。请确认主机已开机，并已开启“让同事连接”，再重新搜索。" :
+                    found.Length == 1 ? "找到主机了，点“加入所选公司”继续。" :
+                    "找到了多台，请让负责人确认选哪一台。", null);
+            } catch (OperationCanceledException) { if (!resourcesDisposed) SetStatus("已取消搜索。", null); }
+            catch (Exception error) { if (!resourcesDisposed) Fail(error); }
+            finally {
+                discovering = false;
+                if (!IsDisposed && !resourcesDisposed) {
+                    search.Text = "重新搜索公司主机";
+                    search.Enabled = hosts.Enabled = true; connect.Enabled = hosts.SelectedItem is Offer && state.Company == null;
+                }
+            }
+        }
+        private async Task Join()
+        {
+            var selected = hosts.SelectedItem as Offer;
+            if (resourcesDisposed || discovering || joining || state.Company != null || selected == null || pairing == null) return;
+            joining = true;
+            search.Enabled = connect.Enabled = false; hosts.Enabled = false;
+            try {
+                await EnsureRuntime();
+                await Task.Run(() => pairing.Begin(selected));
+                pairingCode.Font = new Font(Font.FontFamily, 22, FontStyle.Bold);
+                pairingCode.Text = pairing.Code.Substring(0, 4) + "  " + pairing.Code.Substring(4);
+                SetStatus("请负责人在“系统管理 → 连接同事电脑”核对配对码并同意。", null);
+                string address = await Task.Run(() => pairing.AwaitApproval());
+                if (MessageBox.Show(this, "负责人已同意。两边显示的配对码是否都是 " + pairing.Code + "？\r\n\r\n确认后，将为当前 Windows 用户信任这家公司的连接证书。",
+                    "核对配对码", MessageBoxButtons.YesNo, MessageBoxIcon.Question, MessageBoxDefaultButton.Button2) != DialogResult.Yes) {
+                    SetStatus("已取消，未添加证书。", null); return;
+                }
+                var receipt = new TrustReceipt { ownerSid = Product.Sid, caSha256 = pairing.Connection.caSha256 };
+                Trust.Add(new CurrentUserTrustStore(action => action()), pairing.Connection, receipt, Product.Sid, true, () => state.SaveTrust(receipt));
+                await Task.Run(() => new PinnedBootstrapProbe().Check(pairing.Connection));
+                state.SetCompany(new SavedCompany { origin = pairing.Connection.origin, serverId = pairing.Connection.serverId, connection = pairing.Connection });
+                await StartBrowser(address);
+            } catch (OperationCanceledException) { SetStatus("已取消配对。", null); }
+            catch (Exception error) { Fail(error); }
+            finally {
+                joining = false;
+                if (!IsDisposed) { search.Enabled = true; hosts.Enabled = true; connect.Enabled = hosts.SelectedItem is Offer && state.Company == null; }
+            }
+        }
+        private bool Allowed(string address, bool allowBlob = false)
+        {
+            if (state.Company == null || String.IsNullOrWhiteSpace(address)) return false;
+            if (allowBlob && address.StartsWith("blob:" + state.Company.origin + "/", StringComparison.Ordinal)) return true;
+            Uri uri;
+            return Uri.TryCreate(address, UriKind.Absolute, out uri) && uri.UserInfo.Length == 0 &&
+                uri.GetLeftPart(UriPartial.Authority) == state.Company.origin &&
+                (uri.Scheme == "http" || uri.Scheme == "https");
+        }
+        private async Task StartBrowser(string address)
+        {
+            if (state.Company == null || startingBrowser) return;
+            if (browser.CoreWebView2 != null && !browserFailed) {
+                if (address != null && Allowed(address)) browser.CoreWebView2.Navigate(address);
+                return;
+            }
+            startingBrowser = true;
+            bool navigated = false;
+            try {
+                if (browserFailed) {
+                    Show(); Activate();
+                    if (browserUnresponsive && MessageBox.Show(this,
+                        "业务窗口暂时没有响应。恢复将重新打开页面，尚未保存的输入可能丢失。\r\n\r\n现在恢复？",
+                        "恢复业务窗口", MessageBoxButtons.YesNo, MessageBoxIcon.Warning) != DialogResult.Yes) return;
+                    int index = Controls.GetChildIndex(browser);
+                    Controls.Remove(browser); browser.Dispose();
+                    browser = new WebView2 { Dock = DockStyle.Fill, Visible = false };
+                    Controls.Add(browser); Controls.SetChildIndex(browser, index);
+                    browserFailed = browserUnresponsive = false;
+                }
+                await EnsureRuntime();
+                var environment = await CoreWebView2Environment.CreateAsync(null, state.ProfileDirectory);
+                await browser.EnsureCoreWebView2Async(environment);
+                var core = browser.CoreWebView2;
+                core.Settings.UserAgent += " RentWindows/1";
+                core.Settings.AreDevToolsEnabled = false;
+                core.Settings.AreBrowserAcceleratorKeysEnabled = false;
+                core.Settings.IsPasswordAutosaveEnabled = false;
+                core.Settings.IsGeneralAutofillEnabled = false;
+                core.Settings.AreHostObjectsAllowed = false;
+                core.Settings.AreDefaultContextMenusEnabled = false;
+                core.Settings.IsStatusBarEnabled = false;
+                core.NavigationStarting += (sender, e) => {
+                    if (!Allowed(e.Uri)) { e.Cancel = true; SetStatus("已阻止打开公司系统以外的地址。", null); }
+                    else if (exitPending) { e.Cancel = true; SetStatus("正在确认保存，请稍后再打开页面。", null); }
+                };
+                core.ContentLoading += (sender, e) => {
+                    if (!Object.ReferenceEquals(browser.CoreWebView2, core)) return;
+                    browserReady = exitRequestIds = legacyExitOutstanding = false;
+                    if (exitReply != null) exitReply.TrySetResult(false);
+                };
+                core.FrameNavigationStarting += (sender, e) => {
+                    if (e.Uri != "about:blank" && !Allowed(e.Uri, true)) e.Cancel = true;
+                };
+                core.ServerCertificateErrorDetected += (sender, e) => {
+                    e.Action = CoreWebView2ServerCertificateErrorAction.Cancel;
+                    SetStatus("公司连接证书无效。请联系负责人，不能忽略此错误。", null);
+                };
+                core.PermissionRequested += (sender, e) => {
+                    e.State = CoreWebView2PermissionState.Deny;
+                    e.Handled = true;
+                };
+                core.WebMessageReceived += OnMessage;
+                core.NavigationCompleted += (sender, e) => {
+                    if (!e.IsSuccess) {
+                        string message = NavigationFailure(e.WebErrorStatus);
+                        if (message != null) SetStatus(message, null);
+                    }
+                    else SetStatus(notificationStatus, null);
+                };
+                core.ProcessFailed += (sender, e) => {
+                    if (!Object.ReferenceEquals(browser.CoreWebView2, core) ||
+                        (e.ProcessFailedKind != CoreWebView2ProcessFailedKind.BrowserProcessExited &&
+                         e.ProcessFailedKind != CoreWebView2ProcessFailedKind.RenderProcessExited &&
+                         e.ProcessFailedKind != CoreWebView2ProcessFailedKind.RenderProcessUnresponsive)) return;
+                    browserFailed = true;
+                    browserUnresponsive = e.ProcessFailedKind == CoreWebView2ProcessFailedKind.RenderProcessUnresponsive;
+                    browserReady = false;
+                    recover.Visible = true;
+                    if (exitReply != null) exitReply.TrySetResult(false);
+                    SetStatus("业务窗口异常，请点“恢复业务窗口”；未保存的输入可能丢失。", null);
+                };
+                core.NewWindowRequested += (sender, e) => {
+                    e.Handled = true;
+                    SetStatus("请在原件预览中查看或下载文件。", null);
+                };
+                core.DownloadStarting += (sender, e) => {
+                    if (!Allowed(e.DownloadOperation.Uri, true)) { e.Cancel = true; return; }
+                    string file = Path.GetFileName(e.ResultFilePath);
+                    if (String.IsNullOrWhiteSpace(file) || file.Length > 120) file = "园区租赁导出文件";
+                    using (var dialog = new SaveFileDialog { FileName = file, OverwritePrompt = true, RestoreDirectory = true }) {
+                        if (dialog.ShowDialog(this) != DialogResult.OK) { e.Cancel = true; return; }
+                        e.ResultFilePath = dialog.FileName; e.Handled = true;
+                    }
+                };
+                onboarding.Visible = false; browser.Visible = true;
+                recover.Visible = false;
+                core.Navigate(address ?? state.Company.origin + "/");
+                navigated = true;
+            } catch (WebView2RuntimeNotFoundException error) {
+                throw new IOException("微软显示组件尚不可用。请重新打开软件重试，不需要覆盖安装或删除资料。", error);
+            } finally {
+                if (!navigated) { browserFailed = true; recover.Visible = true; }
+                startingBrowser = false;
+            }
+        }
+        private async Task EnsureRuntime()
+        {
+            if (RuntimeSetup.Available()) return;
+            if (options.Isolated) throw new IOException("隔离测试缺少 WebView2，未安装系统组件。");
+            if (MessageBox.Show(this, "打开业务界面需要微软显示组件。\r\n\r\n现在联网下载并安装？",
+                "安装显示组件", MessageBoxButtons.YesNo, MessageBoxIcon.Information) != DialogResult.Yes)
+                throw new IOException("显示组件尚未安装，请重新打开软件继续安装。");
+            await RuntimeSetup.Install(state.Root, cancellation.Token, text => {
+                if (!IsDisposed && IsHandleCreated) BeginInvoke((MethodInvoker)(() => SetStatus(text, null)));
+            });
+        }
+        private void Send(object message)
+        {
+            if (browser.CoreWebView2 != null && Allowed(browser.CoreWebView2.Source))
+                browser.CoreWebView2.PostWebMessageAsJson(Json.Encode(message));
+        }
+        private void NoticeStatus(string text, Exception error = null)
+        {
+            notificationStatus = text; SetStatus(text, error);
+            Send(new { protocol = 1, kind = "notification-status", text });
+        }
+        private async void OnMessage(object sender, CoreWebView2WebMessageReceivedEventArgs e)
+        {
+            if (!Object.ReferenceEquals(sender, browser.CoreWebView2) || !Allowed(e.Source)) return;
+            try {
+                var value = Json.Object(e.WebMessageAsJson);
+                if (Json.Integer(value, "protocol") != 1) throw new IOException("电脑端消息版本不兼容。");
+                string kind = Json.String(value, "kind");
+                if (kind == "hello") {
+                    if (!browserReady) exitRequestIds = value.ContainsKey("exitRequestIds") && Json.Boolean(value, "exitRequestIds");
+                    browserReady = true;
+                    Send(new { protocol = 1, kind = "configuration", installationId = state.InstallationId });
+                    Send(new { protocol = 1, kind = "notification-status", text = notificationStatus });
+                    SendTarget();
+                } else if (kind == "notification-account") {
+                    var binding = new NoticeBinding { serverId = Json.String(value, "serverId"), userId = Json.String(value, "userId"),
+                        deviceId = Json.String(value, "id"), token = Json.String(value, "token"), expiresAt = (long)value["expiresAt"] };
+                    binding.Validate(state.Company);
+                    bindingGeneration++;
+                    if (state.Binding != null && state.Binding.userId == binding.userId && state.Binding.serverId == binding.serverId)
+                        binding.seen = state.Binding.seen;
+                    else {
+                        notificationFailure = null;
+                        if (!options.Isolated) notices.Clear();
+                    }
+                    state.SetBinding(binding); NoticeStatus(notificationFailure ?? "Windows 后台提醒已开启。");
+                    await Poll();
+                } else if (kind == "notification-clear") {
+                    bindingGeneration++; state.SetBinding(null);
+                    notificationFailure = null;
+                    if (!options.Isolated) notices.Clear();
+                    NoticeStatus("当前账号未开启 Windows 提醒。");
+                } else if (kind == "notification-test") TestNotice();
+                else if (kind == "support-export") ExportSupport();
+                else if (kind == "exit-ready") {
+                    if (exitRequestId != null) {
+                        if (exitReply == null || !value.ContainsKey("requestId") || Json.String(value, "requestId") != exitRequestId) return;
+                    } else if (!legacyExitOutstanding || value.ContainsKey("requestId")) return;
+                    bool ready = Json.Boolean(value, "ready");
+                    legacyExitOutstanding = false;
+                    if (exitReply == null) {
+                        NoticeStatus("上次保存确认已收到，请重新退出或更新。");
+                        return;
+                    }
+                    if (!ready) NoticeStatus(value.ContainsKey("reason") ? Json.String(value, "reason") : "请先保存当前工作。");
+                    exitReply.TrySetResult(ready);
+                }
+            } catch (Exception error) { NoticeStatus("电脑端操作未完成：" + Program.Safe(error.Message), error); }
+        }
+        private async Task Poll()
+        {
+            if (polling || state.Company == null || state.Binding == null || IsDisposed) return;
+            polling = true;
+            var binding = state.Binding; var company = state.Company; int generation = bindingGeneration;
+            try {
+                string body = await Task.Run(() => ClientHttp.Get(company, "/api/desktop/notifications", binding.token, 2097152));
+                if (IsDisposed || generation != bindingGeneration || state.Binding != binding) return;
+                var items = NoticePoll.Validate(body, company, binding);
+                if (items.Count == 0) { NoticeStatus(notificationFailure ?? "Windows 后台提醒已开启。"); return; }
+                if (options.Isolated) { NoticeStatus("隔离运行：收到提醒，未注册或发送 Windows 通知。"); return; }
+                if (items.Count > 3) notices.Show(String.Join("|", items.Select(item => Json.String(item, "id"))),
+                    "园区租赁 · 待办提醒", "有 " + items.Count + " 项未读提醒，点击查看。", new NoticeTarget { kind = "notifications" });
+                else foreach (var item in items) notices.Show(Json.String(item, "id"), "园区租赁 · 待办提醒",
+                    "有待处理事项，点击查看。", Json.Decode<NoticeTarget>(Json.Encode(item["target"])));
+                notificationFailure = null;
+                binding.seen = binding.seen.Concat(items.Select(item => Json.String(item, "id"))).Distinct().Reverse().Take(3000).Reverse().ToArray();
+                state.SetBinding(binding); NoticeStatus("Windows 后台提醒已开启。");
+            } catch (WebException error) {
+                var response = error.Response as HttpWebResponse;
+                bool revoked = response != null && response.StatusCode == HttpStatusCode.Unauthorized;
+                bool responded = response != null;
+                bool secureFailure = error.Status == WebExceptionStatus.TrustFailure || error.Status == WebExceptionStatus.SecureChannelFailure;
+                if (response != null) response.Dispose();
+                if (generation == bindingGeneration && state.Binding == binding) {
+                    if (revoked) {
+                        bindingGeneration++; state.SetBinding(null);
+                        notificationFailure = null;
+                        if (!options.Isolated) notices.Clear();
+                        NoticeStatus("提醒授权已失效，请重新登录。", error);
+                    } else NoticeStatus(secureFailure ? "提醒的安全连接没通过检查，请联系负责人。" :
+                        responded ? "主机暂时没能提供提醒，请稍后重试。" :
+                        "暂时连不上保管账本的电脑。先检查它是否开着、是否连着公司网络。连上后会继续接收提醒。", error);
+                }
+            } catch (Exception error) {
+                if (generation == bindingGeneration) {
+                    notificationFailure = "Windows 提醒未就绪：" + Program.Safe(error.Message);
+                    NoticeStatus(notificationFailure, error);
+                }
+            } finally { polling = false; }
+        }
+        private void TestNotice()
+        {
+            try {
+                if (options.Isolated) throw new IOException("隔离运行不会注册 Windows 通知。");
+                if (state.Binding == null) throw new IOException("请先登录并打开本人提醒开关。");
+                string result = notices.Show("test-" + Guid.NewGuid().ToString("N"), "园区租赁 · 测试通知",
+                    "通知连接正常，点击返回软件。", new NoticeTarget { kind = "notifications" });
+                notificationFailure = null;
+                NoticeStatus(result);
+            } catch (Exception error) {
+                notificationFailure = "Windows 通知未能发送：" + Program.Safe(error.Message);
+                NoticeStatus(notificationFailure, error);
+                if (Visible) MessageBox.Show(this, notificationFailure, "园区租赁", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+            }
+        }
+        internal async void OpenTarget(NoticeTarget target)
+        {
+            try {
+                if (target != null) { target.Validate(); pendingTarget = target; }
+                Show(); WindowState = FormWindowState.Normal; Activate();
+                if (!exitPending && state.Company != null) await StartBrowser(null);
+                else if (!exitPending && !options.Isolated && !discoveryStarted) await Search();
+                SendTarget();
+            } catch (Exception error) { Fail(error); }
+        }
+        private void SendTarget()
+        {
+            if (exitPending || !browserReady || pendingTarget == null) return;
+            Send(new { protocol = 1, kind = "open", target = pendingTarget }); pendingTarget = null;
+        }
+        private async Task ExitSafely()
+        {
+            if (exitPending) return;
+            exitPending = true;
+            browser.Enabled = false;
+            try {
+                if (!await ConfirmSavedWork()) { Show(); Activate(); return; }
+                canExit = true; Close();
+            } catch (Exception error) { Fail(error); }
+            finally { exitPending = false; if (!IsDisposed) { browser.Enabled = true; SendTarget(); } }
+        }
+        internal Task ExitForUpdate() { return ExitSafely(); }
+        private async Task<bool> ConfirmSavedWork()
+        {
+            if (browserFailed) {
+                await StartBrowser(null);
+                SetStatus("业务窗口已尝试重新打开，请核对草稿并保存后再退出或更新。", null);
+                return false;
+            }
+            if (browser.CoreWebView2 != null && !browserReady) throw new IOException("业务窗口尚未就绪。请先确认草稿已保存。");
+            if (!browserReady) return true;
+            if (exitReply != null) throw new IOException("正在确认草稿保存，请稍后重试。");
+            if (legacyExitOutstanding) throw new IOException("上一轮保存尚未确认，请等待完成后再退出或更新。");
+            var reply = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+            exitReply = reply;
+            exitRequestId = exitRequestIds ? Guid.NewGuid().ToString("D") : null;
+            try {
+                if (exitRequestIds) Send(new { protocol = 1, kind = "prepare-exit", requestId = exitRequestId });
+                else {
+                    legacyExitOutstanding = true;
+                    Send(new { protocol = 1, kind = "prepare-exit" });
+                }
+                if (await Task.WhenAny(reply.Task, Task.Delay(15000)) != reply.Task)
+                    throw new IOException("没有收到草稿保存确认，窗口仍保留。请先回到业务页面。");
+                return await reply.Task;
+            } finally {
+                if (Object.ReferenceEquals(exitReply, reply)) { exitReply = null; exitRequestId = null; }
+            }
+        }
+        private async Task CheckUpdate()
+        {
+            checkingUpdate = true; nextUpdate = DateTime.UtcNow.AddMinutes(5);
+            try {
+                var result = await clientUpdates.Check(state.Company);
+                if (IsDisposed) return;
+                if (Json.Boolean(result, "ready")) {
+                    readyUpdate = result; update.Visible = true;
+                    update.Text = "更新到 " + Json.String(result, "version");
+                    SetStatus("软件更新已下载。请完成当前工作后点更新。", null);
+                    if (!Visible) await ApplyDownloadedUpdate();
+                }
+            } catch (Exception error) { if (!IsDisposed) SetStatus("软件更新未就绪：" + Program.Safe(error.Message), error); }
+            finally { checkingUpdate = false; }
+        }
+        private async Task ApplyDownloadedUpdate()
+        {
+            if (readyUpdate == null || exitPending) return;
+            exitPending = true; browser.Enabled = false; update.Enabled = false;
+            try {
+                if (!await ConfirmSavedWork()) { Show(); Activate(); return; }
+                await clientUpdates.Launch(readyUpdate);
+                canExit = true; Close();
+            } catch (Exception error) { Fail(error); }
+            finally { exitPending = false; if (!IsDisposed) { browser.Enabled = true; update.Enabled = true; SendTarget(); } }
+        }
+        private void ExportSupport()
+        {
+            try {
+                using (var dialog = new SaveFileDialog { FileName = "园区租赁故障信息-" + DateTime.Now.ToString("yyyyMMdd-HHmm") + ".json",
+                    Filter = "故障信息 (*.json)|*.json", RestoreDirectory = true }) {
+                    if (dialog.ShowDialog(this) != DialogResult.OK) return;
+                    string body = Json.Encode(new { format = "industrial-rent-client-support", formatVersion = 1,
+                        applicationVersion = System.Reflection.Assembly.GetExecutingAssembly().GetName().Version.ToString(3),
+                        exportedAt = DateTimeOffset.UtcNow.ToString("O"), windowsVersion = Environment.OSVersion.Version.ToString(),
+                        webViewVersion = browser.CoreWebView2 == null ? null : browser.CoreWebView2.Environment.BrowserVersionString,
+                        companyConfigured = state.Company != null, notificationsConfigured = state.Binding != null, errorType = lastErrorType,
+                        note = "不包含账号、凭证、合同、金额、账本、原件或草稿；未自动上传。" });
+                    File.WriteAllText(dialog.FileName, body, Product.Utf8);
+                    SetStatus("故障信息已导出，不含业务数据；请自行交给维护人员。", null);
+                }
+            } catch (Exception error) { Fail(error); }
+        }
+        protected override void OnFormClosing(FormClosingEventArgs e)
+        {
+            if (!canExit) {
+                e.Cancel = true;
+                if (e.CloseReason == CloseReason.WindowsShutDown) { var task = ExitSafely(); }
+                else { Hide(); SetStatus("软件已收起，后台提醒仍在运行。", null); }
+            }
+            base.OnFormClosing(e);
+        }
+        protected override void Dispose(bool disposing)
+        {
+            if (disposing && !resourcesDisposed) {
+                resourcesDisposed = true;
+                cancellation.Cancel(); pollTimer.Stop(); pollTimer.Dispose();
+                if (pairing != null) pairing.Dispose();
+                tray.Visible = false; tray.ContextMenuStrip.Dispose(); tray.Dispose();
+                browser.Dispose(); cancellation.Dispose();
+            }
+            base.Dispose(disposing);
+        }
+    }
+}

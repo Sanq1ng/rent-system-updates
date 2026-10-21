@@ -1,0 +1,229 @@
+"use strict";
+const fs = require("node:fs");
+const path = require("node:path");
+const crypto = require("node:crypto");
+const { execFile } = require("node:child_process");
+const { promisify } = require("node:util");
+const { ensureDirectory, assertDirectory, checkedFile: regularFile, writeFile, sameOrInside } = require("./backup-files.cjs");
+const { verifyBackup } = require("./backup.cjs");
+const execute = promisify(execFile);
+const TARGET_KEY = "independent_backup_target";
+const MARKER = ".rent-independent-backup.json";
+function fail(message, cause) {
+  const error = new Error(message, { cause });
+  error.code = "INDEPENDENT_BACKUP";
+  throw error;
+}
+const fingerprint = value => crypto.createHash("sha256").update(value).digest("hex");
+function diskPair(value) {
+  if (typeof value?.source?.id !== "string" || !value.source.id || typeof value?.target?.id !== "string" || !value.target.id ||
+      !Number.isInteger(value.source.number) || value.source.number < 0 || !Number.isInteger(value.target.number) || value.target.number < 0) {
+    fail("未能确认备份盘的身份。");
+  }
+  if (!["NTFS", "ReFS"].includes(value.target.fileSystem)) {
+    fail("备份盘需要使用 NTFS 或 ReFS 格式，请让负责人准备合适的盘；不要直接格式化有资料的盘。");
+  }
+  const sameDisk = value.source.number === value.target.number || value.source.id === value.target.id;
+  if (!sameDisk) {
+    // Different Windows disk numbers can still describe virtual disks or shared storage.
+    const directBuses = new Set([3, 4, 7, 10, 11, 12, 13, 17, 18, 19]);
+    if ([value.source, value.target].some(disk => !directBuses.has(disk.busType) ||
+        /virtual|vmware|vbox|qemu|xen|elastic block|persistent.?disk/i.test(disk.friendlyName || ""))) {
+      fail("当前存储类型无法自动确认物理独立，尚未启用独立备份。请让维护人员确认，或换用可确认的本地硬盘和移动硬盘。");
+    }
+  }
+  return { source: fingerprint(value.source.id), target: fingerprint(value.target.id), sameDisk };
+}
+async function probeDisks(dataDir, directory) {
+  if (process.platform !== "win32") fail("独立备份盘设置目前只支持 Windows 主机。");
+  const script = `
+$ErrorActionPreference='Stop'
+$ProgressPreference='SilentlyContinue'
+[Console]::OutputEncoding=New-Object Text.UTF8Encoding($false)
+function Device([string]$letter) {
+  $partition=Get-Partition -DriveLetter $letter
+  $disk=$partition | Get-Disk
+  if (@($disk).Count -ne 1 -or [string]::IsNullOrWhiteSpace($disk.UniqueId)) { throw 'Disk identity unavailable.' }
+  $volume=Get-Volume -DriveLetter $letter
+  return @{ id=$disk.UniqueId.Trim(); number=$disk.Number; fileSystem=$volume.FileSystemType.ToString(); busType=[int]$disk.CimInstanceProperties['BusType'].Value; friendlyName=[string]$disk.FriendlyName }
+}
+@{source=(Device $env:RENT_BACKUP_SOURCE);target=(Device $env:RENT_BACKUP_TARGET)} | ConvertTo-Json -Depth 4 -Compress
+`;
+  try {
+    const result = await execute(path.join(process.env.WINDIR, "System32", "WindowsPowerShell", "v1.0", "powershell.exe"),
+      ["-NoProfile", "-NonInteractive", "-EncodedCommand", Buffer.from(script, "utf16le").toString("base64")],
+      { windowsHide: true, timeout: 20000, maxBuffer: 32768, encoding: "utf8",
+        env: { ...process.env, RENT_BACKUP_SOURCE: path.parse(dataDir).root[0], RENT_BACKUP_TARGET: path.parse(directory).root[0] } });
+    const value = JSON.parse(result.stdout.replace(/^\uFEFF/, ""));
+    return diskPair(value);
+  } catch (error) {
+    if (error.code === "INDEPENDENT_BACKUP") throw error;
+    fail("无法确认备份盘，请确认盘已接好，再重试。", error);
+  }
+}
+async function protectNewDirectory(directory) {
+  if (process.platform !== "win32") return;
+  const script = `
+$ErrorActionPreference='Stop'
+$directory=$env:RENT_BACKUP_STAGING
+if (@([IO.Directory]::EnumerateFileSystemEntries($directory)).Count) { throw 'Staging must be empty.' }
+$sid=[Security.Principal.WindowsIdentity]::GetCurrent().User
+$acl=New-Object Security.AccessControl.DirectorySecurity
+$acl.SetOwner($sid); $acl.SetAccessRuleProtection($true,$false)
+foreach ($identity in @($sid,(New-Object Security.Principal.SecurityIdentifier('S-1-5-18')))) {
+ $acl.AddAccessRule((New-Object Security.AccessControl.FileSystemAccessRule($identity,'FullControl','ContainerInherit,ObjectInherit','None','Allow')))
+}
+[IO.Directory]::SetAccessControl($directory,$acl)
+$checked=[IO.Directory]::GetAccessControl($directory)
+if (-not $checked.AreAccessRulesProtected -or $checked.GetOwner([Security.Principal.SecurityIdentifier]).Value -ne $sid.Value) { throw 'Private staging ownership could not be confirmed.' }
+foreach ($rule in $checked.GetAccessRules($true,$true,[Security.Principal.SecurityIdentifier])) {
+ if ($rule.AccessControlType -eq 'Allow' -and $rule.IdentityReference.Value -notin @($sid.Value,'S-1-5-18')) { throw 'Private staging permissions could not be confirmed.' }
+}
+`;
+  await execute(path.join(process.env.WINDIR, "System32", "WindowsPowerShell", "v1.0", "powershell.exe"),
+    ["-NoProfile", "-NonInteractive", "-EncodedCommand", Buffer.from(script, "utf16le").toString("base64")],
+    { windowsHide: true, timeout: 20000, maxBuffer: 32768, env: { ...process.env, RENT_BACKUP_STAGING: directory } });
+}
+function createIndependentBackup({ store, config, probe = probeDisks, recordChange, programDirectory }) {
+  if (typeof recordChange !== "function") throw new TypeError("Independent backup changes require an audit callback.");
+  const dataDir = path.resolve(config.dataDir);
+  const activeProgram = path.resolve(__dirname, "..");
+  const main = require.main?.filename;
+  const stableProgram = programDirectory || (main && path.basename(main) === "host.cjs" ? path.dirname(main) : activeProgram);
+  const programs = [activeProgram, path.resolve(stableProgram)];
+  const current = () => store.get(TARGET_KEY) ? JSON.parse(store.get(TARGET_KEY)) : null;
+  const identityPath = value => process.platform === "win32" ? value.toLowerCase() : value;
+  function verifyOwner(marker, owner) {
+    try { regularFile(marker, 4096); }
+    catch (error) {
+      if (error.code === "BACKUP") fail("备份归属记录不是有效的普通文件，未继续写入。请联系负责人检查链接或记录。", error);
+      throw error;
+    }
+    let prior;
+    try { prior = JSON.parse(fs.readFileSync(marker, "utf8")); }
+    catch (error) {
+      if (error instanceof SyntaxError) fail("备份文件夹的归属记录已损坏，未继续写入，请联系负责人检查。", error);
+      throw error;
+    }
+    if (!prior || prior.format !== owner.format || prior.serverId !== owner.serverId || prior.device !== owner.device ||
+        Object.keys(prior).sort().join(",") !== "device,format,serverId") {
+      fail("备份文件夹的归属或格式不一致，未继续写入。请确认原备份盘，或选择新的文件夹。");
+    }
+  }
+  function status() {
+    const target = current();
+    const needsConfirmation = Boolean(target && target.dataDir !== identityPath(dataDir));
+    return { configured: Boolean(target), directory: target?.directory || "", version: target?.version || 0,
+      needsConfirmation,
+      lastSuccess: !needsConfirmation && store.get("independent_backup_success") ? JSON.parse(store.get("independent_backup_success")) : null,
+      pending: store.get("independent_backup_pending") === "1" };
+  }
+  function validateDirectory(value) {
+    if (typeof value !== "string" || !path.isAbsolute(value) || value.length > 190 || value.includes("\0")) {
+      fail("请填写主机上备份文件夹的完整地址。");
+    }
+    if (process.platform === "win32" && (!/^[A-Za-z]:\\/.test(value) || value.includes("/") ||
+        value.slice(3).split("\\").some(part => !part || /[<>:"|?*\x00-\x1f]/.test(part) || /[. ]$/.test(part) ||
+          /^(con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\.|$)/i.test(part)))) {
+      fail("请选择本机备份盘里的普通文件夹，不要使用网络路径或特殊名称。");
+    }
+    const directory = path.resolve(value);
+    if (process.platform === "win32" && [process.env.WINDIR, process.env.ProgramFiles, process.env["ProgramFiles(x86)"],
+      process.env.ProgramW6432].filter(Boolean).some(root => sameOrInside(root, directory))) {
+      fail("请在备份盘上新建普通文件夹，不要使用 Windows 或程序安装目录。");
+    }
+    if (directory === path.parse(directory).root || sameOrInside(dataDir, directory) || sameOrInside(directory, dataDir) ||
+        programs.some(program => sameOrInside(program, directory) || sameOrInside(directory, program)) ||
+        sameOrInside(config.backupDir, directory) || sameOrInside(directory, config.backupDir)) {
+      fail("请在另一块盘上单独建一个备份文件夹，不要选择账本、程序或盘的根目录。");
+    }
+    let existing = directory;
+    while (!fs.existsSync(existing) && path.dirname(existing) !== existing) existing = path.dirname(existing);
+    if (!fs.existsSync(existing)) fail("找不到备份盘或无法访问，请确认备份盘已接好。");
+    try { assertDirectory(existing); assertDirectory(dataDir); }
+    catch (error) {
+      if (error.code === "BACKUP") fail("备份位置不能包含链接或特殊目录，请换一个普通文件夹。", error);
+      throw error;
+    }
+    return directory;
+  }
+  async function prepare(value) {
+    const directory = validateDirectory(value);
+    const device = await probe(dataDir, directory);
+    if (!device || typeof device.source !== "string" || !device.source || typeof device.target !== "string" ||
+        !device.target || device.sameDisk || device.source === device.target) {
+      fail("这个文件夹仍在账本所在的物理硬盘上，请换另一块硬盘或移动硬盘。");
+    }
+    return { directory, device, dataDir: identityPath(dataDir) };
+  }
+  function save(candidate, expectedVersion, actorId) {
+    const old = current();
+    if (!Number.isSafeInteger(expectedVersion) || expectedVersion !== (old?.version || 0)) {
+      fail("备份位置已被修改，请重新打开系统管理后再保存。");
+    }
+    validateDirectory(candidate.directory);
+    ensureDirectory(candidate.directory);
+    const marker = path.join(candidate.directory, MARKER);
+    const owner = { format: "rent-independent-backup", serverId: store.serverId, device: candidate.device.target };
+    let markerExists;
+    try { fs.lstatSync(marker); markerExists = true; }
+    catch (error) {
+      if (error.code !== "ENOENT") throw error;
+      markerExists = false;
+    }
+    if (markerExists) verifyOwner(marker, owner);
+    else writeFile(marker, Buffer.from(JSON.stringify(owner)));
+    const target = { ...candidate, version: expectedVersion + 1, actorId };
+    store.transaction(() => {
+      store.set(TARGET_KEY, JSON.stringify(target));
+      store.set("independent_backup_pending", "1");
+      store.set("independent_backup_success", "");
+      recordChange(actorId, old, target);
+    });
+    return status();
+  }
+  async function copy(localBackup) {
+    const target = current();
+    if (!target) return null;
+    try {
+      if (target.dataDir !== identityPath(dataDir)) fail("账本位置变了，请重新设置独立备份文件夹。");
+      const actual = await prepare(target.directory);
+      if (actual.device.source !== target.device.source || actual.device.target !== target.device.target) {
+        fail("备份盘或账本所在的盘变了，请重新确认备份位置。");
+      }
+      const marker = path.join(target.directory, MARKER);
+      verifyOwner(marker, { format: "rent-independent-backup", serverId: store.serverId, device: target.device.target });
+      const verified = await verifyBackup(localBackup.path);
+      const destination = path.join(target.directory, verified.name);
+      if (fs.existsSync(destination)) fail("独立备份目标已存在，不会覆盖。");
+      const staging = destination + ".incomplete-" + crypto.randomUUID();
+      fs.mkdirSync(staging, { mode: 0o700 });
+      await protectNewDirectory(staging);
+      fs.mkdirSync(path.join(staging, "attachments"), { mode: 0o700 });
+      for (const entry of [...verified.manifest.files, { path: "manifest.json" }]) {
+        const output = path.join(staging, ...entry.path.split("/"));
+        await fs.promises.copyFile(path.join(localBackup.path, ...entry.path.split("/")), output, fs.constants.COPYFILE_EXCL);
+        const handle = fs.openSync(output, "r+");
+        try { fs.fsyncSync(handle); } finally { fs.closeSync(handle); }
+      }
+      await verifyBackup(staging);
+      const after = await prepare(target.directory);
+      if (after.device.source !== target.device.source || after.device.target !== target.device.target) fail("备份期间磁盘发生变化，副本未标记为完成。");
+      assertDirectory(target.directory);
+      assertDirectory(staging);
+      verifyOwner(marker, { format: "rent-independent-backup", serverId: store.serverId, device: target.device.target });
+      fs.renameSync(staging, destination);
+      const success = { createdAt: verified.createdAt, path: destination, bytes: verified.bytes, fileCount: verified.fileCount };
+      store.transaction(() => {
+        store.set("independent_backup_success", JSON.stringify(success));
+        store.set("independent_backup_pending", "0");
+      });
+      return success;
+    } catch (error) {
+      fail("本机备份已完成，但独立备份未完成。请检查备份盘是否接好、空间是否足够，再重试。" +
+        (error.code === "INDEPENDENT_BACKUP" ? " " + error.message : ""), error);
+    }
+  }
+  return { status, prepare, save, copy };
+}
+module.exports = { createIndependentBackup, probeDisks, diskPair };

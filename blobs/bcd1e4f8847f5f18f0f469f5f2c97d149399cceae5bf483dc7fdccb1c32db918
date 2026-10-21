@@ -1,0 +1,283 @@
+using System;
+using System.Collections.Generic;
+using System.Globalization;
+using System.IO;
+using System.Security;
+using System.Security.Cryptography;
+using System.Text;
+using System.Text.RegularExpressions;
+
+namespace RentLan
+{
+    internal sealed class InvitationException : IOException
+    {
+        internal InvitationException(string message) : base(message) { }
+    }
+
+    internal sealed class InvitationPacket
+    {
+        internal const string ApplicationVersion = "0.4.16";
+        internal const int MaximumExecutableBytes = 32 * 1024 * 1024;
+        internal const int MaximumPayloadBytes = 64 * 1024;
+        private static readonly byte[] Magic = Encoding.ASCII.GetBytes("INDUSTRIAL-RENT-INVITE-1\n");
+        private const string InvalidMessage = "这份邀请文件不完整、已损坏或内容不符合要求。请向负责人领取完整的新邀请，不要使用来源不明的文件。";
+        private const string ExpiredMessage = "这份邀请或公司的连接资料已到期。请向负责人领取新邀请，无需自行修改电脑配置。";
+
+        internal readonly Connection Connection;
+        internal readonly string Id;
+        internal readonly string Token;
+        internal readonly DateTimeOffset ExpiresAt;
+
+        private InvitationPacket(Connection connection, string id, string token, DateTimeOffset expiresAt)
+        {
+            Connection = connection; Id = id; Token = token; ExpiresAt = expiresAt;
+        }
+
+        private static InvitationException Invalid() { return new InvitationException(InvalidMessage); }
+
+        internal static InvitationPacket TryRead(string executablePath)
+        {
+            if (executablePath != null && executablePath.StartsWith(@"\\", StringComparison.Ordinal))
+                throw new InvitationException("请先把邀请文件复制到这台电脑的桌面，再双击打开。");
+            try { return Parse(Paths.Read(executablePath, MaximumExecutableBytes)); }
+            catch (InvitationException) { throw; }
+            // Paths, the JSON parser and certificate APIs may include untrusted input in errors.
+            // Never attach their exceptions to an invitation diagnostic.
+            catch (IOException) { throw Invalid(); }
+            catch (UnauthorizedAccessException) { throw Invalid(); }
+            catch (SecurityException) { throw Invalid(); }
+            catch (ArgumentException) { throw Invalid(); }
+            catch (InvalidOperationException) { throw Invalid(); }
+        }
+
+        internal static InvitationPacket Parse(byte[] executable)
+        {
+            try
+            {
+                if (executable == null || executable.Length > MaximumExecutableBytes) throw Invalid();
+                int footer = executable.Length - Magic.Length - 4 - 32 - 32;
+                if (!Matches(executable, footer, Magic))
+                {
+                    RequirePe(executable, executable.Length);
+                    return null;
+                }
+                uint size = UInt32(executable, footer + Magic.Length, executable.Length);
+                if (size == 0 || size > MaximumPayloadBytes || size > footer - 512) throw Invalid();
+                int payloadLength = (int)size, baseLength = footer - payloadLength;
+                RequirePe(executable, baseLength);
+                using (var sha = SHA256.Create())
+                {
+                    if (!Matches(executable, footer + Magic.Length + 4, sha.ComputeHash(executable, baseLength, payloadLength)) ||
+                        !Matches(executable, footer + Magic.Length + 4 + 32, sha.ComputeHash(executable, 0, baseLength)))
+                        throw new InvitationException("邀请文件的完整性检查未通过。请向负责人重新领取完整邀请，不要继续使用此文件。");
+                }
+                if (payloadLength >= 3 && executable[baseLength] == 0xef && executable[baseLength + 1] == 0xbb && executable[baseLength + 2] == 0xbf)
+                    throw Invalid();
+                var value = Json.Object(Product.Utf8.GetString(executable, baseLength, payloadLength));
+                Json.Keys(value, "format", "formatVersion", "applicationVersion", "connection", "invitation");
+                if (Json.String(value, "format") != "industrial-rent-employee-invitation" || Json.Integer(value, "formatVersion") != 1 ||
+                    Json.String(value, "applicationVersion") != ApplicationVersion)
+                    throw new InvitationException("这份邀请与当前程序版本不兼容。请向负责人领取新版邀请。");
+                var descriptor = Object(value, "connection");
+                // Preserve the strict integer check before serializing the already duplicate-checked object.
+                Json.Integer(descriptor, "formatVersion");
+                Connection connection = RentLan.Connection.Parse(Json.Encode(descriptor), true);
+                if (new Guid(connection.serverId).ToString("D") != connection.serverId) throw Invalid();
+                Time(connection.createdAt); Time(connection.expiresAt);
+                var invitation = Object(value, "invitation");
+                Json.Keys(invitation, "id", "token", "expiresAt");
+                string id = Product.Uuid(Json.String(invitation, "id")), token = Json.String(invitation, "token");
+                if (new Guid(id).ToString("D") != id) throw Invalid();
+                if (!Regex.IsMatch(token, @"\A[A-Za-z0-9_-]{43}\z", RegexOptions.CultureInvariant)) throw Invalid();
+                byte[] decoded = Convert.FromBase64String(token.Replace('-', '+').Replace('_', '/') + "=");
+                if (decoded.Length != 32 || Convert.ToBase64String(decoded).TrimEnd('=').Replace('+', '-').Replace('/', '_') != token) throw Invalid();
+                var result = new InvitationPacket(connection, id, token, Time(Json.String(invitation, "expiresAt")));
+                result.RequireCurrent();
+                return result;
+            }
+            catch (InvitationException) { throw; }
+            catch (IOException) { throw Invalid(); }
+            catch (UnauthorizedAccessException) { throw Invalid(); }
+            catch (SecurityException) { throw Invalid(); }
+            catch (CryptographicException) { throw Invalid(); }
+            catch (FormatException) { throw Invalid(); }
+            catch (ArgumentException) { throw Invalid(); }
+            catch (InvalidOperationException) { throw Invalid(); }
+        }
+
+        internal void RequireCurrent() { RequireCurrent(DateTimeOffset.UtcNow); }
+
+        internal void RequireCurrent(DateTimeOffset now)
+        {
+            try
+            {
+                DateTimeOffset connectionExpiry = RentLan.Connection.Time(Connection.expiresAt);
+                if (ExpiresAt <= now || connectionExpiry <= now) throw new InvitationException(ExpiredMessage);
+                if (ExpiresAt > connectionExpiry || ExpiresAt > now.AddDays(7))
+                    throw new InvitationException("这份邀请的有效时间不符合要求。请向负责人领取新邀请。");
+                Connection.Validate(false);
+            }
+            catch (InvitationException) { throw; }
+            catch (IOException) { throw InvalidConnection(); }
+            catch (UnauthorizedAccessException) { throw InvalidConnection(); }
+            catch (SecurityException) { throw InvalidConnection(); }
+            catch (CryptographicException) { throw InvalidConnection(); }
+            catch (FormatException) { throw InvalidConnection(); }
+            catch (ArgumentException) { throw InvalidConnection(); }
+            catch (InvalidOperationException) { throw InvalidConnection(); }
+        }
+
+        private static InvitationException InvalidConnection()
+        {
+            return new InvitationException("邀请中的公司连接资料无法安全使用。请向负责人领取新邀请，无需自行修改电脑配置。");
+        }
+
+        internal object SafeReport()
+        {
+            RequireCurrent();
+            return new {
+                status = "invitation-locally-validated", applicationVersion = ApplicationVersion,
+                invitationId = Id, expiresAt = ExpiresAt.UtcDateTime.ToString("yyyy-MM-dd'T'HH:mm:ss.fffffff'Z'", CultureInfo.InvariantCulture),
+                serverId = Connection.serverId, origin = Connection.origin, caSha256 = Connection.caSha256,
+                integrityOnly = true, publisherSignatureVerified = false, requiresAdministratorProvidedExecutable = true,
+                invitationServerStatus = "not-checked", osChanges = false, connected = false, loggedIn = false
+            };
+        }
+
+        internal string JoinAddress()
+        {
+            RequireCurrent();
+            return Connection.origin + "/#join=" + Id + "." + Token;
+        }
+
+        private static Dictionary<string, object> Object(Dictionary<string, object> parent, string key)
+        {
+            object value;
+            if (!parent.TryGetValue(key, out value) || !(value is Dictionary<string, object>)) throw Invalid();
+            return (Dictionary<string, object>)value;
+        }
+
+        private static DateTimeOffset Time(string value)
+        {
+            if (!Regex.IsMatch(value, @"\A[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\.[0-9]{1,7})?Z\z")) throw Invalid();
+            return RentLan.Connection.Time(value);
+        }
+
+        private static bool Matches(byte[] bytes, int offset, byte[] expected)
+        {
+            if (offset < 0 || offset > bytes.Length - expected.Length) return false;
+            int different = 0;
+            for (int i = 0; i < expected.Length; i++) different |= bytes[offset + i] ^ expected[i];
+            return different == 0;
+        }
+
+        private static ushort UInt16(byte[] bytes, int offset, int limit)
+        {
+            if (offset < 0 || offset > limit - 2) throw Invalid();
+            return (ushort)(bytes[offset] | bytes[offset + 1] << 8);
+        }
+
+        private static uint UInt32(byte[] bytes, int offset, int limit)
+        {
+            if (offset < 0 || offset > limit - 4) throw Invalid();
+            return (uint)bytes[offset] | (uint)bytes[offset + 1] << 8 | (uint)bytes[offset + 2] << 16 | (uint)bytes[offset + 3] << 24;
+        }
+
+        private static bool PowerOfTwo(uint value) { return value != 0 && (value & (value - 1)) == 0; }
+
+        private static void RequirePe(byte[] bytes, int limit)
+        {
+            if (limit < 512 || limit > bytes.Length || UInt16(bytes, 0, limit) != 0x5a4d) throw Invalid();
+            uint pointer = UInt32(bytes, 0x3c, limit);
+            if (pointer < 64 || pointer > limit - 24) throw Invalid();
+            int pe = (int)pointer;
+            if (UInt32(bytes, pe, limit) != 0x00004550 || UInt16(bytes, pe + 4, limit) != 0x8664) throw Invalid();
+            int count = UInt16(bytes, pe + 6, limit), optionalSize = UInt16(bytes, pe + 20, limit);
+            ushort flags = UInt16(bytes, pe + 22, limit);
+            int optional = pe + 24, sections = optional + optionalSize;
+            if (count < 1 || count > 96 || optionalSize < 112 || sections > limit - count * 40 ||
+                (flags & 2) == 0 || (flags & 0x2000) != 0 || UInt16(bytes, optional, limit) != 0x20b ||
+                UInt16(bytes, optional + 68, limit) != 2) throw Invalid();
+            uint fileAlignment = UInt32(bytes, optional + 36, limit), sectionAlignment = UInt32(bytes, optional + 32, limit);
+            uint headers = UInt32(bytes, optional + 60, limit), imageSize = UInt32(bytes, optional + 56, limit);
+            uint entry = UInt32(bytes, optional + 16, limit), directories = UInt32(bytes, optional + 108, limit);
+            if (!PowerOfTwo(fileAlignment) || fileAlignment < 512 || fileAlignment > 65536 ||
+                !PowerOfTwo(sectionAlignment) || sectionAlignment < fileAlignment || (sectionAlignment < 4096 && sectionAlignment != fileAlignment) ||
+                headers < sections + count * 40 || headers > limit || headers % fileAlignment != 0 ||
+                imageSize < headers || imageSize % sectionAlignment != 0 || directories > 16 || 112 + directories * 8 > optionalSize)
+                throw Invalid();
+            long extent = headers;
+            bool executableEntry = false;
+            var ranges = new List<Tuple<uint, uint>>();
+            for (int i = 0; i < count; i++)
+            {
+                int section = sections + i * 40;
+                uint virtualSize = UInt32(bytes, section + 8, limit), address = UInt32(bytes, section + 12, limit);
+                uint rawSize = UInt32(bytes, section + 16, limit), raw = UInt32(bytes, section + 20, limit);
+                long end = (long)raw + rawSize, virtualEnd = (long)address + Math.Max(virtualSize, rawSize);
+                if (address < headers || address % sectionAlignment != 0 || virtualEnd > imageSize) throw Invalid();
+                if (entry >= address && entry < virtualEnd && (UInt32(bytes, section + 36, limit) & 0x20000000) != 0) executableEntry = true;
+                if (rawSize == 0) continue;
+                if (raw < headers || raw % fileAlignment != 0 || rawSize % fileAlignment != 0 || end > limit) throw Invalid();
+                foreach (var range in ranges)
+                    if (raw < (long)range.Item1 + range.Item2 && end > range.Item1) throw Invalid();
+                ranges.Add(Tuple.Create(raw, rawSize));
+                extent = Math.Max(extent, end);
+            }
+            if (entry == 0 && directories > 14)
+            {
+                uint clrAddress = UInt32(bytes, optional + 112 + 14 * 8, limit);
+                uint clrSize = UInt32(bytes, optional + 112 + 14 * 8 + 4, limit);
+                if (clrSize < 72) throw Invalid();
+                int clr = Rva(bytes, sections, count, clrAddress, clrSize, limit);
+                uint clrFlags = UInt32(bytes, clr + 16, limit), entryToken = UInt32(bytes, clr + 20, limit);
+                if (UInt32(bytes, clr, limit) < 72 || UInt32(bytes, clr, limit) > clrSize ||
+                    (clrFlags & 1) == 0 || (clrFlags & 0x12) != 0 || (entryToken & 0xff000000) != 0x06000000 ||
+                    (entryToken & 0x00ffffff) == 0) throw Invalid();
+                uint metadataSize = UInt32(bytes, clr + 12, limit);
+                if (metadataSize < 16) throw Invalid();
+                int metadata = Rva(bytes, sections, count, UInt32(bytes, clr + 8, limit), metadataSize, limit);
+                if (UInt32(bytes, metadata, limit) != 0x424a5342) throw Invalid();
+            }
+            else if (!executableEntry) throw Invalid();
+            if (directories > 4)
+            {
+                uint certificate = UInt32(bytes, optional + 112 + 4 * 8, limit);
+                uint size = UInt32(bytes, optional + 112 + 4 * 8 + 4, limit);
+                if ((certificate == 0) != (size == 0)) throw Invalid();
+                if (size != 0)
+                {
+                    long aligned = (extent + 7) & ~7L, end = (long)certificate + size;
+                    if (certificate != aligned || size < 8 || size % 8 != 0 || end > limit) throw Invalid();
+                    for (long padding = extent; padding < aligned; padding++) if (bytes[(int)padding] != 0) throw Invalid();
+                    long position = certificate;
+                    while (position < end)
+                    {
+                        uint length = UInt32(bytes, (int)position, (int)end);
+                        if (length < 8 || position + length > end || UInt16(bytes, (int)position + 4, (int)end) != 0x0200 ||
+                            UInt16(bytes, (int)position + 6, (int)end) != 0x0002) throw Invalid();
+                        position += ((long)length + 7) & ~7L;
+                    }
+                    if (position != end) throw Invalid();
+                    extent = end;
+                }
+            }
+            // Unknown overlays are not bare templates, including a clipped footer or trailing bytes.
+            // An Authenticode table, if present, is only structurally checked, not authenticated.
+            if (extent != limit) throw Invalid();
+        }
+
+        private static int Rva(byte[] bytes, int sections, int count, uint address, uint size, int limit)
+        {
+            if (address == 0 || size == 0) throw Invalid();
+            for (int i = 0; i < count; i++)
+            {
+                int section = sections + i * 40;
+                uint start = UInt32(bytes, section + 12, limit), rawSize = UInt32(bytes, section + 16, limit);
+                if (address >= start && (long)address + size <= (long)start + rawSize)
+                    return (int)(UInt32(bytes, section + 20, limit) + address - start);
+            }
+            throw Invalid();
+        }
+    }
+}
