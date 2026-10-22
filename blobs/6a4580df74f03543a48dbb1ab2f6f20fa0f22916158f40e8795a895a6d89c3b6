@@ -1,0 +1,30 @@
+{
+    "format":  "industrial-rent-lan-windows",
+    "formatVersion":  1,
+    "protocolVersion":  1,
+    "applicationVersion":  "0.4.19",
+    "framework":  "net48",
+    "architecture":  "x64",
+    "executableSha256":  {
+                             "局域网配置.exe":  "500a3fb63b1494a48aebbe9536afdcc9e615fc8749cc5197034e499042957a30",
+                             "员工电脑接入.exe":  "7e33662db947b97850ded7f0231442c993f38e45312d1f648f764bcf7018171a"
+                         },
+    "sourceSha256":  {
+                         "Safety.cs":  "6ebc64453c6ea58a2ddcefdeff9e51db56b98602d420377220157b809d8977f8",
+                         "Protocol.cs":  "0c748bd3aed9d8633e1e52ed100debd273c97acc4df0ff0d2880544a00c58098",
+                         "Certificates.cs":  "1fdb454004ad35623864c3b97a6ddaa750e18780163ad1e48b159c7b98db173d",
+                         "Firewall.cs":  "45fda9cc51b370d281305fedb4e78e70b920313f9792aa8fa6f82bb6acd64ba0",
+                         "OfficeNetwork.cs":  "0959e4f83f35a2555f11515dbdc422df23ef873c0c56665a6b835d43e8b7ad8a",
+                         "TrustClient.cs":  "50e6fe60fa51f7ad44671355bb57c90ff39caa5d8d8fc8aed0c451a3d16c5476",
+                         "CoreBridge.cs":  "acfa4fe3b948c8db3e938b71a6b3093737d291072819aa696ef1c592a1afe24a",
+                         "HostWorkflow.cs":  "892b2a766ca07d77ee7bbd33e8bcadcb95f47e239024d59e27caddf24f2b0993",
+                         "Forms.cs":  "5fce6871196796f0911deaafe4d99abeb28edd2e1e39920551f367aa8ee93ef2",
+                         "InvitationPacket.cs":  "cd7221ec8bc3037afecb3184867e97286fb0ac61781e6097a7a9a64f5409f9ee",
+                         "InvitationForm.cs":  "c4f9d2e887b098638c55323245d4fd375d61f372144389dce4532461d9d9f81e",
+                         "Programs.cs":  "87424232e24dba1ef108d558cf6b229a586474d424b52eb25e9c8b196b6163a0",
+                         "app.manifest":  "674c1d398916cbe2d078134992497c5babf054583da400e6c480415223427e6d",
+                         "build.ps1":  "fab8278a84918237c1a65f955259c98794f0030873425f6dab69f47d127b7ec7",
+                         "artifact.cjs":  "139f737191e5c8aef160ed47056e29d8efa3a6e93eccb048d1721b4194c792fe",
+                         "README.md":  "0b548d29961b42e4006697af5af6bcf9150209580a7fbe5fe4d0ad9abe073ca8"
+                     }
+}
