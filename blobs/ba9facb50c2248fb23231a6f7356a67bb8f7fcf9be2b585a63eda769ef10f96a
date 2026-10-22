@@ -1,0 +1,41 @@
+(function (root, factory) {
+  "use strict";
+  if (typeof module === "object" && module.exports) module.exports = factory();
+  else root.RentDesktopUpdate = factory();
+})(globalThis, function () {
+  "use strict";
+  function create({ request, installationId, send, clock = Date.now }) {
+    let generation = 0, registered = "", refreshAt = 0, retryAt = 0, pending = null;
+    async function account(user, serverId) {
+      const key = `${serverId}:${user.id}:${user.version}`;
+      if (registered === key && refreshAt > clock() || retryAt > clock()) return;
+      if (pending) return pending;
+      const epoch = generation;
+      pending = (async () => {
+        try {
+          const installation = await installationId();
+          const grant = await request("/api/desktop/update-access", { installationId: installation });
+          if (epoch !== generation) return;
+          if (grant.available === false) {
+            registered = key; refreshAt = clock() + 5 * 60_000;
+            return;
+          }
+          if (grant.available !== true || grant.serverId !== serverId || grant.userId !== user.id ||
+              grant.installationId !== installation || !Number.isSafeInteger(grant.expiresAt) ||
+              grant.expiresAt <= clock() || grant.expiresAt > clock() + 31 * 24 * 60 * 60_000 ||
+              typeof grant.token !== "string" || !/^[A-Za-z0-9_-]{1,1536}\.[A-Za-z0-9_-]{43}$/.test(grant.token))
+            throw new Error("程序下载授权与当前公司或电脑不符，请重新登录。");
+          send({ kind: "update-access", ...grant });
+          registered = key; refreshAt = Math.max(clock() + 60_000, grant.expiresAt - 24 * 60 * 60_000); retryAt = 0;
+        } catch (error) {
+          if (epoch !== generation) return;
+          retryAt = clock() + 60_000;
+          throw error;
+        }
+      })();
+      try { await pending; } finally { pending = null; }
+    }
+    return { account, clear() { generation++; registered = ""; refreshAt = 0; retryAt = 0; } };
+  }
+  return Object.freeze({ create });
+});

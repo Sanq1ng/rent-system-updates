@@ -1,0 +1,133 @@
+"use strict";
+
+const crypto = require("node:crypto");
+const { pipeline } = require("node:stream/promises");
+const { programDevice } = require("./desktop-notifications.cjs");
+
+const KEY = "desktop_update_key";
+const LIFETIME = 30 * 24 * 60 * 60_000;
+const UUID = /^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i;
+
+class UpdateCacheError extends Error {
+  constructor(status, code, message) { super(message); this.name = "UpdateCacheError"; this.status = status; this.code = code; }
+}
+function insist(condition, status, code, message) {
+  if (!condition) throw new UpdateCacheError(status, code, message);
+}
+function createUpdateCache({ store, updates, enabled, isIdle, clock = Date.now }) {
+  let readers = 0;
+  const available = () => Boolean(enabled && typeof updates?.openClientFile === "function");
+  function key(create) {
+    let value = store.get(KEY);
+    if (value === undefined && create) {
+      value = crypto.randomBytes(32).toString("hex");
+      store.set(KEY, value);
+      store.changed();
+    }
+    insist(value !== undefined, 401, "UPDATE_ACCESS", "更新下载授权已失效，请重新登录。");
+    if (typeof value !== "string" || !/^[a-f0-9]{64}$/.test(value)) {
+      const error = new Error("主机程序下载授权密钥格式无效，请维护人员检查。");
+      error.code = "UPDATE_ACCESS_STATE";
+      throw error;
+    }
+    return Buffer.from(value, "hex");
+  }
+  const mac = (secret, value) => crypto.createHmac("sha256", secret).update(value).digest();
+  function identity(userId, secret) {
+    const row = store.db.prepare("SELECT salt,password_hash,json FROM users WHERE id=?").get(userId);
+    insist(row, 401, "UPDATE_ACCESS", "更新下载账号已失效。");
+    const user = JSON.parse(row.json);
+    insist(user.active, 401, "UPDATE_ACCESS", "更新下载账号已停用。");
+    return { user, credential: mac(secret, `credentials\n${row.salt}:${row.password_hash}`).toString("base64url") };
+  }
+  function issue(user, body, sessionHash) {
+    insist(body && Object.keys(body).length === 1 && UUID.test(body.installationId || ""),
+      400, "VALIDATION", "更新下载授权须指定当前电脑。");
+    if (!available()) return { available: false };
+    return store.transaction(() => {
+      const secret = key(true), current = identity(user.id, secret);
+      const device = programDevice(store, current.user, body.installationId, sessionHash, clock());
+      const expiresAt = Math.min(clock() + LIFETIME, device.expires_at);
+      const claim = { purpose: "rent-program-cache-v1", serverId: store.serverId, userId: user.id,
+        installationId: body.installationId, deviceId: device.id,
+        userVersion: current.user.version, credential: current.credential, expiresAt };
+      const payload = Buffer.from(JSON.stringify(claim)).toString("base64url");
+      return { available: true, serverId: store.serverId, userId: user.id, installationId: body.installationId,
+        expiresAt, token: `${payload}.${mac(secret, `program-cache\n${payload}`).toString("base64url")}` };
+    });
+  }
+  function authorize(req) {
+    insist(available(), 503, "UPDATE_LAN_UNAVAILABLE", "主机的局域网更新尚未就绪。");
+    const header = req.headers.authorization;
+    insist(typeof header === "string" && /^Bearer [A-Za-z0-9_-]{1,1536}\.[A-Za-z0-9_-]{43}$/.test(header),
+      401, "UPDATE_ACCESS", "请先登录，取得这台电脑的更新下载授权。");
+    const [payload, signature] = header.slice(7).split("."), secret = key(false);
+    const provided = Buffer.from(signature, "base64url"), expected = mac(secret, `program-cache\n${payload}`);
+    insist(provided.length === expected.length && provided.toString("base64url") === signature && crypto.timingSafeEqual(provided, expected),
+      401, "UPDATE_ACCESS", "更新下载授权校验失败。");
+    let claim;
+    try { claim = JSON.parse(Buffer.from(payload, "base64url").toString("utf8")); }
+    catch (error) {
+      if (!(error instanceof SyntaxError)) throw error;
+      throw new UpdateCacheError(401, "UPDATE_ACCESS", "更新下载授权格式无效。");
+    }
+    insist(claim && claim.purpose === "rent-program-cache-v1" && claim.serverId === store.serverId &&
+      UUID.test(claim.userId || "") && UUID.test(claim.installationId || "") &&
+      claim.installationId === req.headers["x-rent-installation-id"] &&
+      Number.isSafeInteger(claim.expiresAt) && claim.expiresAt > clock() && claim.expiresAt <= clock() + LIFETIME,
+    401, "UPDATE_ACCESS", "更新下载授权已失效或不属于这台电脑。");
+    const current = identity(claim.userId, secret);
+    const device = UUID.test(claim.deviceId || "") &&
+      store.db.prepare("SELECT * FROM desktop_devices WHERE id=?").get(claim.deviceId);
+    insist(claim.userVersion === current.user.version && claim.credential === current.credential,
+      401, "UPDATE_ACCESS", "账号已发生变化，请重新登录后准备更新。");
+    insist(device && device.revoked_at === null && device.expires_at > clock() &&
+      device.user_id === claim.userId && device.installation_id === claim.installationId &&
+      device.user_version === current.user.version,
+    401, "UPDATE_ACCESS", "这台电脑的更新授权已撤销，请重新登录。");
+    return claim;
+  }
+  async function serve(req, res, releaseId, sha256) {
+    authorize(req);
+    insist(isIdle(), 503, "MAINTENANCE", "主机正在更新，请完成后再下载。");
+    insist(readers < 3, 503, "UPDATE_LAN_UNAVAILABLE", "主机正在为其他电脑准备更新，请稍后重试。");
+    readers++;
+    let opened;
+    try {
+      opened = await updates.openClientFile(releaseId, sha256);
+      authorize(req);
+      insist(isIdle(), 503, "MAINTENANCE", "主机正在更新，请完成后再下载。");
+      let start = 0, end = opened.bytes - 1, status = 200;
+      const range = req.headers.range;
+      if (range !== undefined) {
+        const match = typeof range === "string" && /^bytes=(0|[1-9]\d*)-(0|[1-9]\d*)$/.exec(range);
+        insist(match, 416, "UPDATE_RANGE", "更新文件分段无效。");
+        start = Number(match[1]); end = Number(match[2]);
+        insist(Number.isSafeInteger(start) && Number.isSafeInteger(end) && start <= end && end < opened.bytes,
+          416, "UPDATE_RANGE", "更新文件分段超出范围。");
+        status = 206;
+      }
+      res.writeHead(status, { "Content-Type": "application/octet-stream", "Content-Length": String(end - start + 1),
+        "Cache-Control": "no-store", "Accept-Ranges": "bytes", "X-Rent-Server-Id": store.serverId,
+        ...(status === 206 ? { "Content-Range": `bytes ${start}-${end}/${opened.bytes}` } : {}) });
+      if (opened.bytes === 0) res.end();
+      else await pipeline(opened.handle.createReadStream({ start, end, autoClose: false }), res);
+    } catch (error) {
+      if (error instanceof UpdateCacheError) throw error;
+      if (error.code === "UPDATE_HASH" || error.code === "UPDATE_FILE" || error.code === "UPDATE_SIGNATURE") {
+        console.error("局域网更新缓存完整性核对失败：", error.code, releaseId, sha256);
+        throw new UpdateCacheError(409, "UPDATE_HASH", "主机更新缓存校验未通过，请联系负责人。");
+      }
+      if (["UPDATE_RELEASE", "UPDATE_STATE", "ENOENT"].includes(error.code))
+        throw new UpdateCacheError(503, "UPDATE_LAN_UNAVAILABLE", "主机批准的更新缓存暂不可用。");
+      console.error("局域网更新文件传输失败：", error.name, error.code || "");
+      throw error;
+    } finally {
+      readers--;
+      if (opened) await opened.handle.close();
+    }
+  }
+  return { issue, authorize, serve };
+}
+
+module.exports = { createUpdateCache, UpdateCacheError };

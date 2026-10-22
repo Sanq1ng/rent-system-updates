@@ -1,0 +1,178 @@
+"use strict";
+const fs = require("node:fs");
+const path = require("node:path");
+const crypto = require("node:crypto");
+const { fail, readJSON, writeJSON, regularFile, hashFile, verifyEnvelope, compareVersions, payloadPath, sameOrInside } = require("./files.cjs");
+const { resolveUpdateConfig, createTransport } = require("./transport.cjs");
+const { verifySlot, stageRelease, snapshotRelease, packageVersion } = require("./releases.cjs");
+const { acquireUpdateLease } = require("./state.cjs");
+function policy(program) {
+  const file = path.join(program, "updates", "trust-public.json");
+  if (!fs.existsSync(file)) fail("UPDATE_NOT_CONFIGURED", "安装包尚未内置维护公钥，不能接受远程程序。");
+  const value = readJSON(file, 65536);
+  if (value.format !== "industrial-rent-update-trust" || value.formatVersion !== 1)
+    fail("UPDATE_SIGNATURE", "维护公钥文件无效。");
+  const keys = resolveUpdateConfig({ trustedKeys: value.trustedKeys }).trustedKeys;
+  if (!Object.keys(keys).length) fail("UPDATE_NOT_CONFIGURED", "维护公钥尚未配置，未下载或安装程序。");
+  return keys;
+}
+function locations(program, configFile) {
+  const root = path.dirname(program);
+  if (path.basename(program) !== "程序" || configFile !== path.join(root, "配置", "config.json"))
+    fail("UPDATE_PATH", "员工自动更新只支持完整的受管安装。");
+  const installation = readJSON(path.join(root, "installation.json"), 32768);
+  const role = readJSON(path.join(root, "配置", "电脑角色.json"), 2048);
+  if (role.format !== "industrial-rent-machine-role" || role.mode !== "client" || role.installationId !== installation.installationId)
+    fail("UPDATE_AUTHORIZATION", "此更新入口不能操作保管账本的主机。");
+  const storage = path.join(root, "更新", "client-runtime");
+  return { root, program, storage, configFile, stateFile: path.join(storage, "client-state.json"),
+    receiptFile: path.join(storage, "full-apply.json"), companyFile: path.join(root, "电脑端资料", "company.json") };
+}
+function readState(place) {
+  if (!fs.existsSync(place.stateFile)) return { formatVersion: 1, highestSequence: 0, job: null };
+  const state = readJSON(place.stateFile, 2097152);
+  if (state.formatVersion !== 1 || !Number.isSafeInteger(state.highestSequence) || state.highestSequence < 0)
+    fail("UPDATE_STATE", "员工程序更新记录无效。");
+  return state;
+}
+async function check(program, configFile, source, download, access) {
+  const place = locations(program, configFile), release = acquireUpdateLease(place.storage);
+  try {
+    const state = readState(place), company = readJSON(place.companyFile, 65536);
+    if (!source || source.serverId !== company.serverId) fail("UPDATE_IDENTITY", "程序更新说明不属于已配对的公司主机。");
+    if (state.job?.phase === "committed" && fs.existsSync(place.receiptFile))
+      await finishVerifiedJob(place, state, state.job.id);
+    if (source.maintenance !== "idle") return { ready: false };
+    if (!source.update || compareVersions(source.applicationVersion, packageVersion(program)) <= 0) return { ready: false };
+    const trustedKeys = policy(program);
+    const settings = resolveUpdateConfig({ feedUrl: source.update.feedUrl, allowPrivateNetwork: source.update.allowPrivateNetwork, trustedKeys });
+    const offered = verifyEnvelope(source.update.envelope, trustedKeys);
+    if (offered.manifest.packageKind !== "windows-program" || offered.manifest.version !== source.applicationVersion ||
+        offered.manifest.sequence <= state.highestSequence || compareVersions(offered.manifest.version, packageVersion(program)) <= 0)
+      fail("UPDATE_DOWNGRADE", "主机批准的程序版本无效或已过期。");
+    if (state.job && !["staged", "committed"].includes(state.job.phase)) fail("UPDATE_BUSY", "员工程序还有未完成交接，请先恢复。");
+    require("./full-apply.cjs").assertApplyPaths(program, place.storage, offered.manifest.files);
+    let selectedDownload = download || createTransport(settings), route = download ? "provided" : "public", notice = null;
+    if (!download && source.update.lan?.protocol === 1) {
+      if (!company.connection || !access || access.serverId !== company.serverId ||
+          !Number.isSafeInteger(access.expiresAt) || access.expiresAt <= Date.now()) {
+        notice = "公司连接还没准备好走内网，这次已从网上下载好。请保存后再点更新。";
+      } else {
+        const identity = readJSON(path.join(path.dirname(place.companyFile), "identity.json"), 2048);
+        if (access.installationId !== identity.installationId)
+          fail("UPDATE_IDENTITY", "局域网更新授权不属于当前电脑。");
+        const { createLanTransport, preferLan } = require("./lan-transport.cjs");
+        selectedDownload = preferLan(createLanTransport({ company, access, feedUrl: settings.feedUrl,
+          releaseId: offered.releaseId, manifest: offered.manifest }), selectedDownload);
+        route = "lan";
+      }
+    }
+    const staged = await stageRelease(place.storage, offered, settings.feedUrl, selectedDownload, new AbortController().signal, program);
+    const helper = path.join(place.storage, "releases", offered.releaseId, "desktop", "应用程序更新.exe");
+    const job = state.job?.candidateReleaseId === offered.releaseId ? state.job :
+      { id: crypto.randomUUID(), candidateReleaseId: offered.releaseId, phase: "staged", envelope: offered.envelope,
+        trustedKeys, companyId: company.serverId, targetVersion: offered.manifest.version };
+    job.transfer = staged.transfer;
+    job.downloadRoute = staged.transfer.downloadedFiles === 0 ? "local" : selectedDownload.route || route;
+    job.downloadNotice = selectedDownload.fallback || notice;
+    state.job = job; writeJSON(place.stateFile, state);
+    return { ready: true, jobId: job.id, version: job.targetVersion, helper, helperSha256: await hashFile(helper),
+      downloadRoute: job.downloadRoute, downloadNotice: job.downloadNotice, transfer: job.transfer };
+  } finally { release(); }
+}
+async function prepare(program, configFile, jobId) {
+  const place = locations(program, configFile), release = acquireUpdateLease(place.storage);
+  try {
+    const state = readState(place), job = state.job;
+    if (!job || job.id !== jobId || !["staged", "copying"].includes(job.phase)) fail("UPDATE_STATE", "员工程序交接编号或阶段无效。");
+    const offered = verifyEnvelope(job.envelope, job.trustedKeys);
+    if (offered.releaseId !== job.candidateReleaseId) fail("UPDATE_SIGNATURE", "员工暂存程序签名不匹配。");
+    const candidate = await verifySlot(place.storage, job.candidateReleaseId);
+    if (!job.previousReleaseId) {
+      const previous = await snapshotRelease(place.storage, program, true);
+      job.previousReleaseId = previous.releaseId; writeJSON(place.stateFile, state);
+    } else await verifySlot(place.storage, job.previousReleaseId);
+    const old = await verifySlot(place.storage, job.previousReleaseId);
+    const helper = candidate.manifest.files.find(file => file.path === "desktop/应用程序更新.exe");
+    const plan = { format: "industrial-rent-full-apply", formatVersion: 1, mode: "client", jobId, program, root: place.root, configFile,
+      storage: place.storage, source: candidate.root, sourceId: candidate.releaseId, targetVersion: job.targetVersion,
+      helper: path.join(candidate.root, "desktop", "应用程序更新.exe"), helperSha256: helper.sha256, rollback: false, phase: "copying",
+      files: candidate.manifest.files, original: {}, aliases: clientAliases(place, candidate),
+      obsolete: old.manifest.files.filter(file => !candidate.manifest.files.some(item => item.path === file.path)) };
+    writeJSON(place.receiptFile, plan); job.phase = "copying"; writeJSON(place.stateFile, state);
+    return plan;
+  } finally { release(); }
+}
+function clientAliases(place, selected) {
+  const desktop = selected.manifest.files.find(file => file.path === "desktop/园区租赁主机.exe");
+  return [
+    { source: desktop.path, target: path.join(place.root, "启动园区租赁.exe"), sha256: desktop.sha256 },
+    { source: desktop.path, target: path.join(place.program, "园区租赁主机.exe"), sha256: desktop.sha256 },
+  ];
+}
+async function finishVerifiedJob(place, state, jobId) {
+  const job = state.job;
+  if (!job || job.id !== jobId || !["copying", "committed"].includes(job.phase))
+    fail("UPDATE_STATE", "员工更新复制结果不属于本次交接。");
+  const offered = verifyEnvelope(job.envelope, job.trustedKeys);
+  if (offered.releaseId !== job.candidateReleaseId || offered.manifest.version !== job.targetVersion)
+    fail("UPDATE_SIGNATURE", "员工更新签名不符。");
+  const selected = await verifySlot(place.storage, job.candidateReleaseId);
+  if (selected.manifest.sequence < state.highestSequence)
+    fail("UPDATE_DOWNGRADE", "员工更新记录的发布序号已过期。");
+  const aliases = clientAliases(place, selected);
+  const receipt = fs.existsSync(place.receiptFile) ? readJSON(place.receiptFile) : null;
+  if (!receipt && job.phase !== "committed") fail("UPDATE_STATE", "员工更新缺少复制收据，请保留更新目录并联系维护人员。");
+  if (receipt && (receipt.format !== "industrial-rent-full-apply" || receipt.formatVersion !== 1 ||
+      receipt.mode !== "client" || receipt.phase !== "copying" || receipt.jobId !== jobId ||
+      receipt.program !== place.program || receipt.configFile !== place.configFile || receipt.root !== place.root ||
+      receipt.storage !== place.storage || receipt.source !== selected.root || receipt.sourceId !== selected.releaseId ||
+      receipt.targetVersion !== job.targetVersion || !Array.isArray(receipt.aliases) || receipt.aliases.length !== aliases.length ||
+      aliases.some((alias, index) => ["source", "target", "sha256"].some(key => receipt.aliases[index]?.[key] !== alias[key]))))
+    fail("UPDATE_STATE", "员工更新收据与本机任务不符。");
+  for (const file of selected.manifest.files) {
+    const target = path.join(place.program, ...payloadPath(file.path, true));
+    if (!sameOrInside(place.program, target) || regularFile(target).size !== file.bytes || await hashFile(target) !== file.sha256)
+      fail("UPDATE_HASH", `员工程序文件复制不完整：${file.path}`);
+  }
+  for (const alias of aliases) if (await hashFile(alias.target) !== alias.sha256) fail("UPDATE_HASH", "员工启动入口复制不完整。");
+  if (job.phase !== "committed") {
+    job.phase = "committed"; state.highestSequence = selected.manifest.sequence; writeJSON(place.stateFile, state);
+  }
+  if (receipt) fs.unlinkSync(place.receiptFile);
+  return { jobId, version: job.targetVersion, root: place.root, mode: "client" };
+}
+async function verify(program, configFile, jobId) {
+  const place = locations(program, configFile), release = acquireUpdateLease(place.storage);
+  try { return await finishVerifiedJob(place, readState(place), jobId); }
+  finally { release(); }
+}
+async function main(args = process.argv.slice(2)) {
+  const [command, ...rest] = args, options = {};
+  for (let index = 0; index < rest.length; index += 2) {
+    const key = rest[index];
+    if (!["--program", "--config", "--job"].includes(key) || Object.hasOwn(options, key) || !rest[index + 1]) fail("UPDATE_REQUEST", "员工更新参数无效。");
+    options[key] = rest[index + 1];
+  }
+  if (!options["--program"] || !options["--config"]) fail("UPDATE_REQUEST", "员工更新缺少明确的安装路径。");
+  const program = path.resolve(options["--program"]), config = path.resolve(options["--config"]);
+  let result;
+  if (command === "check") {
+    const chunks = []; let length = 0;
+    for await (const bytes of process.stdin) { length += bytes.length; if (length > 2097152) fail("UPDATE_SIZE", "主机程序说明过大。"); chunks.push(bytes); }
+    let input;
+    try { input = JSON.parse(Buffer.concat(chunks).toString("utf8")); }
+    catch (error) {
+      if (!(error instanceof SyntaxError)) throw error;
+      fail("UPDATE_REQUEST", "主机程序说明不完整或格式无效，未开始更新。", 400);
+    }
+    if (!input || typeof input !== "object" || Array.isArray(input))
+      fail("UPDATE_REQUEST", "主机程序说明必须是有效对象。", 400);
+    result = await check(program, config, input.source || input, undefined, input.access);
+  } else if (command === "prepare") result = await prepare(program, config, options["--job"]);
+  else if (command === "verify") result = await verify(program, config, options["--job"]);
+  else fail("UPDATE_REQUEST", "员工更新操作无效。");
+  console.log(JSON.stringify(result));
+}
+if (require.main === module) main().catch(error => { console.error(error.message); process.exitCode = 1; });
+module.exports = { policy, locations, readState, check, prepare, verify };

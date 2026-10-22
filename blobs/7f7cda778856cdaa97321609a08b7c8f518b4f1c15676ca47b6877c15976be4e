@@ -1,0 +1,192 @@
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Linq;
+using System.Net;
+using System.Security.AccessControl;
+using System.Security.Cryptography;
+using System.Security.Principal;
+using System.Text;
+using System.Text.RegularExpressions;
+using RentLan;
+
+namespace RentCentre.Client
+{
+    internal sealed class SavedCompany
+    {
+        public string origin, serverId;
+        public Connection connection;
+        internal void Validate()
+        {
+            Product.Uuid(serverId);
+            Uri parsed;
+            if (!Uri.TryCreate(origin, UriKind.Absolute, out parsed) || parsed.GetLeftPart(UriPartial.Authority) != origin ||
+                parsed.UserInfo.Length != 0 || parsed.Query.Length != 0 || parsed.Fragment.Length != 0)
+                throw new IOException("公司地址格式无效。");
+            if (parsed.Scheme == "http" && parsed.Host == "127.0.0.1" && parsed.Port > 0) {
+                if (connection != null) throw new IOException("本机地址不能混入局域网证书。");
+                return;
+            }
+            int port;
+            Network.AddressOf(origin, out port);
+            if (connection != null) {
+                connection.Validate(true);
+                if (connection.origin != origin || connection.serverId != serverId) throw new IOException("公司身份与证书不一致。");
+            }
+        }
+    }
+
+    internal sealed class NoticeBinding
+    {
+        public string serverId, userId, deviceId, token;
+        public long expiresAt;
+        public string[] seen = new string[0];
+        internal void Validate(SavedCompany company)
+        {
+            if (company == null || serverId != company.serverId) throw new IOException("电脑通知不属于当前公司。");
+            Product.Uuid(serverId); Product.Uuid(userId); Product.Uuid(deviceId);
+            if (!Regex.IsMatch(token ?? "", "^[A-Za-z0-9_-]{43}$") || seen == null || seen.Length > 3000 ||
+                seen.Any(value => value == null || value.Length > 180)) throw new IOException("电脑通知凭证格式无效。");
+            if (expiresAt < 1 || expiresAt > 8640000000000000L) throw new IOException("电脑通知有效期无效。");
+        }
+    }
+
+    internal sealed class UpdateAccess
+    {
+        public string serverId, userId, installationId, token;
+        public long expiresAt;
+        internal void Validate(SavedCompany company, string installation)
+        {
+            if (company == null || company.serverId != serverId || installationId != installation)
+                throw new IOException("程序下载授权不属于当前公司或电脑。");
+            Product.Uuid(serverId); Product.Uuid(userId); Product.Uuid(installationId);
+            if (!Regex.IsMatch(token ?? "", "^[A-Za-z0-9_-]{1,1536}\\.[A-Za-z0-9_-]{43}$") ||
+                expiresAt < 1 || expiresAt > 8640000000000000L)
+                throw new IOException("程序下载授权格式无效。");
+        }
+    }
+
+    internal sealed class ClientState
+    {
+        internal readonly string Root;
+        internal readonly string InstallationId;
+        internal SavedCompany Company;
+        internal NoticeBinding Binding;
+        internal UpdateAccess UpdateGrant;
+        private readonly object sync = new object();
+        private readonly byte[] entropy;
+        private readonly byte[] updateEntropy;
+        internal ClientState(string root)
+        {
+            Root = Paths.Absolute(root, false); Paths.NotSystem(Root);
+            if (Root.StartsWith(@"\\", StringComparison.Ordinal) || Root.Length > 190) throw new IOException("电脑资料必须保存在本机短路径。");
+            using (var parents = new DirectoryPins(Path.GetDirectoryName(Root))) {
+                if (!Directory.Exists(Root)) {
+                    var acl = new DirectorySecurity();
+                    var sid = WindowsIdentity.GetCurrent().User;
+                    acl.SetOwner(sid); acl.SetAccessRuleProtection(true, false);
+                    foreach (var identity in new[] { sid, new SecurityIdentifier(WellKnownSidType.LocalSystemSid, null) })
+                        acl.AddAccessRule(new FileSystemAccessRule(identity, FileSystemRights.FullControl,
+                            InheritanceFlags.ContainerInherit | InheritanceFlags.ObjectInherit, PropagationFlags.None, AccessControlType.Allow));
+                    Directory.CreateDirectory(Root, acl);
+                }
+            }
+            using (var pins = new DirectoryPins(Root)) {
+                if (Directory.GetAccessControl(Root).GetOwner(typeof(SecurityIdentifier)).Value != WindowsIdentity.GetCurrent().User.Value)
+                    throw new IOException("电脑资料属于另一个 Windows 用户，不能接管。");
+                string identityPath = Path.Combine(Root, "identity.json");
+                if (File.Exists(identityPath)) InstallationId = Json.String(Json.Object(ReadText("identity.json")), "installationId");
+                else { InstallationId = Guid.NewGuid().ToString("D"); Write("identity.json", Product.Utf8.GetBytes(Json.Encode(new { installationId = InstallationId }))); }
+                Product.Uuid(InstallationId);
+                entropy = Product.Utf8.GetBytes("RentWindows/1:" + InstallationId);
+                updateEntropy = Product.Utf8.GetBytes("RentWindowsUpdate/1:" + InstallationId);
+                if (File.Exists(Path.Combine(Root, "company.json"))) {
+                    Company = Json.Decode<SavedCompany>(ReadText("company.json")); Company.Validate();
+                }
+                if (File.Exists(Path.Combine(Root, "notifications.bin"))) {
+                    byte[] clear = ProtectedData.Unprotect(Read("notifications.bin", 1024 * 1024), entropy, DataProtectionScope.CurrentUser);
+                    try { Binding = Json.Decode<NoticeBinding>(Product.Utf8.GetString(clear), 1048576); Binding.Validate(Company); }
+                    finally { Array.Clear(clear, 0, clear.Length); }
+                }
+                if (File.Exists(Path.Combine(Root, "updates.bin"))) {
+                    byte[] clear = ProtectedData.Unprotect(Read("updates.bin", 16384), updateEntropy, DataProtectionScope.CurrentUser);
+                    try { UpdateGrant = Json.Decode<UpdateAccess>(Product.Utf8.GetString(clear), 16384); UpdateGrant.Validate(Company, InstallationId); }
+                    finally { Array.Clear(clear, 0, clear.Length); }
+                }
+            }
+        }
+        internal string ProfileDirectory { get { return Path.Combine(Root, "WebView2"); } }
+        private byte[] Read(string name, int maximum)
+        {
+            using (var file = new CheckedFile(Path.Combine(Root, name), false)) {
+                if (file.Stream.Length > maximum) throw new IOException("电脑配置超过大小限制。");
+                byte[] bytes = new byte[(int)file.Stream.Length];
+                int at = 0, count;
+                while (at < bytes.Length && (count = file.Stream.Read(bytes, at, bytes.Length - at)) > 0) at += count;
+                if (at != bytes.Length) throw new IOException("电脑配置读取不完整。");
+                return bytes;
+            }
+        }
+        private string ReadText(string name) { return Product.Utf8.GetString(Read(name, 65536)); }
+        private void Write(string name, byte[] bytes)
+        {
+            using (var pins = new DirectoryPins(Root)) {
+                string destination = Path.Combine(Root, name), temporary = Path.Combine(Root, "." + name + "-" + Guid.NewGuid().ToString("N"));
+                if (File.Exists(destination)) using (var existing = new CheckedFile(destination, false)) { }
+                using (var output = new FileStream(temporary, FileMode.CreateNew, FileAccess.Write, FileShare.None)) {
+                    output.Write(bytes, 0, bytes.Length); output.Flush(true);
+                }
+                if (File.Exists(destination)) File.Replace(temporary, destination, null);
+                else File.Move(temporary, destination);
+            }
+        }
+        internal void SetCompany(SavedCompany value)
+        {
+            value.Validate();
+            lock (sync) {
+                if (Company != null && (Company.serverId != value.serverId || Company.origin != value.origin))
+                    throw new IOException("这台电脑已连接另一地址。请先保存并导出原来的离线草稿，再由负责人迁移；没有覆盖原资料。");
+                Write("company.json", Product.Utf8.GetBytes(Json.Encode(value)));
+                Company = value;
+            }
+        }
+        internal void SaveTrust(TrustReceipt value) { lock (sync) Write("trust.json", Product.Utf8.GetBytes(Json.Encode(value))); }
+        internal void SetUpdateAccess(UpdateAccess value)
+        {
+            lock (sync) {
+                if (value == null) {
+                    string file = Path.Combine(Root, "updates.bin");
+                    if (File.Exists(file)) {
+                        using (var pins = new DirectoryPins(Root)) using (var check = new CheckedFile(file, false)) { }
+                        File.Delete(file);
+                    }
+                    UpdateGrant = null;
+                    return;
+                }
+                value.Validate(Company, InstallationId);
+                byte[] clear = Product.Utf8.GetBytes(Json.Encode(value, 16384));
+                try { Write("updates.bin", ProtectedData.Protect(clear, updateEntropy, DataProtectionScope.CurrentUser)); }
+                finally { Array.Clear(clear, 0, clear.Length); }
+                UpdateGrant = value;
+            }
+        }
+        internal void SetBinding(NoticeBinding value)
+        {
+            lock (sync) {
+                if (value == null) {
+                    string file = Path.Combine(Root, "notifications.bin");
+                    if (File.Exists(file)) {
+                        using (var pins = new DirectoryPins(Root)) using (var check = new CheckedFile(file, false)) { }
+                        File.Delete(file);
+                    }
+                    Binding = null; return;
+                }
+                value.Validate(Company);
+                byte[] clear = Product.Utf8.GetBytes(Json.Encode(value, 1048576));
+                try { Write("notifications.bin", ProtectedData.Protect(clear, entropy, DataProtectionScope.CurrentUser)); }
+                finally { Array.Clear(clear, 0, clear.Length); }
+                Binding = value;
+            }
+        }
+    }
+}

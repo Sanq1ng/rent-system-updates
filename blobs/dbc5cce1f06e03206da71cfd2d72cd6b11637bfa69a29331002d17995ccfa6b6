@@ -1,0 +1,237 @@
+"use strict";
+
+const https = require("node:https");
+const dns = require("node:dns");
+const net = require("node:net");
+const crypto = require("node:crypto");
+const fs = require("node:fs");
+const path = require("node:path");
+const { setTimeout: sleep } = require("node:timers/promises");
+const { fail, digest, ensureDirectory, regularFile, readJSON, writeFile, writeJSON, MAX_FILE_BYTES } = require("./files.cjs");
+
+const RANGE_BYTES = 1024 * 1024;
+const RANGE_THRESHOLD = 4 * RANGE_BYTES;
+
+function resolveUpdateConfig(settings) {
+  if (settings === undefined || settings === null) settings = {};
+  if (typeof settings !== "object" || Array.isArray(settings)) fail("UPDATE_CONFIG", "更新配置必须是对象。");
+  const feedUrl = settings.feedUrl ?? null;
+  const allowPrivateNetwork = settings.allowPrivateNetwork ?? false;
+  const trustedKeys = settings.trustedKeys ?? {};
+  if (typeof allowPrivateNetwork !== "boolean" || !trustedKeys || typeof trustedKeys !== "object" ||
+      Array.isArray(trustedKeys) || Object.keys(trustedKeys).length > 8) fail("UPDATE_CONFIG", "更新信任配置无效。");
+  for (const [id, pem] of Object.entries(trustedKeys)) {
+    if (!/^[A-Za-z0-9_-]{1,48}$/.test(id) || typeof pem !== "string" || pem.length > 4096 ||
+        !pem.startsWith("-----BEGIN PUBLIC KEY-----")) fail("UPDATE_CONFIG", "更新密钥必须是指定名称的 Ed25519 公钥。");
+    let key;
+    try { key = crypto.createPublicKey(pem); }
+    catch { fail("UPDATE_CONFIG", "更新发布公钥无法读取。"); }
+    if (key.asymmetricKeyType !== "ed25519") fail("UPDATE_CONFIG", "更新发布公钥必须使用 Ed25519。");
+  }
+  if (feedUrl !== null) {
+    let url;
+    try { url = new URL(feedUrl); }
+    catch { fail("UPDATE_CONFIG", "更新地址必须是完整的 HTTPS 清单地址。"); }
+    if (typeof feedUrl !== "string" || feedUrl.length > 2048 || url.protocol !== "https:" ||
+        url.username || url.password || url.hash || url.search) fail("UPDATE_CONFIG", "更新地址只允许无账号、查询参数和片段的 HTTPS 地址。");
+  }
+  return { feedUrl, trustedKeys: { ...trustedKeys }, allowPrivateNetwork };
+}
+
+function isPublicAddress(address) {
+  const kind = net.isIP(address);
+  if (kind === 4) {
+    const [a, b, c] = address.split(".").map(Number);
+    return !(a === 0 || a === 10 || a === 127 || a >= 224 ||
+      (a === 100 && b >= 64 && b <= 127) || (a === 169 && b === 254) ||
+      (a === 172 && b >= 16 && b <= 31) || (a === 192 && (b === 168 || b === 0 || (b === 88 && c === 99))) ||
+      (a === 198 && (b === 18 || b === 19 || (b === 51 && c === 100))) ||
+      (a === 203 && b === 0 && c === 113));
+  }
+  if (kind !== 6) return false;
+  const publicRange = new net.BlockList();
+  publicRange.addSubnet("2000::", 3, "ipv6");
+  const reserved = new net.BlockList();
+  reserved.addSubnet("2001::", 23, "ipv6");
+  reserved.addSubnet("2001:db8::", 32, "ipv6");
+  reserved.addSubnet("2002::", 16, "ipv6");
+  return publicRange.check(address, "ipv6") && !reserved.check(address, "ipv6");
+}
+
+function createTransport(config) {
+  let receivedBytes = 0;
+  async function request(urlValue, { maxBytes, signal, range }) {
+    const url = new URL(urlValue);
+    const feed = new URL(config.feedUrl);
+    if (url.protocol !== "https:" || url.origin !== feed.origin || url.username || url.password || url.search || url.hash) {
+      fail("UPDATE_NETWORK", "更新下载地址不属于配置的 HTTPS 来源。");
+    }
+    const hostname = url.hostname.replace(/^\[|\]$/g, "");
+    if (net.isIP(hostname) && !config.allowPrivateNetwork && !isPublicAddress(hostname)) {
+      fail("UPDATE_NETWORK", "更新源指向内网或特殊地址；仅可由部署人员明确允许受信任内网源。");
+    }
+    const combined = AbortSignal.any([...(signal ? [signal] : []), AbortSignal.timeout(range ? 60_000 : maxBytes > 16 * 1024 * 1024 ? 300_000 : 20_000)]);
+    const lookup = (name, options, callback) => {
+      dns.lookup(name, { all: true }, (error, entries) => {
+        if (error) { callback(error); return; }
+        if (!entries.length || (!config.allowPrivateNetwork && entries.some(entry => !isPublicAddress(entry.address)))) {
+          const rejected = new Error("更新源解析到了不允许的网络地址。");
+          rejected.code = "UPDATE_NETWORK";
+          callback(rejected);
+          return;
+        }
+        if (options.all) callback(null, entries);
+        else callback(null, entries[0].address, entries[0].family);
+      });
+    };
+    return new Promise((resolve, reject) => {
+      const request = https.get(url, {
+        signal: combined, lookup, agent: false, maxHeaderSize: 16384,
+        headers: { Accept: "application/octet-stream, application/json", "Accept-Encoding": "identity",
+          ...(range ? { Range: `bytes=${range.start}-${range.end}` } : {}) },
+      }, response => {
+        const length = response.headers["content-length"];
+        if ([408, 429, 500, 502, 503, 504].includes(response.statusCode)) {
+          response.destroy();
+          const error = new Error("更新来源暂时不可用，请稍后重试。");
+          error.code = "UPDATE_RETRY";
+          reject(error);
+          return;
+        }
+        if (response.statusCode !== (range ? 206 : 200) ||
+            (range && (response.headers["content-range"] !== `bytes ${range.start}-${range.end}/${range.total}` ||
+              length !== String(maxBytes) || response.headers["content-type"]?.startsWith("multipart/"))) ||
+            (response.headers["content-encoding"] && response.headers["content-encoding"] !== "identity") ||
+            (length !== undefined && (!/^\d+$/.test(length) || Number(length) > maxBytes))) {
+          response.destroy();
+          const error = new Error(range ? "更新来源未返回准确的未压缩文件分段，请联系维护人员核对下载来源。" :
+            "更新下载被拒绝：必须直接返回未压缩的完整文件，不支持重定向或超大响应。");
+          error.code = "UPDATE_DOWNLOAD";
+          reject(error);
+          return;
+        }
+        const chunks = [];
+        let bytes = 0;
+        response.on("data", chunk => {
+          receivedBytes += chunk.length;
+          bytes += chunk.length;
+          if (bytes > maxBytes) {
+            const error = new Error("更新下载超过大小限制。");
+            error.code = "UPDATE_SIZE";
+            response.destroy(error);
+          } else chunks.push(chunk);
+        });
+        response.once("error", reject);
+        response.once("end", () => {
+          if (length !== undefined && bytes !== Number(length)) {
+            const error = new Error("更新文件下载不完整。");
+            error.code = "UPDATE_INCOMPLETE";
+            reject(error);
+          } else resolve(Buffer.concat(chunks, bytes));
+        });
+      });
+      request.once("socket", socket => socket.once("secureConnect", () => {
+        if (!config.allowPrivateNetwork && !isPublicAddress(socket.remoteAddress || "")) {
+          const error = new Error("更新连接的实际地址不受允许。");
+          error.code = "UPDATE_NETWORK";
+          request.destroy(error);
+        }
+      }));
+      request.once("error", reject);
+    });
+  }
+
+  const download = createDownloader(config.feedUrl, request);
+  Object.defineProperty(download, "receivedBytes", { get: () => receivedBytes });
+  return download;
+}
+
+function createDownloader(feedUrl, request) {
+  return async function download(urlValue, { maxBytes, signal, expectedSha256, resumeDirectory }) {
+    signal?.throwIfAborted();
+    if (!Number.isSafeInteger(maxBytes) || maxBytes < 0 || maxBytes > MAX_FILE_BYTES)
+      fail("UPDATE_SIZE", "更新下载大小限制无效。");
+    if (!resumeDirectory || maxBytes < RANGE_THRESHOLD) return request(urlValue, { maxBytes, signal });
+    if (!/^[a-f0-9]{64}$/.test(expectedSha256 || ""))
+      fail("UPDATE_HASH", "分段更新必须绑定已签名的完整文件校验值。");
+    const url = new URL(urlValue), feed = new URL(feedUrl);
+    if (url.protocol !== "https:" || url.origin !== feed.origin || url.username || url.password || url.search || url.hash)
+      fail("UPDATE_NETWORK", "更新下载地址不属于配置的 HTTPS 来源。");
+    const identity = { url: url.href, bytes: maxBytes, sha256: expectedSha256, chunkBytes: RANGE_BYTES };
+    const directory = path.join(resumeDirectory, digest(Buffer.from(JSON.stringify(identity))));
+    ensureDirectory(directory);
+    const count = Math.ceil(maxBytes / RANGE_BYTES), result = new Array(count);
+    for (const name of fs.readdirSync(directory)) {
+      const pending = /^(download|0|[1-9]\d*)\.json\.pending-[a-f0-9-]{36}$/.exec(name);
+      if (pending && (pending[1] === "download" || Number(pending[1]) < count)) {
+        const file = path.join(directory, name);
+        regularFile(file, 8192);
+        fs.unlinkSync(file);
+      }
+    }
+    const marker = path.join(directory, "download.json");
+    if (fs.existsSync(marker)) {
+      if (JSON.stringify(readJSON(marker, 8192)) !== JSON.stringify(identity))
+        fail("UPDATE_STATE", "分段下载记录与当前签名文件不符。");
+    } else writeJSON(marker, identity);
+    const controller = new AbortController();
+    const combined = AbortSignal.any([controller.signal, ...(signal ? [signal] : [])]);
+    let next = 0;
+    const partPath = index => path.join(directory, `${index}.part`);
+    const receiptPath = index => path.join(directory, `${index}.json`);
+    async function worker() {
+      while (next < count) {
+        combined.throwIfAborted();
+        const index = next++, start = index * RANGE_BYTES, end = Math.min(maxBytes, start + RANGE_BYTES) - 1;
+        const size = end - start + 1, part = partPath(index), receipt = receiptPath(index);
+        if (fs.existsSync(part)) {
+          regularFile(part, size);
+          if (fs.existsSync(receipt)) {
+            const stored = readJSON(receipt, 1024), bytes = fs.readFileSync(part);
+            if (bytes.length !== size || stored.bytes !== size || stored.sha256 !== digest(bytes))
+              fail("UPDATE_HASH", "已保存的更新分段损坏；请保留下载记录并联系维护人员。");
+            result[index] = bytes;
+            continue;
+          }
+          fs.unlinkSync(part);
+        }
+        let bytes;
+        for (let attempt = 0; attempt < 3; attempt++) {
+          try {
+            bytes = await request(url.href, { maxBytes: size, signal: combined, range: { start, end, total: maxBytes } });
+            break;
+          } catch (error) {
+            const retryable = ["ECONNRESET", "ETIMEDOUT", "EPIPE", "EAI_AGAIN", "ENETUNREACH",
+              "UPDATE_RETRY", "UPDATE_INCOMPLETE", "ABORT_ERR"].includes(error.code);
+            if (combined.aborted || !retryable || attempt === 2) throw error;
+            await sleep(250 * (attempt + 1), undefined, { signal: combined });
+          }
+        }
+        combined.throwIfAborted();
+        if (bytes.length !== size) fail("UPDATE_HASH", "更新分段长度校验失败。");
+        writeFile(part, bytes);
+        writeJSON(receipt, { bytes: size, sha256: digest(bytes) });
+        result[index] = bytes;
+      }
+    }
+    let firstError;
+    await Promise.all(Array.from({ length: Math.min(3, count) }, async () => {
+      try { await worker(); }
+      catch (error) { if (!firstError) firstError = error; controller.abort(error); }
+    }));
+    if (firstError) throw firstError;
+    signal?.throwIfAborted();
+    const bytes = Buffer.concat(result);
+    const valid = bytes.length === maxBytes && digest(bytes) === expectedSha256;
+    for (let index = 0; index < count; index++) {
+      fs.unlinkSync(partPath(index));
+      fs.unlinkSync(receiptPath(index));
+    }
+    fs.unlinkSync(marker);
+    fs.rmdirSync(directory);
+    if (!valid) fail("UPDATE_HASH", "更新文件完整 SHA-256 校验失败，未安装；请重新下载。");
+    return bytes;
+  };
+}
+
+module.exports = { resolveUpdateConfig, isPublicAddress, createTransport, createDownloader };

@@ -1,0 +1,46 @@
+"use strict";
+
+const { assertSupportedSchema } = require("./push-schema.cjs");
+
+function invalidateRestoredNotifications(db, now = Date.now()) {
+  if (!db.isTransaction || !Number.isSafeInteger(now) || now < 0) {
+    throw new Error("恢复通知授权必须与清除旧会话在同一个有效事务中执行。");
+  }
+  const version = db.prepare("PRAGMA user_version").get().user_version;
+  const hasPushState = db.prepare("SELECT 1 FROM sqlite_master WHERE name GLOB 'push_*' LIMIT 1").get();
+  // Legacy backup copying retains its existing validation; there are no notification capabilities to revoke.
+  if (version >= 0 && version < 4 && !hasPushState) return { devices: 0, enrollments: 0, deliveries: 0, attempts: 0 };
+  assertSupportedSchema(db, version);
+  if (version >= 7) {
+    db.prepare("UPDATE desktop_devices SET revoked_at=COALESCE(revoked_at,?)").run(now);
+    db.prepare("DELETE FROM meta WHERE key='desktop_update_key'").run();
+  }
+
+  const counts = {
+    devices: db.prepare("SELECT COUNT(*) AS n FROM push_devices WHERE status='active'").get().n,
+    enrollments: db.prepare("SELECT COUNT(*) AS n FROM push_enrollments WHERE status IN ('sending','pending','confirmed')").get().n,
+    deliveries: db.prepare("SELECT COUNT(*) AS n FROM push_deliveries WHERE status IN ('pending','retry','sending')").get().n,
+    attempts: db.prepare("SELECT COUNT(*) AS n FROM push_attempts WHERE outcome='sending'").get().n,
+  };
+  db.prepare(`UPDATE push_devices SET status='revoked', registration_json=NULL,
+    updated_at=?, revoked_at=COALESCE(revoked_at,?)
+    WHERE status='active' OR registration_json IS NOT NULL`).run(now, now);
+  db.prepare(`UPDATE push_enrollments SET registration_json=NULL, proof_hash=NULL,
+    error_code=CASE WHEN status IN ('sending','pending','confirmed') THEN 'RESTORED' ELSE error_code END,
+    status=CASE WHEN status IN ('sending','pending','confirmed') THEN 'revoked' ELSE status END, updated_at=?
+    WHERE status IN ('sending','pending','confirmed') OR registration_json IS NOT NULL OR proof_hash IS NOT NULL`).run(now);
+
+  // Keep accepted/received/opened history, but no restored capability may authorize a new receipt.
+  db.prepare(`UPDATE push_deliveries SET receipt_hash=NULL,
+    error_code=CASE WHEN status IN ('pending','retry','sending') THEN 'RESTORED' ELSE error_code END,
+    status=CASE WHEN status IN ('pending','retry','sending') THEN 'revoked' ELSE status END, updated_at=?
+    WHERE receipt_hash IS NOT NULL OR status IN ('pending','retry','sending')`).run(now);
+  db.prepare(`UPDATE push_attempts SET receipt_hash=NULL,
+    finished_at=CASE WHEN outcome='sending' THEN COALESCE(finished_at,?) ELSE finished_at END,
+    error_code=CASE WHEN outcome='sending' THEN 'RESTORED' ELSE error_code END,
+    outcome=CASE WHEN outcome='sending' THEN 'revoked' ELSE outcome END
+    WHERE receipt_hash IS NOT NULL OR outcome='sending'`).run(now);
+  return counts;
+}
+
+module.exports = { invalidateRestoredNotifications };

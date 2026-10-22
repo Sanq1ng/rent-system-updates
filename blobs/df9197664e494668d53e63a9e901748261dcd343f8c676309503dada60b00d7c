@@ -1,0 +1,174 @@
+using System;
+using System.Collections.Generic;
+using System.Diagnostics;
+using System.IO;
+using System.IO.Pipes;
+using System.Reflection;
+using System.Security.AccessControl;
+using System.Security.Principal;
+using System.Threading;
+using System.Threading.Tasks;
+using System.Windows.Forms;
+using RentLan;
+
+[assembly: AssemblyTitle("园区租赁")]
+[assembly: AssemblyDescription("独立业务窗口与 Windows 提醒")]
+[assembly: AssemblyProduct("园区租赁")]
+[assembly: AssemblyVersion("0.4.17.0")]
+[assembly: AssemblyFileVersion("0.4.17.0")]
+
+namespace RentCentre.Client
+{
+    internal sealed class Options
+    {
+        internal string State, Origin, Activation;
+        internal bool Background, Isolated;
+        internal static Options Parse(string[] args)
+        {
+            var value = new Options();
+            var seen = new HashSet<string>();
+            for (int i = 0; i < args.Length; i++) {
+                string key = args[i];
+                if (!seen.Add(key)) throw new IOException("不能重复启动参数。");
+                if (key == "--background") value.Background = true;
+                else if (key == "--isolated") value.Isolated = true;
+                else if (i + 1 < args.Length && !args[i + 1].StartsWith("--", StringComparison.Ordinal)) {
+                    string item = args[++i];
+                    if (key == "--state") value.State = item;
+                    else if (key == "--origin") value.Origin = item;
+                    else if (key == "--activate") value.Activation = item;
+                    else throw new IOException("不支持的电脑端启动参数。");
+                } else throw new IOException("电脑端启动参数不完整。");
+            }
+            if (value.State == null) {
+                string program = Directory.GetParent(AppDomain.CurrentDomain.BaseDirectory.TrimEnd('\\')).FullName;
+                value.State = Path.Combine(Directory.GetParent(program).FullName, "电脑端资料");
+            }
+            if (value.Isolated && (value.Origin == null || !value.Origin.StartsWith("http://127.0.0.1:", StringComparison.Ordinal) ||
+                value.State.IndexOf(@"\.test-data\", StringComparison.OrdinalIgnoreCase) < 0))
+                throw new IOException("隔离运行仅用于项目测试目录和回环测试主机。");
+            return value;
+        }
+    }
+
+    internal sealed class SingleClient : IDisposable
+    {
+        private readonly string pipeName;
+        private readonly Mutex mutex;
+        private readonly bool owns;
+        private NamedPipeServerStream waiting;
+        private bool disposed;
+        internal SingleClient(string root)
+        {
+            string hash = Product.Hash(Product.Utf8.GetBytes(Path.GetFullPath(root).ToLowerInvariant() + ":" + Product.Sid));
+            pipeName = "RentClient-" + hash;
+            bool created;
+            mutex = new Mutex(false, @"Local\" + pipeName, out created);
+            try { owns = mutex.WaitOne(0); } catch (AbandonedMutexException) { owns = true; }
+        }
+        internal bool Owns { get { return owns; } }
+        internal void Forward(NoticeTarget target)
+        {
+            using (var pipe = new NamedPipeClientStream(".", pipeName, PipeDirection.Out)) {
+                pipe.Connect(5000);
+                using (var output = new StreamWriter(pipe, Product.Utf8)) {
+                    output.WriteLine(Json.Encode(new { target = target })); output.Flush();
+                }
+            }
+        }
+        internal void Listen(Action<NoticeTarget> opened, Action<Exception> failure, Action exiting)
+        {
+            Task.Run(() => {
+                while (!disposed) {
+                    try {
+                        var security = new PipeSecurity(); security.SetAccessRuleProtection(true, false);
+                        security.AddAccessRule(new PipeAccessRule(WindowsIdentity.GetCurrent().User, PipeAccessRights.FullControl, AccessControlType.Allow));
+                        using (var pipe = new NamedPipeServerStream(pipeName, PipeDirection.InOut, 1, PipeTransmissionMode.Byte,
+                            PipeOptions.Asynchronous, 4096, 4096, security)) {
+                            waiting = pipe;
+                            pipe.WaitForConnection();
+                            if (disposed) return;
+                            byte[] bytes = new byte[2049]; int total = 0;
+                            using (var deadline = new System.Threading.Timer(ignored => pipe.Dispose(), null, 3000, Timeout.Infinite)) {
+                                while (total < bytes.Length) {
+                                    int count = pipe.Read(bytes, total, bytes.Length - total);
+                                    if (count == 0) break;
+                                    total += count;
+                                    if (Array.IndexOf(bytes, (byte)'\n', 0, total) >= 0) break;
+                                }
+                            }
+                            if (total > 2048) throw new IOException("窗口唤醒参数超过限制。");
+                            var value = Json.Object(Product.Utf8.GetString(bytes, 0, total));
+                            if (value.ContainsKey("command")) {
+                                Json.Keys(value, "command");
+                                if (Json.String(value, "command") != "exit-for-update") throw new IOException("窗口更新请求无效。");
+                                using (var output = new StreamWriter(pipe, Product.Utf8, 1024, true)) {
+                                    var process = Process.GetCurrentProcess();
+                                    output.WriteLine(Json.Encode(new { pid = process.Id, startedAt = process.StartTime.ToUniversalTime().Ticks.ToString() }));
+                                    output.Flush();
+                                }
+                                exiting(); continue;
+                            }
+                            Json.Keys(value, "target");
+                            NoticeTarget target = value["target"] == null ? null : Json.Decode<NoticeTarget>(Json.Encode(value["target"]));
+                            if (target != null) target.Validate();
+                            opened(target);
+                        }
+                    } catch (Exception error) {
+                        if (disposed) return;
+                        failure(error);
+                        Thread.Sleep(1000);
+                    }
+                }
+            });
+        }
+        public void Dispose()
+        {
+            disposed = true;
+            if (waiting != null) waiting.Dispose();
+            if (owns) mutex.ReleaseMutex();
+            mutex.Dispose();
+        }
+    }
+
+    internal static class Program
+    {
+        [STAThread]
+        private static void Main(string[] args)
+        {
+            Application.EnableVisualStyles(); Application.SetCompatibleTextRenderingDefault(false);
+            AppContext.SetSwitch("Switch.UseLegacyAccessibilityFeatures", false);
+            Application.SetUnhandledExceptionMode(UnhandledExceptionMode.ThrowException);
+            try {
+                Options options = Options.Parse(args);
+                using (var single = new SingleClient(options.State)) {
+                    var state = new ClientState(options.State);
+                    var notices = new WindowsNotices(state, Application.ExecutablePath);
+                    NoticeTarget target = options.Activation == null ? null : notices.ParseActivation(options.Activation);
+                    if (!single.Owns) { single.Forward(target); return; }
+                    using (var window = new ClientWindow(options, state, notices)) {
+                        window.Shown += delegate {
+                            single.Listen(value => {
+                                if (!window.IsDisposed) window.BeginInvoke((Action)(() => window.OpenTarget(value)));
+                            }, error => {
+                                if (!window.IsDisposed) window.BeginInvoke((Action)(() => window.SetStatus("窗口唤醒失败，请从任务栏打开。", error)));
+                            }, () => {
+                                if (!window.IsDisposed) window.BeginInvoke((Action)(async () => await window.ExitForUpdate()));
+                            });
+                            if (target != null) window.OpenTarget(target);
+                        };
+                        Application.Run(window);
+                    }
+                }
+            } catch (Exception error) {
+                MessageBox.Show("软件未能继续运行。原账本和本机草稿未删除。\r\n\r\n" + Safe(error.Message),
+                    "园区租赁", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            }
+        }
+        internal static string Safe(string value)
+        {
+            string text = System.Text.RegularExpressions.Regex.Replace(value ?? "未知错误", @"[\x00-\x1f\x7f]+", " ");
+            return text.Length > 450 ? text.Substring(0, 450) : text;
+        }
+    }
+}

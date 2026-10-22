@@ -1,0 +1,78 @@
+using System;
+using System.Collections.Generic;
+using System.Diagnostics;
+using System.IO;
+using System.Threading.Tasks;
+using RentLan;
+
+namespace RentCentre.Client
+{
+    internal sealed class ClientUpdates
+    {
+        private readonly string program, root, config;
+        internal readonly bool Enabled;
+        internal ClientUpdates(bool isolated)
+        {
+            program = Directory.GetParent(Path.GetDirectoryName(System.Windows.Forms.Application.ExecutablePath)).FullName;
+            root = Directory.GetParent(program).FullName; config = Path.Combine(root, "配置", "config.json");
+            string roleFile = Path.Combine(root, "配置", "电脑角色.json");
+            if (!isolated && File.Exists(roleFile)) {
+                var role = Json.Object(Product.Utf8.GetString(Paths.Read(roleFile, 2048)));
+                Enabled = Json.String(role, "mode") == "client";
+            }
+        }
+        internal async Task<Dictionary<string, object>> Check(SavedCompany company, UpdateAccess access, string installationId)
+        {
+            string source = await Task.Run(() => ClientHttp.Get(company, "/api/desktop/update-source", null, 2097152));
+            var value = Json.Object(source, 2097152);
+            if (Json.String(value, "serverId") != company.serverId) throw new IOException("软件更新来源不是当前公司。");
+            var start = new ProcessStartInfo(Path.Combine(program, "runtime", "node.exe"),
+                "--disable-warning=ExperimentalWarning " + WindowsNotices.Quote(Path.Combine(program, "updates", "desktop-agent.cjs")) +
+                " check --program " + WindowsNotices.Quote(program) + " --config " + WindowsNotices.Quote(config)) {
+                UseShellExecute = false, CreateNoWindow = true, WorkingDirectory = program,
+                RedirectStandardInput = true, RedirectStandardOutput = true, RedirectStandardError = true,
+                StandardOutputEncoding = Product.Utf8, StandardErrorEncoding = Product.Utf8
+            };
+            start.EnvironmentVariables.Remove("NODE_OPTIONS"); start.EnvironmentVariables.Remove("NODE_PATH");
+            using (var process = Process.Start(start)) {
+                if (access != null) access.Validate(company, installationId);
+                byte[] bytes = Product.Utf8.GetBytes(Json.Encode(new { source = value, access }, 2097152));
+                process.StandardInput.BaseStream.Write(bytes, 0, bytes.Length); process.StandardInput.Close();
+                var output = process.StandardOutput.ReadToEndAsync(); var errors = process.StandardError.ReadToEndAsync();
+                if (!await Task.Run(() => process.WaitForExit(600000))) { process.Kill(); throw new IOException("软件下载超时，现有程序仍保留。"); }
+                string body = await output, failure = await errors;
+                if (process.ExitCode != 0) throw new IOException(String.IsNullOrWhiteSpace(failure) ? "软件更新准备失败。" : failure);
+                return Json.Object(body);
+            }
+        }
+        internal async Task Launch(Dictionary<string, object> update)
+        {
+            string id = Json.String(update, "jobId"), helper = Json.String(update, "helper"), expected = Json.String(update, "helperSha256");
+            Product.Uuid(id); Product.Sha256(expected); Paths.Absolute(helper, false);
+            string release = Directory.GetParent(Path.GetDirectoryName(helper)).FullName;
+            if (Path.GetFileName(helper) != "应用程序更新.exe" || Path.GetFileName(Path.GetDirectoryName(helper)) != "desktop" ||
+                Directory.GetParent(release).FullName != Path.Combine(root, "更新", "client-runtime", "releases"))
+                throw new IOException("员工更新助手不属于此安装。");
+            using (var file = new CheckedFile(helper, false)) {
+                byte[] data = new byte[(int)file.Stream.Length];
+                int total = 0;
+                while (total < data.Length) { int count = file.Stream.Read(data, total, data.Length - total); if (count == 0) throw new IOException("更新助手读取不完整。"); total += count; }
+                if (Product.Hash(data) != expected) throw new IOException("员工更新助手发生变化。");
+            }
+            var parent = Process.GetCurrentProcess();
+            var start = new ProcessStartInfo(helper, "--client --program " + WindowsNotices.Quote(program) +
+                " --config " + WindowsNotices.Quote(config) + " --job " + id + " --parent " + parent.Id +
+                " --parent-start " + parent.StartTime.ToUniversalTime().Ticks) {
+                UseShellExecute = false, WorkingDirectory = Path.GetDirectoryName(helper), RedirectStandardInput = true,
+                RedirectStandardOutput = true, StandardOutputEncoding = Product.Utf8
+            };
+            using (var process = Process.Start(start)) {
+                byte[] frame = Product.Utf8.GetBytes(Json.Encode(new { command = "apply", protocol = 1, jobId = id }) + "\n");
+                process.StandardInput.BaseStream.Write(frame, 0, frame.Length); process.StandardInput.BaseStream.Flush();
+                var reading = process.StandardOutput.ReadLineAsync();
+                if (await Task.WhenAny(reading, Task.Delay(15000)) != reading || await reading != "{\"ready\":true}")
+                    throw new IOException("更新助手未确认接管，业务窗口仍保留。");
+            }
+        }
+    }
+}

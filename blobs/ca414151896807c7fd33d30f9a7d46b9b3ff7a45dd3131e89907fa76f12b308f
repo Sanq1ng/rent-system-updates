@@ -1,0 +1,127 @@
+"use strict";
+
+const https = require("node:https");
+const tls = require("node:tls");
+const crypto = require("node:crypto");
+const { privateIPv4 } = require("../shared/lan-policy.cjs");
+const { fail, digest } = require("./files.cjs");
+const { createDownloader } = require("./transport.cjs");
+
+function createLanTransport({ company, access, feedUrl, releaseId, manifest }, { request = https.get } = {}) {
+  if (!/^[a-f0-9]{64}$/.test(releaseId || "")) fail("UPDATE_LAN_IDENTITY", "局域网更新版本标识无效。");
+  const connection = company?.connection;
+  if (!connection || connection.serverId !== company.serverId || connection.origin !== company.origin)
+    fail("UPDATE_LAN_IDENTITY", "局域网更新缺少当前公司已核对的连接。");
+  const origin = new URL(company.origin);
+  if (origin.protocol !== "https:" || !privateIPv4(origin.hostname) || origin.href !== `${company.origin}/` ||
+      origin.username || origin.password || origin.search || origin.hash)
+    fail("UPDATE_LAN_IDENTITY", "局域网更新只能连接已配对的公司主机。");
+  const der = Buffer.from(connection.caCertificate || "", "base64");
+  if (der.length < 256 || der.length > 12288 || der.toString("base64") !== connection.caCertificate ||
+      digest(der) !== connection.caSha256 || connection.format !== "industrial-rent-lan-connection" || connection.formatVersion !== 1)
+    fail("UPDATE_LAN_IDENTITY", "公司更新连接证书校验失败。");
+  const ca = new crypto.X509Certificate(der);
+  const createdAt = Date.parse(connection.createdAt), expiresAt = Date.parse(connection.expiresAt);
+  if (!ca.raw.equals(der) || !ca.ca || !ca.checkIssued(ca) || !ca.verify(ca.publicKey) ||
+      ca.publicKey.asymmetricKeyType !== "rsa" || ca.publicKey.asymmetricKeyDetails.modulusLength < 2048 ||
+      Date.parse(ca.validFrom) > Date.now() || Date.parse(ca.validTo) <= Date.now() ||
+      !Number.isFinite(createdAt) || createdAt > Date.now() + 600_000 ||
+      !Number.isFinite(expiresAt) || expiresAt <= Date.now() || expiresAt <= createdAt ||
+      expiresAt > createdAt + 367 * 24 * 60 * 60_000 || expiresAt > Date.parse(ca.validTo))
+    fail("UPDATE_LAN_IDENTITY", "公司更新连接证书已失效，请联系负责人。");
+  if (!access || access.serverId !== company.serverId || !/^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i.test(access.userId || "") ||
+      access.installationId === undefined ||
+      !/^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/i.test(access.installationId) ||
+      typeof access.token !== "string" || !/^[A-Za-z0-9_-]{1,1536}\.[A-Za-z0-9_-]{43}$/.test(access.token) ||
+      !Number.isSafeInteger(access.expiresAt) || access.expiresAt <= Date.now())
+    fail("UPDATE_ACCESS", "当前电脑的局域网更新授权尚未就绪。", 401);
+  const entries = new Map(manifest.files.map(file => [file.sha256, file.bytes]));
+  let receivedBytes = 0;
+  async function read(address, { maxBytes, signal, range }) {
+    const url = new URL(address), sha = url.pathname.slice(url.pathname.lastIndexOf("/") + 1);
+    const expected = new URL(`blobs/${sha}`, feedUrl);
+    if (url.href !== expected.href || !entries.has(sha) ||
+        (range ? range.total !== entries.get(sha) : maxBytes !== entries.get(sha)))
+      fail("UPDATE_LAN_IDENTITY", "请求不属于已签名的公司程序清单。");
+    const target = new URL(`/api/desktop/update-files/${releaseId}/${sha}`, company.origin);
+    const combined = AbortSignal.any([...(signal ? [signal] : []), AbortSignal.timeout(range ? 60_000 : 180_000)]);
+    return new Promise((resolve, reject) => {
+      const outgoing = request(target, { agent: false, signal: combined, maxHeaderSize: 16384,
+        ca: ca.toString(), rejectUnauthorized: true,
+        checkServerIdentity: (hostname, certificate) => tls.checkServerIdentity(origin.hostname, certificate),
+        headers: { Authorization: `Bearer ${access.token}`, "X-Rent-Installation-Id": access.installationId,
+          Accept: "application/octet-stream", "Accept-Encoding": "identity",
+          ...(range ? { Range: `bytes=${range.start}-${range.end}` } : {}) },
+      }, response => {
+        if ([401, 403, 404, 408, 429, 500, 502, 503, 504].includes(response.statusCode)) {
+          response.destroy();
+          const error = new Error("公司主机的更新下载暂不可用。");
+          error.code = "UPDATE_LAN_UNAVAILABLE"; reject(error); return;
+        }
+        if (response.statusCode === 409) {
+          response.destroy();
+          const error = new Error("公司主机的程序缓存校验未通过。");
+          error.code = "UPDATE_HASH"; reject(error); return;
+        }
+        if (response.headers["x-rent-server-id"] !== company.serverId) {
+          response.destroy();
+          const error = new Error("下载响应不属于已配对的公司。");
+          error.code = "UPDATE_LAN_IDENTITY"; reject(error); return;
+        }
+        if (response.statusCode !== (range ? 206 : 200) || response.headers["content-length"] !== String(maxBytes) ||
+            response.headers["content-type"]?.split(";")[0] !== "application/octet-stream" ||
+            response.headers["content-encoding"] && response.headers["content-encoding"] !== "identity" ||
+            range && response.headers["content-range"] !== `bytes ${range.start}-${range.end}/${range.total}`) {
+          response.destroy();
+          const error = new Error("公司更新响应格式或分段不符，未接受文件。");
+          error.code = "UPDATE_DOWNLOAD"; reject(error); return;
+        }
+        const chunks = [];
+        let count = 0;
+        response.on("data", chunk => {
+          receivedBytes += chunk.length; count += chunk.length;
+          if (count > maxBytes) {
+            const error = new Error("公司更新文件超过签名大小。"); error.code = "UPDATE_SIZE"; response.destroy(error);
+          } else chunks.push(chunk);
+        });
+        response.once("error", reject);
+        response.once("end", () => {
+          if (count !== maxBytes) {
+            const error = new Error("公司更新传输中断，文件未收齐。");
+            error.code = "UPDATE_LAN_UNAVAILABLE"; reject(error);
+          } else resolve(Buffer.concat(chunks, count));
+        });
+      });
+      outgoing.once("error", error => {
+        if (["ECONNREFUSED", "ECONNRESET", "ETIMEDOUT", "EHOSTUNREACH", "ENETUNREACH", "EPIPE", "ABORT_ERR"].includes(error.code) && !signal?.aborted) {
+          const unavailable = new Error("暂时连不上公司主机的更新通道。", { cause: error });
+          unavailable.code = "UPDATE_LAN_UNAVAILABLE"; reject(unavailable);
+        } else reject(error);
+      });
+    });
+  }
+  const download = createDownloader(feedUrl, read);
+  Object.defineProperty(download, "receivedBytes", { get: () => receivedBytes });
+  return download;
+}
+
+function preferLan(lan, publicDownload) {
+  let route = "lan", fallback = null;
+  const download = async (address, options) => {
+    if (route === "public") return publicDownload(address, options);
+    try { return await lan(address, options); }
+    catch (error) {
+      if (error.code !== "UPDATE_LAN_UNAVAILABLE" || options.signal?.aborted) throw error;
+      route = "public"; fallback = "公司主机暂时没能提供更新，这次已从网上下载好。请保存后再点更新。";
+      return publicDownload(address, options);
+    }
+  };
+  Object.defineProperties(download, {
+    route: { get: () => route }, fallback: { get: () => fallback },
+    receivedBytes: { get: () => Number.isSafeInteger(lan.receivedBytes) && Number.isSafeInteger(publicDownload.receivedBytes)
+      ? lan.receivedBytes + publicDownload.receivedBytes : undefined },
+  });
+  return download;
+}
+
+module.exports = { createLanTransport, preferLan };

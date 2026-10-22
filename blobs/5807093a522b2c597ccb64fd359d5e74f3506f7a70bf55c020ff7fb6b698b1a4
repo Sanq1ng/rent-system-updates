@@ -1,0 +1,89 @@
+﻿param(
+    [switch]$UpdateRootLauncher
+)
+
+$ErrorActionPreference = 'Stop'
+$compiler = Join-Path $env:SystemRoot 'Microsoft.NET\Framework64\v4.0.30319\csc.exe'
+if (-not (Test-Path -LiteralPath $compiler -PathType Leaf)) {
+    throw '未找到 Windows 自带的 .NET Framework x64 C# 编译器。请在维护开发机安装/启用 .NET Framework 4.x 后构建；终端用户不需要构建。'
+}
+
+Add-Type -AssemblyName System.Drawing
+$iconPath = Join-Path $PSScriptRoot 'host.ico'
+$bitmap = New-Object System.Drawing.Bitmap(64, 64)
+$graphics = [System.Drawing.Graphics]::FromImage($bitmap)
+$graphics.SmoothingMode = [System.Drawing.Drawing2D.SmoothingMode]::AntiAlias
+$background = New-Object System.Drawing.SolidBrush([System.Drawing.Color]::FromArgb(25, 123, 112))
+$line = New-Object System.Drawing.Pen([System.Drawing.Color]::White, 3)
+$stream = $null
+$icon = $null
+try {
+    $graphics.Clear([System.Drawing.Color]::Transparent)
+    $graphics.FillEllipse($background, 1, 1, 62, 62)
+    $graphics.DrawRectangle($line, 18, 14, 20, 36)
+    $graphics.DrawLine($line, 38, 28, 47, 28)
+    $graphics.DrawLine($line, 47, 28, 47, 50)
+    $graphics.DrawLine($line, 15, 50, 50, 50)
+    foreach ($y in @(22, 30, 38)) { $graphics.DrawLine($line, 24, $y, 31, $y) }
+    $icon = [System.Drawing.Icon]::FromHandle($bitmap.GetHicon())
+    $stream = [System.IO.File]::Create($iconPath)
+    $icon.Save($stream)
+}
+finally {
+    if ($null -ne $stream) { $stream.Dispose() }
+    if ($null -ne $icon) { $icon.Dispose() }
+    $line.Dispose()
+    $background.Dispose()
+    $graphics.Dispose()
+    $bitmap.Dispose()
+}
+
+$executable = Join-Path $PSScriptRoot '园区租赁主机.exe'
+$arguments = @(
+    '/nologo', '/utf8output', '/target:winexe', '/platform:x64', '/optimize+', '/codepage:65001',
+    ('/out:' + $executable), ('/win32manifest:' + (Join-Path $PSScriptRoot 'app.manifest')),
+    ('/win32icon:' + $iconPath),
+    '/reference:System.dll', '/reference:System.Core.dll', '/reference:System.Drawing.dll',
+    '/reference:System.Windows.Forms.dll', '/reference:System.Web.Extensions.dll',
+    (Join-Path $PSScriptRoot 'HostManager.cs'), (Join-Path $PSScriptRoot 'Native.cs'),
+    (Join-Path $PSScriptRoot 'Theme.cs'), (Join-Path $PSScriptRoot 'Updates.cs'), (Join-Path $PSScriptRoot 'WholeUpdate.cs'),
+    (Join-Path $PSScriptRoot 'Lan.cs'), (Join-Path $PSScriptRoot 'AccountSetup.cs')
+)
+& $compiler @arguments
+if ($LASTEXITCODE -ne 0) { throw '图形主机编译失败；未更新构建校验记录，不得使用旧入口打包。' }
+$helper = Join-Path $PSScriptRoot '应用程序更新.exe'
+& $compiler /nologo /target:winexe /platform:x64 /optimize+ /codepage:65001 ('/out:' + $helper) `
+    ('/win32manifest:' + (Join-Path $PSScriptRoot 'app.manifest')) `
+    /reference:System.dll /reference:System.Core.dll /reference:System.Drawing.dll /reference:System.Windows.Forms.dll /reference:System.Web.Extensions.dll `
+    (Join-Path $PSScriptRoot 'ApplyUpdate.cs') (Join-Path $PSScriptRoot '..\lan-windows\Protocol.cs') `
+    (Join-Path $PSScriptRoot '..\lan-windows\Safety.cs') (Join-Path $PSScriptRoot '..\lan-windows\Certificates.cs')
+if ($LASTEXITCODE -ne 0) { throw '整程序更新助手编译失败；不得打包旧程序。' }
+
+$sources = @('HostManager.cs', 'Updates.cs', 'WholeUpdate.cs', 'ApplyUpdate.cs', 'Lan.cs', 'AccountSetup.cs', 'Native.cs', 'Theme.cs', 'app.manifest', 'artifact.cjs', 'build.ps1', 'host.ico', '..\host.cjs', '..\config.cjs', '..\deployment\layout.cjs', '..\deployment\employee-package.cjs', '..\shared\lan-policy.cjs',
+    '..\lan-windows\Protocol.cs', '..\lan-windows\Safety.cs', '..\lan-windows\Certificates.cs',
+    '..\updates\files.cjs', '..\updates\transport.cjs', '..\updates\lan-transport.cjs', '..\updates\source-config.cjs', '..\updates\releases.cjs', '..\updates\state.cjs',
+    '..\updates\engine.cjs', '..\updates\supervisor.cjs', '..\updates\publish.cjs', '..\updates\bundle-layout.cjs', '..\updates\full-apply.cjs', '..\updates\desktop-agent.cjs')
+$hashes = [ordered]@{}
+foreach ($source in $sources) {
+    $hashes[$source] = (Get-FileHash -LiteralPath (Join-Path $PSScriptRoot $source) -Algorithm SHA256).Hash.ToLowerInvariant()
+}
+$record = [ordered]@{
+    format = 'industrial-rent-desktop'
+    formatVersion = 1
+    protocolVersion = 2
+    executable = '园区租赁主机.exe'
+    executableSha256 = (Get-FileHash -LiteralPath $executable -Algorithm SHA256).Hash.ToLowerInvariant()
+    helperSha256 = (Get-FileHash -LiteralPath $helper -Algorithm SHA256).Hash.ToLowerInvariant()
+    sourceSha256 = $hashes
+}
+$utf8 = New-Object System.Text.UTF8Encoding($false)
+[System.IO.File]::WriteAllText((Join-Path $PSScriptRoot 'build.json'), ($record | ConvertTo-Json -Depth 5) + "`r`n", $utf8)
+
+if ($UpdateRootLauncher) {
+    $project = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
+    $rootLauncher = Join-Path $project '启动租约正式版.exe'
+    Copy-Item -LiteralPath $executable -Destination $rootLauncher -Force
+    Write-Host ('已更新根目录图形入口：' + $rootLauncher)
+}
+Write-Host ('图形主机已构建（x64 / 无控制台）：' + $executable)
+Write-Host '已记录源码与程序 SHA-256；维护工具打包时将重新校验，不会在部署电脑编译。'
