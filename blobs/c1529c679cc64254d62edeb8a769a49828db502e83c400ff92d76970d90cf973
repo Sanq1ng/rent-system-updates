@@ -1,0 +1,306 @@
+export type Role = "admin" | "operator" | "reviewer" | "viewer";
+export interface User {
+  id: string;
+  username: string;
+  displayName: string;
+  roles: Role[];
+  allParks: boolean;
+  parks: string[];
+  canExport: boolean;
+  receiveReminders: boolean;
+  active: boolean;
+  version: number;
+}
+export interface Location {
+  park: string;
+  building: string;
+  floor: string;
+  zone: string;
+  area: string;
+  allocatedRent: string;
+}
+export interface Attachment {
+  id: string;
+  name: string;
+  size: number;
+  mime: string;
+  sha256: string;
+}
+export interface Fee {
+  id: string;
+  kind: "property" | "water" | "electricity" | "deposit" | "other";
+  label: string;
+  /** For period frequency this is the whole fee per rent-payment occurrence, not a monthly unit rate. */
+  amount: string;
+  frequency: "once" | "period";
+  dueDate: string;
+}
+export interface OpeningPayment {
+  rowId: string;
+  paidCents: number;
+  reason: string;
+}
+export type RentTaxMode = "inclusive" | "exclusive";
+export type LessorEntity = "jiuming" | "xunyong" | "hengdong" | "shihan" | "debang" | "other";
+export interface ContractMetadata {
+  /** Absent only in pre-upgrade records; new submissions require an explicit value. Does not change amounts. */
+  rentTaxMode?: RentTaxMode;
+  lessorId?: LessorEntity;
+  lessorOtherName?: string;
+  /** Independent optional owner label; never inferred from park or contracting lessor. */
+  propertyOwner?: string;
+}
+export interface ContractData extends ContractMetadata {
+  number: string;
+  tenantType: "company" | "person";
+  tenant: string;
+  contact: string;
+  phone: string;
+  startDate: string;
+  endDate: string;
+  managementStartDate: string;
+  locations: Location[];
+  amount: string;
+  amountBasis: "month" | "period";
+  cycleMonths: 1 | 3 | 6 | 12;
+  anchor: "calendar" | "anniversary";
+  advanceMonths: number;
+  dueDay: number;
+  fees: Fee[];
+  freeEnabled: boolean;
+  freeStart: string;
+  freeEnd: string;
+  notes: string;
+  overrides: Record<string, { amount: string; dueDate: string; reason: string }>;
+  attachments: Attachment[];
+  openingPayments: OpeningPayment[];
+  renewalOf?: string;
+}
+export interface ScheduleRow {
+  id: string;
+  kind: string;
+  label: string;
+  periodStart: string;
+  periodEnd: string;
+  dueDate: string | null;
+  amountCents: number | null;
+  manual: boolean;
+  reason: string;
+  issues: string[];
+  flags: string[];
+  needsOpening: boolean;
+}
+export interface Contract {
+  id: string;
+  /** Aggregate concurrency revision, including changes to its approved ledger. */
+  version: number;
+  status: "active" | "terminated" | "void";
+  data: ContractData;
+  approvedAt: string;
+  approvedBy: string;
+  terminationDate?: string;
+  versions: Array<{ version: number; data: ContractData; at: string; actor: string; reason: string }>;
+}
+export interface Invoice extends ContractMetadata {
+  id: string;
+  version: number;
+  contractId: string;
+  kind: string;
+  label: string;
+  tenant: string;
+  locations: Location[];
+  periodStart: string;
+  periodEnd: string;
+  dueDate: string;
+  amountCents: number;
+  openingPaidCents: number;
+  paidCents: number;
+  status: "active" | "superseded" | "void";
+  manual: boolean;
+  reason: string;
+  flags: string[];
+}
+export interface Payment {
+  id: string;
+  version: number;
+  contractId: string;
+  invoiceId: string;
+  amountCents: number;
+  payDate: string;
+  method: string;
+  note: string;
+  attachments: Attachment[];
+  status: "active" | "void";
+  approvedBy: string;
+  approvedAt: string;
+}
+export interface Refund {
+  id: string;
+  invoiceId: string;
+  contractId: string;
+  amountCents: number;
+  refundDate: string;
+  effect: "reopen" | "reduce-charge";
+  reason: string;
+  attachments: Attachment[];
+  approvedBy: string;
+  approvedAt: string;
+}
+export type ApplicationKind =
+  | "contract" | "contract-change" | "contract-void"
+  | "termination" | "payment" | "payment-void"
+  | "refund" | "invoice-adjustment" | "opening-balance";
+export interface Application {
+  id: string;
+  number: string;
+  kind: ApplicationKind;
+  status: "pending" | "approved" | "returned";
+  version: number;
+  creator: string;
+  submittedAt: string;
+  payload: ApplicationPayload;
+  reason: string;
+  reviewer?: string;
+  reviewedAt?: string;
+  reviewReason?: string;
+  trail: AuditEntry[];
+  versions: Array<{ version: number; payload: ApplicationPayload; at: string }>;
+}
+export interface AuditEntry {
+  id: string;
+  action: string;
+  actor: string;
+  at: string;
+  clientTime?: string;
+  detail: string;
+  before?: unknown;
+  after?: unknown;
+}
+export type ApplicationPayload =
+  | { data: ContractData; rows?: ScheduleRow[] }
+  | { contractId: string; expectedVersion: number; data: ContractData; effectiveDate: string }
+  | { contractId: string; expectedVersion: number }
+  | { contractId: string; expectedVersion: number; terminationDate: string;
+      adjustments: Array<{ invoiceId: string; expectedVersion: number; amountCents: number; reason: string }> }
+  | { invoiceId: string; expectedVersion: number; amountCents: number; payDate: string;
+      method: string; note: string; attachments: Attachment[] }
+  | { paymentId: string; expectedVersion: number }
+  | { invoiceId: string; expectedVersion: number; amountCents: number; refundDate: string;
+      effect: "reopen" | "reduce-charge"; attachments: Attachment[] }
+  | { invoiceId: string; expectedVersion: number; amountCents: number; dueDate: string }
+  | { contractId: string; expectedVersion: number; kind: string; label: string; amountCents: number;
+      periodStart: string; periodEnd: string; dueDate: string };
+export interface Operation {
+  operationId: string;
+  clientTime: string;
+  type: "submit" | "resubmit" | "review";
+  payload:
+    | { kind: ApplicationKind; payload: ApplicationPayload; reason: string }
+    | { applicationId: string; expectedVersion: number; payload: ApplicationPayload; reason: string }
+    | { applicationId: string; expectedVersion: number; decision: "approve" | "return"; reason: string };
+}
+export interface OperationResult {
+  operationId: string;
+  applicationId: string;
+  status: string;
+  version: number;
+}
+export interface Settings {
+  accountingStartDate: string;
+  dueReminderTime: string;
+  monthlyReminderTime: string;
+  offlineDays: number;
+  version: number;
+}
+export interface Notification {
+  id: string;
+  type: "due" | "monthly";
+  date: string;
+  title: string;
+  detail: string;
+  invoiceId?: string;
+  month?: string;
+  read: boolean;
+}
+export interface Snapshot {
+  protocolVersion: 1;
+  serverId: string;
+  serverTime: string;
+  today: string;
+  user: User;
+  settings: Settings;
+  people: Record<string, { name: string }>;
+  parks: string[];
+  contracts: Contract[];
+  invoices: Invoice[];
+  payments: Payment[];
+  refunds: Refund[];
+  applications: Application[];
+  history: AuditEntry[];
+  notifications: Notification[];
+}
+export interface ServerConfig {
+  dataDir: string;
+  backupDir: string;
+  host: string;
+  port: number;
+  publicOrigin: string;
+  tls?: { keyFile: string; certFile: string };
+  sessionHours: number;
+  backupIntervalMinutes: number;
+  updates?: UpdateConfiguration;
+}
+
+export interface UpdateConfiguration {
+  feedUrl: string | null;
+  trustedKeys: Record<string, string>;
+  allowPrivateNetwork: boolean;
+}
+export interface UpdateJob {
+  id: string;
+  action: "check" | "stage" | "install";
+  phase: string;
+  targetVersion: string | null;
+  stagedId: string | null;
+  windowId: string | null;
+  canCancel: boolean;
+  error: { code: string; message: string } | null;
+  createdAt: string;
+  updatedAt: string;
+}
+export interface UpdateStatus {
+  currentVersion: string;
+  configured: boolean;
+  installSupported: boolean;
+  unavailableReason: string | null;
+  phase: string;
+  availableRelease: { id: string; releaseId: string; version: string; sequence: number; fileCount: number; bytes: number } | null;
+  stagedRelease: { id: string; version: string } | null;
+  job: UpdateJob | null;
+  requestError: { code: string; message: string; diagnosticId: string; action: UpdateJob["action"]; createdAt: string } | null;
+}
+export interface UpdateContext {
+  actorId: string;
+  /** Registered before enqueue; resolves on HTTP response finish or close, never rejects. */
+  responseSettled?: Promise<void>;
+  /** Revalidates the initiating session/admin before asynchronous preparation and restart handoff. */
+  authorize(): string;
+}
+export interface UpdateAcceptance { jobId: string; windowId?: string }
+export interface UpdateController {
+  status(): UpdateStatus;
+  check(input: { requestId: string }, context: UpdateContext): Promise<UpdateAcceptance>;
+  stage(input: { releaseId: string; requestId: string }, context: UpdateContext): Promise<UpdateAcceptance>;
+  install(input: { stagedId: string; expectedVersion: string; requestId: string }, context: UpdateContext): Promise<UpdateAcceptance>;
+  cancel(input: { jobId: string; requestId: string }, context: UpdateContext): Promise<UpdateAcceptance>;
+}
+export interface UpdateMaintenance {
+  /** deadline is epoch milliseconds for preparation; a sealed installing gate never expires itself. */
+  quiesceForUpdate(input: { windowId: string; targetVersion: string; deadline: number; signal: AbortSignal }): Promise<void>;
+  finishUpdateMaintenance(input: { windowId: string; outcome: "cancelled" | "committed" | "rolled-back" }): Promise<void>;
+  getUpdateGateStatus(): {
+    phase: "idle" | "preparing" | "installing" | "expired"; id?: string | null; targetVersion?: string;
+    expiresAt?: string; pageCount?: number; readyCount?: number; blockers?: Array<{ name: string; reason: string }>;
+  };
+  getUpdateIdentity(): { serverId: string; schemaVersion: number; applicationVersion: string };
+}

@@ -1,0 +1,512 @@
+(function (root, factory) {
+  "use strict";
+  const api = factory();
+  if (typeof module === "object" && module.exports) module.exports = api;
+  else root.RentOffline = api;
+})(globalThis, function () {
+  "use strict";
+  const DB = "rent-private-workspace-v1";
+  const RECORDS = "records";
+  const TRANSFER_FORMAT = "rent-encrypted-local-work";
+  const TRANSFER_VERSION = 1;
+  const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+  const encoder = new TextEncoder();
+  const decoder = new TextDecoder();
+  const copy = value => structuredClone(value);
+  const id = () => crypto.randomUUID();
+  const localAttachment = attachment => typeof attachment?.id === "string" && attachment.id.startsWith("local:");
+  const bytesToBase64 = bytes => {
+    let output = "";
+    for (let i = 0; i < bytes.length; i += 8192) output += String.fromCharCode(...bytes.subarray(i, i + 8192));
+    return btoa(output);
+  };
+  const base64ToBytes = text => Uint8Array.from(atob(text), char => char.charCodeAt(0));
+  const profileKey = (serverId, userId) => `vault:${serverId}:${userId}`;
+  const profilesKey = serverId => `profiles:${serverId}`;
+  const recoveryKey = (serverId, userId) => `draft-recovery:${serverId}:${userId}`;
+  const recoveryHeader = record => JSON.stringify([record.format, record.version, record.id, record.serverId, record.userId]);
+
+  function openDB() {
+    return new Promise((resolve, reject) => {
+      const request = indexedDB.open(DB, 1);
+      request.onupgradeneeded = () => request.result.createObjectStore(RECORDS);
+      request.onsuccess = () => resolve(request.result);
+      request.onerror = () => reject(request.error);
+      request.onblocked = () => reject(new Error("本机加密存储正在被其他窗口占用，请关闭其他窗口后重试。"));
+    });
+  }
+
+  async function get(key) {
+    const db = await openDB();
+    try {
+      return await new Promise((resolve, reject) => {
+        const tx = db.transaction(RECORDS, "readonly");
+        const request = tx.objectStore(RECORDS).get(key);
+        request.onsuccess = () => resolve(request.result);
+        request.onerror = () => reject(request.error);
+      });
+    } finally { db.close(); }
+  }
+
+  async function cas(key, expected, value) {
+    const db = await openDB();
+    try {
+      return await new Promise((resolve, reject) => {
+        const tx = db.transaction(RECORDS, "readwrite", { durability: "strict" });
+        const store = tx.objectStore(RECORDS);
+        let conflict = false;
+        const request = store.get(key);
+        request.onsuccess = () => {
+          if ((request.result?.revision || 0) !== expected) {
+            conflict = true;
+            tx.abort();
+          } else store.put({ ...value, revision: expected + 1 }, key);
+        };
+        tx.oncomplete = () => resolve(expected + 1);
+        tx.onabort = () => reject(conflict
+          ? new Error("另一窗口已更新本机加密工作区。当前输入仍在此窗口；请保留输入并重新登录后再保存。")
+          : tx.error || new Error("无法保存加密工作区。"));
+        tx.onerror = () => reject(tx.error);
+      });
+    } finally { db.close(); }
+  }
+
+  async function derive(password, salt) {
+    const material = await crypto.subtle.importKey("raw", encoder.encode(password), "PBKDF2", false, ["deriveKey"]);
+    return crypto.subtle.deriveKey({ name: "PBKDF2", salt, iterations: 310000, hash: "SHA-256" },
+      material, { name: "AES-GCM", length: 256 }, false, ["encrypt", "decrypt"]);
+  }
+
+  async function encrypt(value, key, salt, additionalData = null) {
+    const iv = crypto.getRandomValues(new Uint8Array(12));
+    const ciphertext = await crypto.subtle.encrypt({ name: "AES-GCM", iv,
+      ...(additionalData ? { additionalData: encoder.encode(additionalData) } : {}) },
+    key, encoder.encode(JSON.stringify(value)));
+    return { salt: bytesToBase64(salt), iv: bytesToBase64(iv), ciphertext: bytesToBase64(new Uint8Array(ciphertext)) };
+  }
+
+  async function decrypt(record, key, additionalData = null) {
+    try {
+      const bytes = await crypto.subtle.decrypt({ name: "AES-GCM", iv: base64ToBytes(record.iv),
+        ...(additionalData ? { additionalData: encoder.encode(additionalData) } : {}) },
+        key, base64ToBytes(record.ciphertext));
+      return JSON.parse(decoder.decode(bytes));
+    } catch (error) {
+      if (error.name === "OperationError") throw Object.assign(new Error("此账号的本机加密密码不匹配。请用此前登录时的密码恢复草稿和待同步数据，再更换加密密码；勿清除浏览器数据。"),
+        { code: "OFFLINE_PASSWORD_MISMATCH" });
+      throw error;
+    }
+  }
+
+  function replaceLocalAttachments(value, uploaded) {
+    if (Array.isArray(value)) return value.map(entry => replaceLocalAttachments(entry, uploaded));
+    if (!value || typeof value !== "object") return value;
+    if (localAttachment(value)) {
+      if (!uploaded[value.id]) throw new Error(`附件 ${value.name} 尚未完成上传。`);
+      return uploaded[value.id];
+    }
+    return Object.fromEntries(Object.entries(value).map(([key, entry]) => [key, replaceLocalAttachments(entry, uploaded)]));
+  }
+
+  function attachmentIds(value, output = new Set()) {
+    if (Array.isArray(value)) value.forEach(entry => attachmentIds(entry, output));
+    else if (value && typeof value === "object") {
+      if (localAttachment(value)) output.add(value.id);
+      else Object.values(value).forEach(entry => attachmentIds(entry, output));
+    }
+    return [...output];
+  }
+
+  function object(value) { return value !== null && typeof value === "object" && !Array.isArray(value); }
+  function same(a, b) { return JSON.stringify(a) === JSON.stringify(b); }
+  function transferHeader(bundle) {
+    return JSON.stringify([bundle.format, bundle.version, bundle.serverId, bundle.userId, bundle.exportedAt]);
+  }
+  function transferPassword(password) {
+    if (typeof password !== "string" || password.length < 12 || password.length > 128) {
+      throw new Error("迁移文件密码须为 12 至 128 个字符；请妥善保管，它不会传给主机。");
+    }
+  }
+  function validateTransfer(content) {
+    if (!object(content) || !Array.isArray(content.drafts) || !Array.isArray(content.queue) ||
+        !Array.isArray(content.rejected) || !object(content.files) || !object(content.uploaded)) {
+      throw new Error("迁移文件内容缺失草稿、队列、原件或上传映射，未写入本机。");
+    }
+    const used = new Set();
+    for (const item of [...content.queue, ...content.rejected]) {
+      const op = item?.operation;
+      if (!object(item) || !object(op) || !UUID.test(op.operationId) || used.has(op.operationId) ||
+          !["submit", "resubmit", "review"].includes(op.type) || !object(op.payload) ||
+          !Number.isFinite(Date.parse(op.clientTime)) || typeof item.error !== "string" ||
+          (item.prepared != null && (!object(item.prepared) || item.prepared.operationId !== op.operationId ||
+            item.prepared.type !== op.type || item.prepared.clientTime !== op.clientTime))) {
+        throw new Error("迁移文件包含重复或无效的请求标识/版本，未写入本机。");
+      }
+      used.add(op.operationId);
+    }
+    const drafts = new Set();
+    for (const draft of content.drafts) {
+      if (!object(draft) || !UUID.test(draft.id) || drafts.has(draft.id) || !object(draft.data)) {
+        throw new Error("迁移文件包含重复或无效的合同草稿，未写入本机。");
+      }
+      drafts.add(draft.id);
+    }
+    for (const [key, file] of Object.entries(content.files)) {
+      if (!UUID.test(key) && !(key.startsWith("local:") && UUID.test(key.slice(6))) ||
+          !object(file) || typeof file.name !== "string" || typeof file.mime !== "string" ||
+          typeof file.bytes !== "string" || file.bytes.length % 4 !== 0 ||
+          !/^[A-Za-z0-9+/]*={0,2}$/.test(file.bytes)) {
+        throw new Error("迁移文件包含无效的原件缓存，未写入本机。");
+      }
+    }
+    for (const [key, attachment] of Object.entries(content.uploaded)) {
+      if (!key.startsWith("local:") || !UUID.test(key.slice(6)) || !object(attachment) ||
+          !UUID.test(attachment.id) || typeof attachment.name !== "string") {
+        throw new Error("迁移文件包含无效的上传映射，未写入本机。");
+      }
+    }
+    for (const item of [
+      ...content.queue.map(entry => ({ label: `待同步请求 ${entry.operation.operationId}`, data: entry.operation })),
+      ...content.rejected.map(entry => ({ label: `拒绝请求 ${entry.operation.operationId}`, data: entry.operation })),
+      ...content.drafts.map(entry => ({ label: `合同草稿 ${entry.id}`, data: entry.data })),
+    ]) {
+      for (const key of attachmentIds(item.data)) {
+        if (!Object.hasOwn(content.files, key)) {
+          throw new Error(`${item.label} 缺少实际原件字节 ${key}，未导入。`);
+        }
+      }
+    }
+  }
+  function usesAttachment(value, ids) {
+    if (Array.isArray(value)) return value.some(entry => usesAttachment(entry, ids));
+    if (!object(value)) return false;
+    if (typeof value.id === "string" && typeof value.name === "string" && ids.has(value.id)) return true;
+    return Object.values(value).some(entry => usesAttachment(entry, ids));
+  }
+  function planTransfer(current, content) {
+    validateTransfer(content);
+    const conflicts = [];
+    const occupiedFiles = new Set(), occupiedUploads = new Set();
+    for (const [key, file] of Object.entries(content.files)) {
+      if (Object.hasOwn(current.files, key) && !same(current.files[key], file)) {
+        conflicts.push(`原件 ${key}：本机与迁移文件字节不同`); occupiedFiles.add(key);
+      }
+    }
+    for (const [key, attachment] of Object.entries(content.uploaded)) {
+      if (Object.hasOwn(current.uploaded, key) && !same(current.uploaded[key], attachment)) {
+        conflicts.push(`上传映射 ${key}：服务端原件标识不同`); occupiedUploads.add(key);
+      }
+    }
+    const occupied = new Set([...occupiedFiles, ...occupiedUploads]);
+    const known = new Map([...(current.queue || []).map(item => [item, "queue"]),
+      ...(current.rejected || []).map(item => [item, "rejected"])]
+      .map(([item, kind]) => [item.operation.operationId, { item, kind }]));
+    for (const [kind, items] of [["queue", content.queue], ["rejected", content.rejected]]) {
+      for (const item of items) {
+        const opId = item.operation.operationId;
+        const previous = known.get(opId);
+        if (previous && (previous.kind !== kind || !same(previous.item, item))) {
+          conflicts.push(`请求 ${opId}：相同幂等标识对应不同内容、进度或队列状态`);
+        } else if (usesAttachment(item, occupied)) conflicts.push(`请求 ${opId}：引用了冲突的原件或上传映射`);
+      }
+    }
+    for (const draft of content.drafts) {
+      if (usesAttachment(draft, occupied)) conflicts.push(`草稿 ${draft.id}：引用了冲突的原件或上传映射`);
+    }
+    const copies = content.drafts.filter(draft =>
+      current.drafts.some(local => local.id === draft.id && !same(local, draft))).length;
+    return { conflicts, draftCopies: copies, drafts: content.drafts.length,
+      queue: content.queue.length, rejected: content.rejected.length, files: Object.keys(content.files).length };
+  }
+  function mergeTransfer(current, content, reviewedConflicts, skipConflicts) {
+    const plan = planTransfer(current, content);
+    if (!same(plan.conflicts, reviewedConflicts)) throw new Error("本机工作区或冲突清单已变化；请重新检查迁移文件再确认。");
+    if (plan.conflicts.length && !skipConflicts) throw new Error("迁移内容存在冲突；需明确选择保留本机冲突项或取消。");
+    const occupied = new Set();
+    for (const [key, file] of Object.entries(content.files)) {
+      if (Object.hasOwn(current.files, key) && !same(current.files[key], file)) occupied.add(key);
+      else if (!Object.hasOwn(current.files, key)) current.files[key] = file;
+    }
+    for (const [key, attachment] of Object.entries(content.uploaded)) {
+      if (Object.hasOwn(current.uploaded, key) && !same(current.uploaded[key], attachment)) occupied.add(key);
+      else if (!Object.hasOwn(current.uploaded, key)) current.uploaded[key] = attachment;
+    }
+    const existing = new Map([...current.queue.map(item => [item, "queue"]),
+      ...(current.rejected || []).map(item => [item, "rejected"])]
+      .map(([item, kind]) => [item.operation.operationId, { item, kind }]));
+    let addedDrafts = 0, addedQueue = 0, skipped = 0;
+    for (const draft of content.drafts) {
+      if (usesAttachment(draft, occupied)) { skipped++; continue; }
+      const prior = current.drafts.find(item => item.id === draft.id);
+      if (prior && same(prior, draft)) continue;
+      const incoming = copy(draft);
+      if (prior) { incoming.id = id(); incoming.updatedAt = new Date().toISOString(); }
+      current.drafts.push(incoming);
+      addedDrafts++;
+    }
+    for (const [kind, items] of [["queue", content.queue], ["rejected", content.rejected]]) {
+      current[kind] ||= [];
+      for (const item of items) {
+        const previous = existing.get(item.operation.operationId);
+        if (previous && (previous.kind !== kind || !same(previous.item, item)) ||
+            usesAttachment(item, occupied)) { skipped++; continue; }
+        if (previous) continue;
+        current[kind].push(copy(item));
+        existing.set(item.operation.operationId, { item, kind });
+        if (kind === "queue") addedQueue++;
+      }
+    }
+    if (addedQueue) current.importAwaitingReview = true;
+    return { addedDrafts, addedQueue, skipped };
+  }
+
+  function recoveryItems(record) {
+    if (!record) return [];
+    if (!Array.isArray(record.items) || !Number.isSafeInteger(record.revision) || record.revision < 1 ||
+        record.items.some(item => !object(item) || item.format !== "rent-protected-draft" || item.version !== 1 ||
+          !UUID.test(item.id) || typeof item.serverId !== "string" || typeof item.userId !== "string" ||
+          !["salt", "iv", "ciphertext"].every(key => typeof item[key] === "string")) ||
+        new Set(record.items.map(item => item.id)).size !== record.items.length) {
+      throw new Error("本机草稿恢复记录损坏，请保留现有资料并联系维护人员。");
+    }
+    return record.items;
+  }
+
+  class DraftRecovery {
+    constructor() { this.pending = new Map(); }
+    hasPending() { return this.pending.size > 0; }
+    capture(vault, draft) {
+      const header = { format: "rent-protected-draft", version: 1, id: id(),
+        serverId: vault.serverId, userId: vault.userId };
+      const entry = { header, content: { draft: copy(draft),
+        base: copy(vault.value.drafts.find(item => item.id === draft.id) || null) }, sealed: null, task: null };
+      const key = vault.key, salt = vault.salt;
+      this.pending.set(header.id, entry);
+      entry.task = (async () => {
+        entry.sealed = { ...header, ...await encrypt(entry.content, key, salt, recoveryHeader(header)) };
+        entry.content = null;
+        const name = recoveryKey(header.serverId, header.userId);
+        const previous = await get(name), items = recoveryItems(previous);
+        await cas(name, previous?.revision || 0, { items: [...items, entry.sealed] });
+        this.pending.delete(header.id);
+      })();
+      return entry.task;
+    }
+    async restore(vault, passwords = []) {
+      if (!vault.key || !vault.value) throw new Error("请先重新验证并解锁原账号，才能恢复未保存的草稿。");
+      const owns = header => header.serverId === vault.serverId && header.userId === vault.userId;
+      const pending = [...this.pending.values()].filter(entry => owns(entry.header));
+      await Promise.allSettled(pending.map(entry => entry.task));
+      const name = recoveryKey(vault.serverId, vault.userId);
+      const stored = await get(name);
+      const records = new Map(recoveryItems(stored).map(record => [record.id, { header: record, sealed: record }]));
+      for (const entry of pending) records.set(entry.header.id, entry);
+      let restored = 0, conflicts = 0;
+      for (const entry of records.values()) {
+        if (!owns(entry.header)) throw new Error("恢复副本属于另一个账号或账套，未导入。");
+        let content = entry.content;
+        if (!content) {
+          const keys = [vault.key];
+          for (const password of new Set(passwords.filter(value => typeof value === "string" && value))) {
+            keys.push(await derive(password, base64ToBytes(entry.sealed.salt)));
+          }
+          let mismatch, decoded = false;
+          for (const key of keys) {
+            try { content = await decrypt(entry.sealed, key, recoveryHeader(entry.header)); decoded = true; break; }
+            catch (error) {
+              if (error.code !== "OFFLINE_PASSWORD_MISMATCH") throw error;
+              mismatch = error;
+            }
+          }
+          if (!decoded) throw mismatch;
+        }
+        if (!object(content) || !object(content.draft) || !UUID.test(content.draft.id) ||
+            !object(content.draft.data) || content.base !== null && (!object(content.base) || content.base.id !== content.draft.id)) {
+          throw new Error("未保存草稿的恢复内容不完整，未覆盖现有工作。");
+        }
+        await vault.update(value => {
+          if (value.drafts.some(draft => draft.recoveryId === entry.header.id)) return;
+          const index = value.drafts.findIndex(draft => draft.id === content.draft.id);
+          const draft = { ...copy(content.draft), recoveryId: entry.header.id, updatedAt: new Date().toISOString() };
+          if (index < 0) value.drafts.push(draft);
+          else if (JSON.stringify(value.drafts[index]) === JSON.stringify(content.base)) value.drafts[index] = draft;
+          else {
+            draft.id = id();
+            value.drafts.push(draft);
+            conflicts++;
+          }
+          restored++;
+        });
+        const current = await get(name), items = recoveryItems(current);
+        if (items.some(item => item.id === entry.header.id)) {
+          await cas(name, current.revision, { items: items.filter(item => item.id !== entry.header.id) });
+        }
+        this.pending.delete(entry.header.id);
+      }
+      return { restored, conflicts };
+    }
+  }
+
+  class Vault {
+    constructor(serverId, userId) {
+      this.name = profileKey(serverId, userId);
+      this.serverId = serverId;
+      this.userId = userId;
+      this.revision = 0;
+      this.value = null;
+      this.key = null;
+      this.salt = null;
+    }
+    async unlock(password, create = false) {
+      const record = await get(this.name);
+      if (!record && !create) throw new Error("此账号没有已登录过的本机加密快照；请联网登录。");
+      this.salt = record ? base64ToBytes(record.salt) : crypto.getRandomValues(new Uint8Array(16));
+      this.key = await derive(password, this.salt);
+      this.revision = record?.revision || 0;
+      this.value = record ? await decrypt(record, this.key) :
+        { snapshot: null, drafts: [], queue: [], rejected: [], files: {}, uploaded: {},
+          seenNotifications: [], syncedAt: null, importAwaitingReview: false };
+      return this.value;
+    }
+    async update(change) {
+      const commit = async () => {
+        if (!this.value || !this.key) throw new Error("工作区已锁定，请重新登录。");
+        const revision = this.revision;
+        const next = copy(this.value);
+        await change(next);
+        const sealed = await encrypt(next, this.key, this.salt);
+        this.revision = await cas(this.name, revision, sealed);
+        this.value = next;
+        return next;
+      };
+      return navigator.locks ? navigator.locks.request(this.name, commit) : commit();
+    }
+    async exportTransfer(password) {
+      if (!this.value || !this.key) throw new Error("请先解锁原浏览器工作区。");
+      transferPassword(password);
+      const exportUnderLock = async () => {
+        const record = await get(this.name);
+        const revision = this.revision;
+        if ((record?.revision || 0) !== revision) {
+          throw new Error("另一窗口已修改此工作区；请重新登录后导出最新的加密内容。");
+        }
+        const bundle = { format: TRANSFER_FORMAT, version: TRANSFER_VERSION,
+          serverId: this.serverId, userId: this.userId, exportedAt: new Date().toISOString() };
+        const salt = crypto.getRandomValues(new Uint8Array(16));
+        const key = await derive(password, salt);
+        const content = copy({ drafts: this.value.drafts, queue: this.value.queue,
+          rejected: this.value.rejected || [], files: this.value.files, uploaded: this.value.uploaded });
+        const sealed = await encrypt(content, key, salt, transferHeader(bundle));
+        if ((await get(this.name))?.revision !== revision || this.revision !== revision) {
+          throw new Error("导出期间另一个窗口更新了草稿或队列；本次文件未生成，请重新导出。");
+        }
+        return { ...bundle, ...sealed };
+      };
+      return navigator.locks ? navigator.locks.request(this.name, exportUnderLock) : exportUnderLock();
+    }
+    async openTransfer(bundle, password) {
+      if (!this.value || !this.key) throw new Error("请先登录并解锁目标浏览器工作区。");
+      if (!object(bundle) || bundle.format !== TRANSFER_FORMAT || bundle.version !== TRANSFER_VERSION ||
+          typeof bundle.exportedAt !== "string" || !Number.isFinite(Date.parse(bundle.exportedAt)) ||
+          typeof bundle.salt !== "string" || typeof bundle.iv !== "string" || typeof bundle.ciphertext !== "string") {
+        throw new Error("迁移文件格式或版本不受支持；未写入本机。");
+      }
+      if (bundle.serverId !== this.serverId || bundle.userId !== this.userId) {
+        throw new Error("迁移文件的主机 serverId 或账号 userId 与当前登录身份不同；不能导入其他人的工作区。");
+      }
+      if (typeof password !== "string" || !password) throw new Error("请输入导出时设置的迁移文件密码。");
+      let content;
+      try {
+        const key = await derive(password, base64ToBytes(bundle.salt));
+        content = await decrypt(bundle, key, transferHeader(bundle));
+      } catch (error) {
+        if (error.name === "InvalidCharacterError" || /密码不匹配/.test(error.message)) {
+          throw new Error("迁移文件密码错误或文件已损坏；本机工作区未更改。");
+        }
+        throw error;
+      }
+      validateTransfer(content);
+      return content;
+    }
+    async rekey(newPassword) {
+      if (!this.value || !this.key) throw new Error("请先解锁旧密码保护的工作区。");
+      const salt = crypto.getRandomValues(new Uint8Array(16));
+      const key = await derive(newPassword, salt);
+      const save = async () => {
+        if (!this.value || !this.key) throw new Error("工作区已锁定，请重新登录。");
+        const revision = this.revision;
+        const sealed = await encrypt(this.value, key, salt);
+        this.revision = await cas(this.name, revision, sealed);
+        this.salt = salt;
+        this.key = key;
+      };
+      return navigator.locks ? navigator.locks.request(this.name, save) : save();
+    }
+    lock() {
+      this.key = null;
+      this.salt = null;
+      this.value = null;
+      this.revision = 0;
+    }
+  }
+
+  async function profiles(serverId) {
+    return (await get(profilesKey(serverId)))?.items || [];
+  }
+  async function remember(serverId, user) {
+    const key = profilesKey(serverId);
+    const save = async () => {
+      const previous = await get(key);
+      const items = (previous?.items || []).filter(item => item.userId !== user.id);
+      items.push({ userId: user.id, username: user.username });
+      await cas(key, previous?.revision || 0, { items });
+    };
+    return navigator.locks ? navigator.locks.request(key, save) : save();
+  }
+  async function rememberServer(origin, serverId) {
+    const key = `host:${origin}`;
+    const save = async () => {
+      const previous = await get(key);
+      await cas(key, previous?.revision || 0, { serverId });
+    };
+    return navigator.locks ? navigator.locks.request(key, save) : save();
+  }
+  async function lastServer(origin) { return (await get(`host:${origin}`))?.serverId || null; }
+
+  function offlineValidity(syncedAt, days, checkedAt, lastObservedAt = 0) {
+    const synced = Date.parse(syncedAt);
+    if (!Number.isInteger(days) || days < 1 || days > 30 ||
+        !Number.isFinite(synced) || !Number.isFinite(checkedAt) || checkedAt < 0 ||
+        !Number.isFinite(lastObservedAt) || lastObservedAt < 0) {
+      return { valid: false, reason: "本机快照日期或离线期限无效；必须联网重新验证账号。" };
+    }
+    if (checkedAt < synced || checkedAt < lastObservedAt) {
+      return { valid: false, reason: "本机时钟早于上次同步或使用时间；必须联网重新验证账号。设备时钟无法提供防篡改保证。" };
+    }
+    if (checkedAt - synced > days * 86400000) {
+      return { valid: false, reason: `本机快照已超过 ${days} 天离线期限；必须联网重新验证账号。已加密保存的草稿和队列不会删除。` };
+    }
+    return { valid: true, checkedAt };
+  }
+
+  async function cacheFile(file) {
+    if (!/(\.pdf|\.png|\.jpe?g|\.webp|\.docx?)$/i.test(file.name) ||
+        !["application/pdf", "image/png", "image/jpeg", "image/webp",
+          "application/msword", "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+          "application/octet-stream", ""].includes(file.type) || file.size > 25 * 1024 * 1024 || file.size === 0) {
+      throw new Error("原件仅支持 PDF、PNG、JPEG、WebP、DOC、DOCX，每份不超过 25 MiB 且不能为空。");
+    }
+    const bytes = new Uint8Array(await file.arrayBuffer());
+    const sha256 = bytesToBase64(new Uint8Array(await crypto.subtle.digest("SHA-256", bytes)));
+    const attachment = { id: `local:${id()}`, name: file.name, size: file.size, mime: file.type, sha256 };
+    return { attachment, record: { name: file.name, mime: file.type, bytes: bytesToBase64(bytes) } };
+  }
+  async function cacheRecent(blob, name) {
+    const bytes = new Uint8Array(await blob.arrayBuffer());
+    return { name, mime: blob.type, bytes: bytesToBase64(bytes) };
+  }
+  function asBlob(file) { return new Blob([base64ToBytes(file.bytes)], { type: file.mime }); }
+
+  return Object.freeze({ Vault, DraftRecovery, profiles, remember, rememberServer, lastServer, offlineValidity, cacheFile,
+    cacheRecent, asBlob, attachmentIds, replaceLocalAttachments, planTransfer, mergeTransfer, id });
+});

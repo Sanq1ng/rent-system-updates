@@ -1,0 +1,1789 @@
+"use strict";
+
+const fs = require("node:fs");
+const fsp = require("node:fs/promises");
+const path = require("node:path");
+const http = require("node:http");
+const https = require("node:https");
+const net = require("node:net");
+const crypto = require("node:crypto");
+const { pipeline } = require("node:stream/promises");
+const { Transform } = require("node:stream");
+const { describeFailure } = require("./diagnostics.cjs");
+const { openStore } = require("./store.cjs");
+const { initializeAdmin, hashPassword, SetupError } = require("./bootstrap.cjs");
+const Business = require("../public/business.js");
+const Domain = require("../public/domain.js");
+const Reporting = require("../public/reporting.js");
+const { buildWorkbook } = require("./report-export.cjs");
+const Parks = require("./parks.cjs");
+const { Workspaces, TAB_ID, REASONS: WORKSPACE_REASONS } = require("./workspaces.cjs");
+const { createPushService, PushError } = require("./push.cjs");
+const { createPushHttpAdapter, isPushApiRoute } = require("./push-http.cjs");
+const { loadPushCredentials } = require("./runtime-secrets.cjs");
+const { createInvitationService, invitationDelivery, createInvitationRateGate, InvitationError } = require("./invitations.cjs");
+const { createDesktopNotifications, workflowNotifications, DesktopError } = require("./desktop-notifications.cjs");
+const { startPairing, PairingError } = require("./lan-pairing.cjs");
+const { createUpdateCache, UpdateCacheError } = require("./update-cache.cjs");
+const { validateLan, peerAllowed } = require("../shared/lan-policy.cjs");
+const APPLICATION_VERSION = require("../package.json").version;
+const RESOURCE_REVISION = "1";
+
+const uuid = () => crypto.randomUUID();
+const now = () => new Date().toISOString();
+const today = () => new Intl.DateTimeFormat("en-CA", { timeZone: "Asia/Shanghai", year: "numeric", month: "2-digit", day: "2-digit" }).format(new Date());
+const digest = value => crypto.createHash("sha256").update(value).digest("hex");
+const json = value => JSON.stringify(value);
+const parsed = row => row && JSON.parse(row.json);
+const roles = ["admin", "operator", "reviewer", "viewer"];
+const kinds = ["contract", "contract-change", "contract-void", "termination", "payment", "payment-void", "refund", "invoice-adjustment", "opening-balance"];
+const mutation = new Set(["POST", "PUT", "PATCH", "DELETE"]);
+const MAX_CENTS = 1_000_000_000_000;
+const formatCents = value => `${BigInt(value) / 100n}.${String(BigInt(value) % 100n).padStart(2, "0")}`;
+
+class ApiError extends Error {
+  constructor(status, code, message) { super(message); this.status = status; this.code = code; }
+}
+function fail(message, status = 400, code = "VALIDATION") { throw new ApiError(status, code, message); }
+function requireThat(condition, message, status = 400, code = "VALIDATION") {
+  if (!condition) fail(message, status, code);
+}
+function record(value) { return value !== null && typeof value === "object" && !Array.isArray(value); }
+function string(value, label, max = 1000, required = true) {
+  requireThat(typeof value === "string" && value.length <= max && (!required || value.trim()), `${label}不能为空，且不能超过 ${max} 字。`);
+  return value.trim();
+}
+function cents(value, label, positive = false) {
+  requireThat(Number.isSafeInteger(value) && value >= (positive ? 1 : 0) && value <= MAX_CENTS, `${label}须为${positive ? "正" : "非负"}整数分，且不超过金额上限。`);
+  return value;
+}
+function date(value, label) { requireThat(Domain.isISODate(value), `${label}须为真实有效的 YYYY-MM-DD 日期。`); return value; }
+function expected(entity, version, label) {
+  requireThat(entity, `${label}不存在或已不可访问。`, 404, "NOT_FOUND");
+  requireThat(Number.isInteger(version) && entity.version === version, `${label}版本已变化，请同步最新数据后重新提交。`, 409, "CONFLICT");
+}
+function publicUser(user) {
+  const { id, username, displayName, roles: r, allParks, parks, canExport, receiveReminders, active, version } = user;
+  return { id, username, displayName, roles: r, allParks, parks, canExport, receiveReminders, active, version };
+}
+const normalizePark = Business.normalizePark;
+function parksOf(data) { return [...new Set((data?.locations || []).map(location => normalizePark(location.park)))]; }
+function parksOfContract(contract) {
+  return [...new Set([...(contract?.versions || []).flatMap(version => parksOf(version.data)), ...parksOf(contract?.data)])];
+}
+function canSee(user, parks) {
+  return user?.active && user.roles.some(role => role !== "admin") &&
+    parks.length > 0 && parks.every(park => park && (user.allParks || user.parks.includes(park)));
+}
+function requireRole(user, role) { requireThat(user?.active && user.roles.includes(role), "当前账号没有此操作权限。", 403, "FORBIDDEN"); }
+function requireScope(user, parks) { requireThat(canSee(user, parks), "当前账号无权访问涉及的全部园区。", 403, "FORBIDDEN"); }
+function password(value) { string(value, "密码", 128); requireThat(value.length >= 10, "密码至少需要 10 个字符。"); return value; }
+function equalToken(provided, expectedToken) {
+  return typeof provided === "string" && typeof expectedToken === "string" &&
+    /^[A-Za-z0-9_-]+$/.test(provided) && provided.length === expectedToken.length &&
+    crypto.timingSafeEqual(Buffer.from(provided), Buffer.from(expectedToken));
+}
+function requireKnownParks(store, names) {
+  const known = new Set(Parks.directory(store).map(entry => entry.name));
+  requireThat(names.every(name => known.has(normalizePark(name))),
+    "包含不在园区清单中的名称，请重新选择；旧资料不会自动归入其他园区。");
+}
+function userInput(store, input, creating = false) {
+  requireThat(record(input), "账号资料格式无效。");
+  const r = input.roles;
+  requireThat(Array.isArray(r) && r.length && r.length <= 4 && r.every(role => roles.includes(role)) && new Set(r).size === r.length, "请明确选择有效且不重复的岗位权限。");
+  const explicitScope = Object.hasOwn(input, "allParks") || Object.hasOwn(input, "parks");
+  const scope = {};
+  if (creating || explicitScope) {
+    const allParks = explicitScope ? input.allParks : r.some(role => role !== "admin");
+    const suppliedParks = explicitScope ? input.parks : [];
+    requireThat(typeof allParks === "boolean" && Array.isArray(suppliedParks) && suppliedParks.length <= 200 &&
+      suppliedParks.every(park => typeof park === "string" && normalizePark(park).length && park.length <= 120), "园区授权格式无效。");
+    const parks = [...new Set(suppliedParks.map(normalizePark))];
+    requireKnownParks(store, parks);
+    Object.assign(scope, { allParks, parks });
+  }
+  requireThat(typeof input.canExport === "boolean" && typeof input.receiveReminders === "boolean", "导出与提醒权限必须明确填写。");
+  return {
+    ...(creating ? { username: string(input.username, "账号", 80) } : {}),
+    displayName: string(input.displayName, "姓名", 120),
+    roles: r, ...scope,
+    canExport: input.canExport, receiveReminders: input.receiveReminders,
+  };
+}
+function originalMatches(file, size, sha256) {
+  const stat = fs.lstatSync(file, { throwIfNoEntry: false });
+  if (!stat?.isFile() || stat.size !== size) return false;
+  const fd = fs.openSync(file, "r");
+  const hash = crypto.createHash("sha256");
+  const chunk = Buffer.allocUnsafe(64 * 1024);
+  try {
+    let count;
+    while ((count = fs.readSync(fd, chunk, 0, chunk.length, null)) > 0) hash.update(chunk.subarray(0, count));
+  } finally { fs.closeSync(fd); }
+  return hash.digest("hex") === sha256;
+}
+function attachmentsIn(store, items, owner, linkedContractId = null) {
+  const db = store.db;
+  requireThat(Array.isArray(items) && items.length <= 100, "附件清单格式无效。");
+  const contract = linkedContractId ? store.read("contracts", linkedContractId) : null;
+  if (linkedContractId) requireThat(contract, "原合同不存在，不能沿用其附件。", 404, "NOT_FOUND");
+  const archived = new Set(contract ? [
+    ...contract.data.attachments.map(attachment => attachment.id),
+    ...contract.versions.flatMap(version => version.data.attachments.map(attachment => attachment.id)),
+  ] : []);
+  return items.map(item => {
+    requireThat(record(item) && typeof item.id === "string", "附件标识无效。");
+    const actual = db.prepare("SELECT * FROM attachments WHERE id=?").get(item.id);
+    requireThat(actual && (actual.owner === owner || archived.has(item.id)) &&
+      attachmentVisible(store, store.read("users", owner), item.id),
+    "附件必须先由当前录入者上传，或来自其仍有权查看的已归档业务。", 403, "FORBIDDEN");
+    requireThat(item.sha256 === undefined || item.sha256 === actual.sha256, "附件校验值与原件不符。", 409, "CONFLICT");
+    requireThat(item.size === undefined || item.size === actual.size, "附件大小与原件不符。", 409, "CONFLICT");
+    requireThat(item.name === undefined || item.name === actual.name, "附件名称与原件不符。", 409, "CONFLICT");
+    requireThat(item.mime === undefined || item.mime === actual.mime, "附件类型与原件不符。", 409, "CONFLICT");
+    const file = path.join(db._attachmentsDir, actual.id);
+    requireThat(originalMatches(file, actual.size, actual.sha256),
+      "原始附件丢失或校验失败，无法提交或批准。", 409, "CONFLICT");
+    return { id: actual.id, name: actual.name, size: actual.size, mime: actual.mime, sha256: actual.sha256 };
+  });
+}
+function scopeFor(store, kind, payload) {
+  requireThat(record(payload), "申请内容格式无效。");
+  const contractFor = id => store.read("contracts", id);
+  const invoiceFor = id => store.read("invoices", id);
+  if (kind === "contract") {
+    const old = payload.data?.renewalOf ? contractFor(payload.data.renewalOf) : null;
+    if (payload.data?.renewalOf) requireThat(old, "续租引用的合同不存在。", 409, "CONFLICT");
+    return [...new Set([...parksOf(payload.data), ...parksOfContract(old)])];
+  }
+  if (["contract-change", "contract-void", "termination", "opening-balance"].includes(kind)) {
+    const contract = contractFor(payload.contractId);
+    requireThat(contract, "目标合同不存在。", 404, "NOT_FOUND");
+    return [...new Set([...parksOfContract(contract), ...(kind === "contract-change" ? parksOf(payload.data) : [])])];
+  }
+  const invoice = kind === "payment-void"
+    ? invoiceFor(store.read("payments", payload.paymentId)?.invoiceId)
+    : invoiceFor(payload.invoiceId);
+  requireThat(invoice, "目标应收或收款不存在。", 404, "NOT_FOUND");
+  return parksOfContract(contractFor(invoice.contractId));
+}
+function scopeForApplication(store, application) {
+  return [...new Set([
+    ...scopeFor(store, application.kind, application.payload),
+    ...(application.versions || []).flatMap(version => scopeFor(store, application.kind, version.payload)),
+  ])];
+}
+function audit(store, action, actor, detail, before, after, clientTime) {
+  const entry = { id: uuid(), action, actor, at: now(), detail };
+  if (clientTime !== undefined) entry.clientTime = clientTime;
+  if (before !== undefined) entry.before = before;
+  if (after !== undefined) entry.after = after;
+  store.db.prepare("INSERT INTO audit(id,action,actor,at,json) VALUES(?,?,?,?,?)").run(entry.id, action, actor, entry.at, json(entry));
+  store.changed();
+  return entry;
+}
+function appendTrail(store, app, action, actor, detail, before, after, clientTime) {
+  const entry = audit(store, action, actor, detail, before, after, clientTime);
+  app.trail.push(entry);
+  return entry;
+}
+function ledgerState(store, app, createdContractId) {
+  const p = app.payload;
+  const contract = app.kind === "contract" ?
+    (createdContractId ? store.read("contracts", createdContractId) : null) :
+    ["contract-change", "contract-void", "termination", "opening-balance"].includes(app.kind) ?
+      store.read("contracts", p.contractId) : null;
+  const payment = app.kind === "payment-void" ? store.read("payments", p.paymentId) : null;
+  const invoice = !contract && app.kind !== "contract" ?
+    store.read("invoices", payment?.invoiceId || p.invoiceId) : null;
+  const invoices = contract ? store.db.prepare("SELECT json FROM invoices WHERE contract_id=?").all(contract.id).map(parsed) :
+    invoice ? [invoice] : [];
+  const ids = new Set(invoices.map(item => item.id));
+  return { contract: contract || (invoice ? store.read("contracts", invoice.contractId) : null), invoices,
+    payments: store.all("payments").filter(item => ids.has(item.invoiceId)),
+    refunds: store.all("refunds").filter(item => ids.has(item.invoiceId)) };
+}
+function invoiceFrom(row, contract) {
+  return {
+    id: uuid(), rowId: row.id, version: 1, contractId: contract.id, kind: row.kind, label: row.label,
+    tenant: contract.data.tenant, locations: contract.data.locations,
+    rentTaxMode: contract.data.rentTaxMode, lessorId: contract.data.lessorId,
+    lessorOtherName: contract.data.lessorOtherName,
+    propertyOwner: contract.data.propertyOwner,
+    periodStart: row.periodStart, periodEnd: row.periodEnd, dueDate: row.dueDate,
+    amountCents: row.amountCents,
+    openingPaidCents: contract.data.openingPayments.find(entry => entry.rowId === row.id)?.paidCents || 0,
+    paidCents: contract.data.openingPayments.find(entry => entry.rowId === row.id)?.paidCents || 0,
+    status: "active", manual: row.manual, reason: row.reason, flags: row.flags,
+  };
+}
+function contractPreview(store, data, change = null) {
+  if (!change) return Business.previewContract(data);
+  string(change.contractId, "关联合同", 80);
+  const contract = store.read("contracts", change.contractId);
+  expected(contract, change.expectedVersion, "合同");
+  date(change.effectiveDate, "变更生效日");
+  requireThat(contract.status === "active", "只有生效中的合同可以办理此项业务。", 409, "CONFLICT");
+  const invoices = store.db.prepare("SELECT json FROM invoices WHERE contract_id=? AND status='active'")
+    .all(contract.id).map(parsed);
+  return Business.previewContract(data, { amendment: { contract, invoices, effectiveDate: change.effectiveDate } });
+}
+function validateContract(store, data, actor, change = null) {
+  const preview = contractPreview(store, data, change);
+  const linkedContractId = change?.contractId || null;
+  requireThat(!preview.errors.length, preview.errors.slice(0, 8).join("；"));
+  requireKnownParks(store, parksOf(data));
+  const settings = JSON.parse(store.db.prepare("SELECT json FROM settings WHERE id=1").get().json);
+  requireThat(data.managementStartDate >= settings.accountingStartDate, "合同管账起点不能早于系统开始管账日期。");
+  const attachments = attachmentsIn(store, data.attachments, actor, linkedContractId);
+  requireThat(attachments.length, "合同必须上传至少一份真实原件。");
+  const normalized = {
+    number: data.number.trim(), tenantType: data.tenantType, tenant: data.tenant.trim(),
+    rentTaxMode: data.rentTaxMode, lessorId: data.lessorId,
+    lessorOtherName: data.lessorId === "other" ? data.lessorOtherName.trim() : "",
+    propertyOwner: data.propertyOwner === undefined && linkedContractId
+      ? store.read("contracts", linkedContractId)?.data.propertyOwner || ""
+      : (data.propertyOwner || "").trim(),
+    contact: data.contact.trim(), phone: data.phone.trim(),
+    startDate: data.startDate, endDate: data.endDate, managementStartDate: data.managementStartDate,
+    locations: data.locations.map(loc => ({
+      park: normalizePark(loc.park), building: loc.building.trim(), floor: loc.floor.trim(),
+      zone: loc.zone.trim(), area: loc.area.trim(), allocatedRent: loc.allocatedRent,
+    })),
+    amount: data.amount, amountBasis: data.amountBasis, cycleMonths: data.cycleMonths,
+    anchor: data.anchor, advanceMonths: data.advanceMonths, dueDay: data.dueDay,
+    fees: data.fees.map(fee => ({
+      id: fee.id, kind: fee.kind, label: fee.label.trim(), amount: fee.amount,
+      frequency: fee.frequency, dueDate: fee.dueDate,
+    })),
+    freeEnabled: data.freeEnabled, freeStart: data.freeStart, freeEnd: data.freeEnd,
+    notes: data.notes, overrides: Object.fromEntries(Object.entries(data.overrides).map(([key, value]) =>
+      [key, { amount: value.amount, dueDate: value.dueDate, reason: value.reason.trim() }])),
+    attachments, openingPayments: data.openingPayments.map(entry => ({
+      rowId: entry.rowId, paidCents: entry.paidCents, reason: entry.reason.trim(),
+    })),
+    ...(data.renewalOf === undefined ? {} : { renewalOf: data.renewalOf }),
+  };
+  return { data: normalized, rows: preview.rows };
+}
+function validateSettings(value, current, hasLedger) {
+  requireThat(record(value), "设置格式无效。");
+  expected(current, value.expectedVersion, "系统设置");
+  const accountingStartDate = date(value.accountingStartDate, "开始管账日期");
+  if (hasLedger) requireThat(accountingStartDate === current.accountingStartDate, "已有正式账目后不能重设开始管账日期。", 409, "CONFLICT");
+  const clock = time => typeof time === "string" && /^([01]\d|2[0-3]):[0-5]\d$/.test(time);
+  requireThat(clock(value.dueReminderTime) && clock(value.monthlyReminderTime), "提醒时间应为 00:00 至 23:59 的 HH:mm。");
+  requireThat(Number.isInteger(value.offlineDays) && value.offlineDays >= 1 && value.offlineDays <= 30, "离线保留期限须为 1 至 30 天。");
+  return { accountingStartDate, dueReminderTime: value.dueReminderTime, monthlyReminderTime: value.monthlyReminderTime, offlineDays: value.offlineDays, version: current.version + 1 };
+}
+
+function validateSubmission(store, user, kind, payload) {
+  requireThat(kinds.includes(kind), "不支持此申请类型。");
+  requireScope(user, scopeFor(store, kind, payload));
+  if (kind === "contract" || kind === "contract-change") {
+    requireThat(record(payload.data), "合同内容不能为空。");
+    requireThat(payload.rows === undefined, "服务端生成应收排期，请勿提交客户端生成的行。");
+    if (kind === "contract" && payload.data.renewalOf) {
+      const old = store.read("contracts", payload.data.renewalOf);
+      requireThat(old && old.status !== "void", "续租引用的合同不存在或已作废。", 409, "CONFLICT");
+    }
+    const { data } = validateContract(store, payload.data, user.id,
+      kind === "contract-change" ? payload : null);
+    if (kind === "contract-change") {
+      expected(store.read("contracts", payload.contractId), payload.expectedVersion, "合同");
+      date(payload.effectiveDate, "变更生效日");
+      return { contractId: payload.contractId, expectedVersion: payload.expectedVersion, data, effectiveDate: payload.effectiveDate };
+    }
+    return { data };
+  } else if (["contract-void", "termination", "opening-balance"].includes(kind)) {
+    expected(store.read("contracts", payload.contractId), payload.expectedVersion, "合同");
+    if (kind === "termination") {
+      date(payload.terminationDate, "退租日期");
+      requireThat(Array.isArray(payload.adjustments), "退租须逐笔列出所有调整。");
+      requireThat(payload.adjustments.length <= 1200, "退租调整项目过多，请分期处理。");
+      const adjustments = payload.adjustments.map(item => {
+        requireThat(record(item) && typeof item.invoiceId === "string", "退租调整应指定真实应收期次。");
+        cents(item.amountCents, "退租核定金额");
+        string(item.reason, "退租核定依据", 1000);
+        requireThat(Number.isInteger(item.expectedVersion) && item.expectedVersion > 0, "退租应收版本无效。");
+        return { invoiceId: item.invoiceId, expectedVersion: item.expectedVersion,
+          amountCents: item.amountCents, reason: item.reason.trim() };
+      });
+      return { contractId: payload.contractId, expectedVersion: payload.expectedVersion,
+        terminationDate: payload.terminationDate, adjustments };
+    }
+    if (kind === "opening-balance") {
+      cents(payload.amountCents, "期初欠款金额");
+      date(payload.dueDate, "期初欠款到期日");
+      date(payload.periodStart, "所属期间起日");
+      date(payload.periodEnd, "所属期间止日");
+      requireThat(Business.feeKinds.includes(string(payload.kind, "期初欠款类别", 80)), "请选择有效的费用类别。");
+      string(payload.label, "期初欠款名称", 120);
+      return { contractId: payload.contractId, expectedVersion: payload.expectedVersion,
+        kind: payload.kind.trim(), label: payload.label.trim(), amountCents: payload.amountCents,
+        periodStart: payload.periodStart, periodEnd: payload.periodEnd, dueDate: payload.dueDate };
+    }
+    return { contractId: payload.contractId, expectedVersion: payload.expectedVersion };
+  } else if (kind === "payment-void") {
+    const payment = store.read("payments", payload.paymentId);
+    expected(payment, payload.expectedVersion, "收款");
+    const invoice = store.read("invoices", payment.invoiceId);
+    requireThat(payment.status === "active" && invoice?.status === "active" &&
+      invoice.paidCents >= payment.amountCents, "此收款不能作废，后续退款已使用其余额；请先人工核对结算。", 409, "CONFLICT");
+    return { paymentId: payload.paymentId, expectedVersion: payload.expectedVersion };
+  } else {
+    const invoice = store.read("invoices", payload.invoiceId);
+    expected(invoice, payload.expectedVersion, "应收期次");
+    requireThat(invoice.status === "active", "应收期次已被替换或作废。", 409, "CONFLICT");
+    if (["payment", "refund"].includes(kind)) {
+      cents(payload.amountCents, "金额", true);
+      const attachments = attachmentsIn(store, payload.attachments, user.id);
+      if (kind === "payment") {
+        date(payload.payDate, "到账日");
+        string(payload.method, "收款方式", 120);
+        string(payload.note, "收款备注", 2000, false);
+        requireThat(invoice.paidCents + payload.amountCents <= invoice.amountCents,
+          "收款超过此期剩余应收，请核对到账与分配金额。", 409, "CONFLICT");
+        return { invoiceId: payload.invoiceId, expectedVersion: payload.expectedVersion,
+          amountCents: payload.amountCents, payDate: payload.payDate, method: payload.method.trim(),
+          note: payload.note.trim(), attachments };
+      } else {
+        date(payload.refundDate, "退款日");
+        requireThat(["reopen", "reduce-charge"].includes(payload.effect), "须明确退款对账目影响。");
+        requireThat(payload.amountCents <= invoice.paidCents, "退款不能超过已收净额。", 409, "CONFLICT");
+        return { invoiceId: payload.invoiceId, expectedVersion: payload.expectedVersion,
+          amountCents: payload.amountCents, refundDate: payload.refundDate, effect: payload.effect, attachments };
+      }
+    }
+    if (kind === "invoice-adjustment") {
+      cents(payload.amountCents, "应收金额");
+      date(payload.dueDate, "到期日");
+      requireThat(payload.amountCents >= invoice.paidCents, "核定应收不得低于已收净额。", 409, "CONFLICT");
+      return { invoiceId: payload.invoiceId, expectedVersion: payload.expectedVersion,
+        amountCents: payload.amountCents, dueDate: payload.dueDate };
+    }
+  }
+}
+
+function applyOperation(store, user, operation) {
+  requireThat(record(operation) && typeof operation.operationId === "string" &&
+    /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(operation.operationId) &&
+    ["submit", "resubmit", "review"].includes(operation.type) && record(operation.payload),
+  "操作标识、类别或内容无效。");
+  requireThat(typeof operation.clientTime === "string" && operation.clientTime.length <= 40 &&
+    /^\d{4}-\d{2}-\d{2}T.+Z$/.test(operation.clientTime) && Number.isFinite(Date.parse(operation.clientTime)),
+  "本机操作时间须为有效 UTC 时间；它仅用于留痕，不决定审批顺序。");
+  const db = store.db;
+  const operationDigest = digest(json(operation));
+  return store.transaction(() => {
+    const existing = db.prepare("SELECT digest,result FROM operations WHERE actor=? AND id=?").get(user.id, operation.operationId);
+    if (existing) {
+      requireThat(existing.digest === operationDigest, "相同操作标识已用于不同内容，请勿覆盖原操作。", 409, "CONFLICT");
+      return JSON.parse(existing.result);
+    }
+    const current = store.read("users", user.id);
+    requireThat(current?.active, "账号已停用，请重新登录。", 401, "UNAUTHORIZED");
+    let app;
+    if (operation.type === "submit") {
+      requireRole(current, "operator");
+      const request = operation.payload;
+      string(request.reason, "申请原因", 2000);
+      const safePayload = validateSubmission(store, current, request.kind, request.payload);
+      const at = now();
+      const id = uuid();
+      app = { id, number: `SQ-${at.slice(0, 10).replaceAll("-", "")}-${id.slice(0, 8)}`,
+        kind: request.kind, status: "pending", version: 1, creator: current.id,
+        submittedAt: at, payload: safePayload, reason: request.reason.trim(),
+        trail: [], versions: [{ version: 1, payload: safePayload, at }] };
+      appendTrail(store, app, "application.submit", current.id, app.number, undefined, { kind: app.kind, payload: app.payload }, operation.clientTime);
+    } else if (operation.type === "resubmit") {
+      requireRole(current, "operator");
+      const request = operation.payload;
+      app = store.read("applications", request.applicationId);
+      expected(app, request.expectedVersion, "申请");
+      requireThat(app.creator === current.id && app.status === "returned", "只有申请人本人可以修改已退回申请。", 403, "FORBIDDEN");
+      requireScope(current, scopeForApplication(store, app));
+      string(request.reason, "重新提交原因", 2000);
+      const safePayload = validateSubmission(store, current, app.kind, request.payload);
+      const previous = app.payload;
+      app.version++;
+      app.status = "pending";
+      app.payload = safePayload;
+      app.reason = request.reason.trim();
+      app.submittedAt = now();
+      app.versions.push({ version: app.version, payload: safePayload, at: app.submittedAt });
+      appendTrail(store, app, "application.resubmit", current.id, app.number, previous, app.payload, operation.clientTime);
+    } else {
+      requireRole(current, "reviewer");
+      const request = operation.payload;
+      app = store.read("applications", request.applicationId);
+      expected(app, request.expectedVersion, "申请");
+      requireThat(app.status === "pending", "该申请已处理，不能重复审批。", 409, "CONFLICT");
+      requireThat(app.creator !== current.id, "不能复核本人提交的申请，即使兼任其他岗位。", 403, "FORBIDDEN");
+      requireThat(["approve", "return"].includes(request.decision), "请选择批准或退回。");
+      string(request.reason, "审批意见", 2000, request.decision === "return");
+      requireScope(current, scopeForApplication(store, app));
+      if (request.decision === "approve") {
+        const creator = store.read("users", app.creator);
+        requireThat(creator?.active && creator.roles.includes("operator") &&
+          canSee(creator, scopeForApplication(store, app)),
+        "申请人的权限或园区范围已发生变化，须由有权人员重新提交。", 409, "CONFLICT");
+      }
+      const beforeLedger = request.decision === "approve" ? ledgerState(store, app) : undefined;
+      const createdContractId = request.decision === "approve" ? processApproved(store, app, current) : undefined;
+      const afterLedger = request.decision === "approve" ? ledgerState(store, app, createdContractId) : undefined;
+      app.version++;
+      app.status = request.decision === "approve" ? "approved" : "returned";
+      app.reviewer = current.id;
+      app.reviewedAt = now();
+      app.reviewReason = (request.reason || "").trim();
+      appendTrail(store, app, `application.${request.decision}`, current.id, app.number,
+        { status: "pending", version: request.expectedVersion, ledger: beforeLedger },
+        { status: app.status, version: app.version, reason: app.reviewReason, ledger: afterLedger }, operation.clientTime);
+    }
+    store.put("applications", app);
+    const result = { operationId: operation.operationId, applicationId: app.id, status: app.status, version: app.version };
+    db.prepare("INSERT INTO operations(actor,id,digest,result) VALUES(?,?,?,?)").run(current.id, operation.operationId, operationDigest, json(result));
+    store.changed();
+    return result;
+  });
+}
+
+function createNotifications(store) {
+  const db = store.db;
+  const clock = new Intl.DateTimeFormat("en-GB", { timeZone: "Asia/Shanghai", hour: "2-digit", minute: "2-digit", hourCycle: "h23" }).format(new Date());
+  const currentDay = today();
+  const settings = JSON.parse(db.prepare("SELECT json FROM settings WHERE id=1").get()?.json || "null");
+  if (!settings) return;
+  store.transaction(() => {
+    const invoices = store.all("invoices").filter(invoice => invoice.status === "active");
+    let changed = false;
+    for (const invoice of invoices) {
+      if (invoice.dueDate > currentDay || (invoice.dueDate === currentDay && clock < settings.dueReminderTime) ||
+        invoice.paidCents >= invoice.amountCents) continue;
+      const id = `due:${invoice.id}:${invoice.dueDate}`;
+      changed = Boolean(db.prepare("INSERT OR IGNORE INTO notifications(id,type,date,invoice_id,month) VALUES(?,'due',?,?,NULL)").run(id, invoice.dueDate, invoice.id).changes) || changed;
+    }
+    for (const month of new Set(invoices.filter(invoice => invoice.kind === "rent" && invoice.dueDate >= settings.accountingStartDate)
+      .map(invoice => invoice.dueDate.slice(0, 7)))) {
+      if (month > currentDay.slice(0, 7) || (month === currentDay.slice(0, 7) &&
+        (currentDay.endsWith("-01") && clock < settings.monthlyReminderTime))) continue;
+      const id = `monthly:${month}`;
+      changed = Boolean(db.prepare("INSERT OR IGNORE INTO notifications(id,type,date,invoice_id,month) VALUES(?,'monthly',?,NULL,?)").run(id, `${month}-01`, month).changes) || changed;
+    }
+    if (changed) store.changed();
+  });
+}
+
+function notificationsFor(store, user, visibleInvoices) {
+  if (!user.receiveReminders || !user.roles.some(role => role !== "admin")) return [];
+  const visible = new Map(visibleInvoices.filter(invoice => invoice.status === "active").map(invoice => [invoice.id, invoice]));
+  const currentMonth = today().slice(0, 7);
+  const entries = store.db.prepare(`SELECT n.*,r.user_id AS read_by FROM notifications n
+    LEFT JOIN notification_reads r ON r.id=n.id AND r.user_id=? ORDER BY n.date DESC,n.id DESC`).all(user.id);
+  const result = entries.flatMap(entry => {
+    if (entry.type === "due") {
+      const invoice = visible.get(entry.invoice_id);
+      if (!invoice || invoice.dueDate !== entry.date || invoice.paidCents >= invoice.amountCents) return [];
+      return [{ id: entry.id, type: "due", date: entry.date,
+        title: `${invoice.tenant} · ${invoice.label}到期提醒`,
+        detail: `应收 ${formatCents(invoice.amountCents)} 元，已收 ${formatCents(invoice.paidCents)} 元，剩余 ${formatCents(invoice.amountCents - invoice.paidCents)} 元。`,
+        invoiceId: invoice.id, read: Boolean(entry.read_by) }];
+    }
+    const month = entry.month;
+    if (!month || month > currentMonth) return [];
+    const invoices = [...visible.values()].filter(invoice => invoice.kind === "rent" && invoice.dueDate.startsWith(month));
+    if (!invoices.length) return [];
+    const tenants = new Set(invoices.map(invoice => invoice.tenant.trim().normalize("NFC")));
+    const total = invoices.reduce((sum, invoice) => sum + BigInt(invoice.amountCents), 0n);
+    const paid = invoices.reduce((sum, invoice) => sum + BigInt(invoice.paidCents), 0n);
+    return [{ id: entry.id, type: "monthly", date: entry.date, title: `${month} 收租汇总`,
+      detail: `${tenants.size} 户，${invoices.length} 笔租金；应收 ${formatCents(total)} 元，已收 ${formatCents(paid)} 元，未收 ${formatCents(total - paid)} 元。其他费用请另行筛选报表。`,
+      month, read: Boolean(entry.read_by) }];
+  });
+  return result.concat(workflowNotifications(store, user, app => {
+    try { return canSee(user, scopeForApplication(store, app)); }
+    catch (error) { if (error instanceof ApiError) return false; throw error; }
+  }));
+}
+
+function snapshot(store, user) {
+  const contracts = store.all("contracts").filter(contract => canSee(user, parksOfContract(contract)));
+  const ids = new Set(contracts.map(contract => contract.id));
+  const invoices = store.all("invoices").filter(invoice => ids.has(invoice.contractId));
+  const invoiceIds = new Set(invoices.map(invoice => invoice.id));
+  const applications = store.all("applications").filter(app => {
+    try { return canSee(user, scopeForApplication(store, app)); }
+    catch (error) { if (error instanceof ApiError) return false; throw error; }
+  });
+  const parks = [...new Set(contracts.flatMap(contract => parksOf(contract.data)))];
+  const payments = store.all("payments").filter(payment => invoiceIds.has(payment.invoiceId));
+  const refunds = store.all("refunds").filter(refund => invoiceIds.has(refund.invoiceId));
+  const history = applications.flatMap(app => app.trail);
+  if (user.roles.includes("admin")) history.push(...store.all("audit").filter(entry => entry.action.startsWith("admin.")));
+  const actors = new Set([
+    ...contracts.flatMap(contract => [contract.approvedBy, ...contract.versions.map(version => version.actor)]),
+    ...applications.flatMap(app => [app.creator, app.reviewer, ...app.trail.map(entry => entry.actor)]),
+    ...history.map(entry => entry.actor),
+    ...payments.map(payment => payment.approvedBy),
+    ...refunds.map(refund => refund.approvedBy),
+  ]);
+  const people = Object.fromEntries([
+    ...contracts.map(contract => [contract.data.tenant.trim().normalize("NFC"), { name: contract.data.tenant }]),
+    ...store.all("users").filter(actor => actors.has(actor.id))
+      .map(actor => [actor.id, { name: actor.displayName }]),
+  ]);
+  return {
+    protocolVersion: 1, serverId: store.serverId, serverTime: now(), today: today(), user: publicUser(user),
+    settings: JSON.parse(store.db.prepare("SELECT json FROM settings WHERE id=1").get().json),
+    people, parks, parkDirectory: Parks.visibleDirectory(store, user), contracts, invoices, payments, refunds,
+    applications, history, notifications: notificationsFor(store, user, invoices),
+  };
+}
+
+async function readBody(req, limit = 2 * 1024 * 1024) {
+  const chunks = [];
+  let size = 0;
+  for await (const chunk of req) {
+    size += chunk.length;
+    if (size > limit) fail("提交内容超过大小上限。", 413, "TOO_LARGE");
+    chunks.push(chunk);
+  }
+  try { return JSON.parse(Buffer.concat(chunks).toString("utf8")); }
+  catch { fail("请求必须包含有效的 JSON 对象。"); }
+}
+async function readObject(req, limit) {
+  if (limit !== undefined) requireThat(!req.headers["content-length"] ||
+    /^\d+$/.test(req.headers["content-length"]) && Number(req.headers["content-length"]) <= limit,
+  "提交内容超过大小上限。", 413, "TOO_LARGE");
+  const result = await readBody(req, limit);
+  requireThat(record(result), "请求内容须为 JSON 对象。");
+  return result;
+}
+function send(res, status, value, extra = {}) {
+  res.writeHead(status, { "Content-Type": "application/json; charset=utf-8", "Cache-Control": "no-store", ...extra });
+  res.end(json(value));
+}
+function sameOrigin(req, origin) {
+  requireThat(req.headers.origin === origin, "请求来源不匹配，操作已拒绝。", 403, "ORIGIN");
+}
+function socketLocal(req) {
+  return ["127.0.0.1", "::1", "::ffff:127.0.0.1"].includes(req.socket.remoteAddress);
+}
+const assetTypes = {
+  ".pdf": "application/pdf", ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
+  ".webp": "image/webp", ".doc": "application/msword",
+  ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+};
+function archiveType(name, bytes) {
+  const extension = path.extname(name).toLowerCase();
+  const mime = assetTypes[extension];
+  requireThat(Boolean(mime), "仅支持 PDF、PNG、JPEG、WebP、DOC、DOCX 原始文件。");
+  const has = signature => bytes.subarray(0, signature.length).equals(signature);
+  const valid = extension === ".pdf" ? has(Buffer.from("%PDF-")) :
+    extension === ".png" ? has(Buffer.from([137, 80, 78, 71, 13, 10, 26, 10])) :
+    [".jpg", ".jpeg"].includes(extension) ? has(Buffer.from([255, 216, 255])) :
+    extension === ".webp" ? bytes.toString("ascii", 0, 4) === "RIFF" && bytes.toString("ascii", 8, 12) === "WEBP" :
+    extension === ".doc" ? has(Buffer.from([208, 207, 17, 224, 161, 177, 26, 225])) :
+    has(Buffer.from([80, 75, 3, 4])) && bytes.includes(Buffer.from("[Content_Types].xml")) && bytes.includes(Buffer.from("word/"));
+  requireThat(valid, "文件扩展名与实际文件格式不匹配。");
+  return mime;
+}
+function assetMetadata(row) {
+  return { id: row.id, name: row.name, size: row.size, mime: row.mime, sha256: row.sha256 };
+}
+function attachmentVisible(store, user, id) {
+  if (!user?.active || !user.roles.some(role => role !== "admin")) return false;
+  const own = Boolean(store.db.prepare("SELECT 1 FROM attachments WHERE id=? AND owner=?").get(id, user.id));
+  const owns = items => Array.isArray(items) && items.some(item => item?.id === id);
+  const linkedParks = new Set();
+  for (const contract of store.all("contracts")) {
+    if (owns(contract.data.attachments) || contract.versions.some(version => owns(version.data.attachments))) {
+      for (const park of parksOfContract(contract)) linkedParks.add(park);
+    }
+  }
+  for (const app of store.all("applications")) {
+    if (app.versions.some(version => owns(version.payload?.data?.attachments) || owns(version.payload?.attachments))) {
+      try { for (const park of scopeForApplication(store, app)) linkedParks.add(park); }
+      catch (error) { if (!(error instanceof ApiError)) throw error; return false; }
+    }
+  }
+  for (const payment of store.all("payments")) if (owns(payment.attachments)) {
+    for (const park of parksOfContract(store.read("contracts", payment.contractId))) linkedParks.add(park);
+  }
+  for (const refund of store.all("refunds")) if (owns(refund.attachments)) {
+    for (const park of parksOfContract(store.read("contracts", refund.contractId))) linkedParks.add(park);
+  }
+  return linkedParks.size ? canSee(user, [...linkedParks]) : own && user.roles.includes("operator");
+}
+async function upload(req, store, user, url, reauthenticate) {
+  requireRole(user, "operator");
+  const name = url.searchParams.get("name");
+  requireThat(typeof name === "string" && name.length > 0 && name.length <= 180 &&
+    !/[\\/\u0000-\u001f\u007f]/.test(name) && ![".", ".."].includes(name), "原件名称无效或包含路径字符。");
+  const uploadId = req.headers["x-upload-id"];
+  requireThat(typeof uploadId === "string" && /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(uploadId),
+    "上传标识须为稳定的 UUID。");
+  if (req.headers["content-length"] !== undefined) {
+    requireThat(Number(req.headers["content-length"]) <= 25 * 1024 * 1024,
+      "单个原件不能超过 25 MiB。", 413, "TOO_LARGE");
+  }
+  const uploadKey = `${user.id}:${uploadId}`;
+  requireThat(store.uploads < 4, "同时上传文件过多，请稍后重试。", 429, "RATE_LIMIT");
+  requireThat(!store.uploadKeys.has(uploadKey), "相同上传标识正在处理，请等待结果后重试。", 409, "CONFLICT");
+  store.uploads++;
+  store.uploadKeys.add(uploadKey);
+  const assets = path.join(store.db._attachmentsDir);
+  const temporary = path.join(assets, `.upload-${uuid()}`);
+  const hash = crypto.createHash("sha256");
+  let size = 0;
+  const guard = new Transform({
+    transform(chunk, encoding, callback) {
+      size += chunk.length;
+      if (size > 25 * 1024 * 1024) callback(new ApiError(413, "TOO_LARGE", "单个原件不能超过 25 MiB。"));
+      else { hash.update(chunk); callback(null, chunk); }
+    },
+  });
+  try {
+    await pipeline(req, guard, fs.createWriteStream(temporary, { flags: "wx", mode: 0o600 }));
+    requireThat(size > 0, "不能上传空文件。");
+    const bytes = await fsp.readFile(temporary);
+    const mime = archiveType(name, bytes);
+    const sha256 = hash.digest("hex");
+    const current = reauthenticate();
+    requireThat(current?.active && current.roles.includes("operator"), "上传期间账号权限已变化，请重新登录。", 403, "FORBIDDEN");
+    const existing = store.db.prepare("SELECT * FROM attachments WHERE owner=? AND upload_id=?").get(user.id, uploadId);
+    if (existing) {
+      requireThat(existing.sha256 === sha256 && existing.name === name && existing.mime === mime, "上传标识已对应其他文件或名称。", 409, "CONFLICT");
+      requireThat(attachmentVisible(store, current, existing.id), "附件的归属园区权限已变化。", 403, "FORBIDDEN");
+      return assetMetadata(existing);
+    }
+    const id = uuid();
+    const file = path.join(assets, id);
+    requireThat(!fs.existsSync(file), "生成的附件标识已被占用，请重新上传。", 409, "CONFLICT");
+    fs.renameSync(temporary, file);
+    const handle = fs.openSync(file, "r+");
+    try { fs.fsyncSync(handle); } finally { fs.closeSync(handle); }
+    try {
+      store.transaction(() => {
+        const fresh = store.read("users", user.id);
+        requireThat(fresh?.active && fresh.roles.includes("operator"), "账号已失去上传权限。", 403, "FORBIDDEN");
+        store.db.prepare("INSERT INTO attachments(id,upload_id,owner,name,size,mime,sha256) VALUES(?,?,?,?,?,?,?)")
+          .run(id, uploadId, user.id, name, size, mime, sha256);
+        store.changed();
+      });
+    } catch (error) {
+      // An unindexed original remains immutable rather than risking deletion after an uncertain write.
+      throw error;
+    }
+    return { id, name, size, mime, sha256 };
+  } finally {
+    try { if (fs.existsSync(temporary)) fs.unlinkSync(temporary); }
+    finally {
+      store.uploads--;
+      store.uploadKeys.delete(uploadKey);
+    }
+  }
+}
+
+async function startServer(config, { updates = null, bootMaintenance = false, pushTransports, invitationPackageBuilder, pairingConnection, backupDiskProbe, programDirectory,
+  diagnoseFailure = describeFailure } = {}) {
+  requireThat(record(config) && typeof config.dataDir === "string" && typeof config.backupDir === "string", "缺少业务数据与备份目录。");
+  requireThat(path.isAbsolute(config.dataDir) && path.isAbsolute(config.backupDir) &&
+    path.resolve(config.dataDir) !== path.parse(path.resolve(config.dataDir)).root,
+  "业务数据与备份目录须为明确的绝对路径，业务数据不可放在磁盘根目录。");
+  if (process.platform === "win32") requireThat(!path.resolve(config.dataDir).startsWith("\\\\"),
+    "SQLite 业务数据须放在主机本地磁盘，不能放在网络共享目录。");
+  const host = config.host || "127.0.0.1";
+  const port = config.port ?? 8765;
+  requireThat(Number.isInteger(port) && port >= 0 && port < 65536, "监听端口无效。");
+  const loopback = ["127.0.0.1", "::1", "localhost"].includes(host);
+  requireThat(config.reverseProxy === undefined || typeof config.reverseProxy === "boolean", "reverseProxy 配置无效。");
+  const reverseProxy = config.reverseProxy === true;
+  if (reverseProxy) {
+    requireThat(["127.0.0.1", "::1"].includes(host) && !config.tls && typeof config.publicOrigin === "string",
+      "反向代理模式仅允许数字回环监听、固定 HTTPS 来源且不配置后端 TLS。");
+    const origin = new URL(config.publicOrigin);
+    requireThat(origin.protocol === "https:" && origin.pathname === "/" && !origin.search && !origin.hash &&
+      !origin.username && !origin.password, "反向代理模式必须配置固定的完整 HTTPS 来源地址。");
+  }
+  if (!loopback) requireThat(config.tls && typeof config.publicOrigin === "string" &&
+    new URL(config.publicOrigin).protocol === "https:", "非本机访问必须同时配置 HTTPS 证书和公开访问地址。");
+  requireThat(!config.tls || typeof config.tls.keyFile === "string" && typeof config.tls.certFile === "string", "TLS 证书设置无效。");
+  const lan = validateLan(config.lan, { host, port, tls: config.tls, publicOrigin: config.publicOrigin, reverseProxy });
+  const sessionHours = config.sessionHours ?? 8;
+  const backupMinutes = config.backupIntervalMinutes ?? 60;
+  requireThat(Number.isInteger(sessionHours) && sessionHours >= 1 && sessionHours <= 24 &&
+    Number.isInteger(backupMinutes) && backupMinutes >= 0 && backupMinutes <= 10080, "会话或备份间隔设置无效。");
+  if (bootMaintenance) requireThat(fs.existsSync(path.join(config.dataDir, "rent.sqlite")),
+    "更新启动必须使用已有账本，不会在缺失的数据目录中重新初始化。", 503, "UPDATE_LEDGER_MISSING");
+  if (lan) requireThat(fs.existsSync(path.join(config.dataDir, "rent.sqlite")),
+    "局域网入口必须使用已初始化的原账本，不会创建新的空账。", 503, "LAN_IDENTITY");
+  const pushConfiguration = loadPushCredentials(config);
+  const store = openStore(config);
+  if (lan && (store.serverId !== lan.serverId || !store.db.prepare("SELECT 1 FROM users LIMIT 1").get())) {
+    store.close();
+    fail("局域网配置不属于当前已初始化账套；不会在此入口重新注册管理员。", 503, "LAN_IDENTITY");
+  }
+  store.db._attachmentsDir = path.join(config.dataDir, "attachments");
+  store.uploads = 0;
+  store.uploadKeys = new Set();
+  const initialized = () => Boolean(store.db.prepare("SELECT id FROM users LIMIT 1").get());
+  const setupToken = initialized() || reverseProxy ? null : crypto.randomBytes(32).toString("base64url");
+  const attempts = new Map();
+  const passwordAttempts = new Map();
+  const invitations = createInvitationService({ store });
+  const desktopNotifications = createDesktopNotifications({ store,
+    visibleNotifications: user => snapshot(store, user).notifications });
+  const invitationRate = createInvitationRateGate();
+  let invitationPackageRunning = false;
+  let publicOrigin;
+  let push = null, pushHttp = null;
+  let pairing = null;
+  let backupFailure = store.get("backup_failure") ? JSON.parse(store.get("backup_failure")) : null;
+  let reminderFailure = store.get("reminder_failure") ? JSON.parse(store.get("reminder_failure")) : null;
+  let lastBackup = null;
+  let backupRunning = false;
+  let backupTargetSaving = false;
+  const independentBackup = require("./independent-backup.cjs").createIndependentBackup({
+    store, config, probe: backupDiskProbe, programDirectory,
+    recordChange: (actorId, before, after) => audit(store, "admin.backup-target.update", actorId, "设置独立备份位置", before, after),
+  });
+  let reminderTimer;
+  let backupTimer;
+  const workspaces = new Workspaces(APPLICATION_VERSION);
+  let sealedForUpdate = Boolean(bootMaintenance);
+  let updateWindowId = bootMaintenance?.windowId || (bootMaintenance ? uuid() : null);
+  let quiescing = false;
+  let closing = false;
+  let activeBusinessRequests = 0;
+  const gateStatus = (admin = false) => {
+    const state = workspaces.status(admin);
+    if (state.phase === "expired") sealedForUpdate = true;
+    return sealedForUpdate && state.phase === "idle"
+      ? { phase: "installing", id: updateWindowId, targetVersion: APPLICATION_VERSION, pageCount: 0, readyCount: 0 }
+      : state;
+  };
+  const writeAdmission = () => {
+    const gate = gateStatus();
+    requireThat(!sealedForUpdate && gate.phase !== "installing" && gate.phase !== "expired",
+      "主机正在安全更新，已保存的工作会保留，请稍后重试；不要重新录入同一笔款项。", 503, "MAINTENANCE");
+  };
+  const updateStatus = () => ({
+    ...(updates ? updates.status() : {
+      currentVersion: APPLICATION_VERSION, configured: false, installSupported: false,
+      unavailableReason: "当前启动方式未接入在线更新组件，请通过新版图形主机启动。",
+      phase: "unavailable", availableRelease: null, job: null, requestError: null,
+    }),
+    maintenance: gateStatus(true),
+  });
+  const updateControl = route => route === "/api/workspaces/heartbeat" ||
+    route === "/api/system/status" || route === "/api/me" ||
+    route.startsWith("/api/admin/updates");
+  async function quiesceForUpdate({ windowId, targetVersion, deadline, signal }) {
+    requireThat(!quiescing && !sealedForUpdate && !closing, "主机已在维护或停止中。", 409, "UPDATE_CONFLICT");
+    const until = typeof deadline === "number" ? deadline : Date.parse(deadline);
+    requireThat(typeof windowId === "string" && TAB_ID.test(windowId) &&
+      Number.isFinite(until) && until > Date.now() && until <= Date.now() + 10 * 60_000,
+    "更新准备标识或截止时间无效。", 400, "VALIDATION");
+    workspaces.begin(targetVersion, "", { id: windowId, deadline: until });
+    quiescing = true;
+    updateWindowId = windowId;
+    try {
+      await push.pause("update");
+      while (true) {
+        if (signal?.aborted) throw signal.reason instanceof Error ? signal.reason : new Error("更新准备已取消。");
+        const state = gateStatus(true);
+        requireThat(!closing && state.id === windowId && state.phase === "preparing",
+          state.message || "更新准备已失效，程序尚未替换。", 409, "UPDATE_CONFLICT");
+        if (state.readyCount === state.pageCount && activeBusinessRequests === 0 &&
+          store.uploads === 0 && !backupRunning) {
+          // 同一事件循环内封闭入口；已经开始读取请求体的操作也会在 reauthenticate 再检查。
+          workspaces.commit(windowId);
+          sealedForUpdate = true;
+          await store.waitForBackups();
+          if (signal?.aborted) throw signal.reason instanceof Error ? signal.reason : new Error("更新准备已取消。");
+          requireThat(!closing && updateWindowId === windowId && sealedForUpdate,
+            "更新准备已取消。", 409, "UPDATE_CONFLICT");
+          return gateStatus(true);
+        }
+        await new Promise(resolve => setTimeout(resolve, 100));
+      }
+    } catch (error) {
+      if (updateWindowId === windowId) sealedForUpdate = true;
+      throw error;
+    } finally { quiescing = false; }
+  }
+  function finishUpdateMaintenance({ windowId, outcome }) {
+    requireThat(["cancelled", "committed", "rolled-back"].includes(outcome),
+      "更新维护结果无效。", 400, "VALIDATION");
+    requireThat(!updateWindowId || windowId === updateWindowId,
+      "不能结束其他更新的维护窗口。", 409, "UPDATE_CONFLICT");
+    workspaces.finish(windowId, outcome === "cancelled" ? "更新已取消，当前页面可以继续工作。" : "");
+    sealedForUpdate = false;
+    updateWindowId = null;
+    push.resume("update");
+  }
+  async function makeBackup() {
+    if (backupRunning || backupTargetSaving) fail("备份或备份设置正在进行，请稍后重试。", 409, "CONFLICT");
+    backupRunning = true;
+    try {
+      await push.pause("backup");
+      const sequence = Number(store.get("changes"));
+      const result = await store.createBackup();
+      store.transaction(() => store.set("backed_up", Math.max(Number(store.get("backed_up")), sequence)));
+      lastBackup = result;
+      const independent = await independentBackup.copy(result);
+      backupFailure = null;
+      store.set("backup_failure", "");
+      return { ...result, independentBackup: independent };
+    } catch (error) {
+      const ioMessage = require("./backup-files.cjs").backupIoMessage(error);
+      const message = ioMessage || error.message;
+      backupFailure = { at: now(), message,
+        kind: error.code === "INDEPENDENT_BACKUP" ? "independent" : "local" };
+      console.error("自动或手动备份失败：", error.message, error.cause ? `${error.cause.code || ""} ${error.cause.message}` : "");
+      try { store.set("backup_failure", json(backupFailure)); }
+      catch (recordError) {
+        console.error("备份故障记录保存失败：", recordError.code || recordError.name, recordError.message);
+        backupFailure.persisted = false;
+        backupFailure.message += " 这次故障记录暂未保存到主机，请保留本次提示并联系负责人。";
+        if (!require("./backup-files.cjs").backupIoMessage(recordError)) {
+          throw new AggregateError([error, recordError], "备份失败，且故障记录未能保存。");
+        }
+      }
+      if (error.code === "BACKUP" || error.code === "INDEPENDENT_BACKUP" || ioMessage) throw new ApiError(503, "BACKUP", backupFailure.message);
+      throw error;
+    } finally {
+      backupRunning = false;
+      push.resume("backup");
+    }
+  }
+  const updateCache = createUpdateCache({ store, updates, enabled: Boolean(lan && config.tls),
+    isIdle: () => gateStatus().phase === "idle" && !sealedForUpdate && !quiescing && !closing });
+  let server;
+  try {
+    server = config.tls ? https.createServer({
+      key: fs.readFileSync(config.tls.keyFile), cert: fs.readFileSync(config.tls.certFile),
+    }) : http.createServer();
+  } catch (error) {
+    store.close();
+    throw error;
+  }
+  server.requestTimeout = 180_000;
+  server.headersTimeout = 30_000;
+  const unstartedConnections = new Map();
+  // HTTPS exposes a different socket wrapper for requests, so match public endpoints.
+  const connectionKey = socket => JSON.stringify([socket.localAddress, socket.localPort, socket.remoteAddress, socket.remotePort]);
+  server.on("connection", socket => {
+    if (closing) { socket.destroy(); return; }
+    const key = connectionKey(socket);
+    unstartedConnections.set(key, socket);
+    socket.once("close", () => {
+      if (unstartedConnections.get(key) === socket) unstartedConnections.delete(key);
+    });
+  });
+  function closeServer() {
+    return new Promise((resolve, reject) => {
+      server.close(error => error ? reject(error) : resolve());
+      for (const socket of unstartedConnections.values()) socket.destroy();
+    });
+  }
+  server.on("request", async (req, res) => {
+    unstartedConnections.delete(connectionKey(req.socket));
+    res.setHeader("X-Content-Type-Options", "nosniff");
+    res.setHeader("Referrer-Policy", "no-referrer");
+    res.setHeader("X-Frame-Options", "DENY");
+    res.setHeader("X-Rent-Application-Version", APPLICATION_VERSION);
+    let diagnosticRoute = "other";
+    try {
+      requireThat(peerAllowed(req.socket.remoteAddress, lan), "此入口只允许已配置的局域网子网访问。", 403, "LAN_SCOPE");
+      const origin = new URL(publicOrigin);
+      requireThat(req.headers.host === origin.host, "访问主机名不匹配。", 403, "HOST");
+      requireThat(typeof req.url === "string" && req.url.length < 4096, "请求地址无效。");
+      const url = new URL(req.url, publicOrigin);
+      const route = url.pathname;
+      if (/^\/api\/admin\/updates(?:\/(?:check|stage|install|cancel))?$/.test(route)) diagnosticRoute = route;
+      if (mutation.has(req.method)) sameOrigin(req, publicOrigin);
+      const control = updateControl(route);
+      if ((mutation.has(req.method) || route === "/api/reports.xlsx") && !control) writeAdmission();
+      if (route.startsWith("/api/") && !control && route !== "/api/bootstrap") {
+        activeBusinessRequests++;
+        let finished = false;
+        const finish = () => { if (!finished) { finished = true; activeBusinessRequests--; } };
+        res.once("finish", finish);
+        res.once("close", finish);
+      }
+      if (req.method === "GET" && route === "/api/bootstrap") {
+        const setupAvailable = !reverseProxy && !initialized() && loopback && socketLocal(req) &&
+          !["forwarded", "x-forwarded-for", "x-forwarded-host", "x-forwarded-proto", "x-real-ip"]
+            .some(header => req.headers[header] !== undefined);
+        return send(res, 200, { initialized: initialized(), serverId: store.serverId, version: 1, setupAvailable,
+          applicationVersion: APPLICATION_VERSION, maintenance: gateStatus() });
+      }
+      if (req.method === "GET" && route === "/api/desktop/update-source") {
+        requireThat(!url.search, "软件更新状态不接受查询参数。");
+        return send(res, 200, { serverId: store.serverId, applicationVersion: APPLICATION_VERSION,
+          maintenance: gateStatus().phase, update: updates?.clientRelease ? updates.clientRelease() : null });
+      }
+      if (route.startsWith("/api/desktop/update-files/")) {
+        const match = /^\/api\/desktop\/update-files\/([a-f0-9]{64})\/([a-f0-9]{64})$/.exec(route);
+        requireThat(req.method === "GET" && !url.search && match, "更新文件地址无效。", 404, "NOT_FOUND");
+        await updateCache.serve(req, res, match[1], match[2]);
+        return;
+      }
+      if (route.startsWith("/api/invitations") || route.startsWith("/api/admin/invitations")) {
+        requireThat(!url.search, "邀请接口不接受网址查询参数；请重新打开邀请。");
+      }
+      if (req.method === "POST" && ["/api/invitations/inspect", "/api/invitations/claim"].includes(route)) {
+        const admission = () => {
+          writeAdmission();
+          requireThat(!closing, "主机正在停止，请稍后重试。", 503, "MAINTENANCE");
+          requireThat(req.headers["x-rent-client-version"] === APPLICATION_VERSION &&
+            TAB_ID.test(req.headers["x-rent-client-id"] || ""),
+          "邀请页面已更新，请重新打开管理员发给你的邀请。", 503, "CLIENT_UPDATE_REQUIRED");
+          requireThat(initialized(), "主机尚未启用，不能接受员工邀请。", 409, "INVITATION_UNAVAILABLE");
+        };
+        admission();
+        const proxyPeer = req.headers["x-rent-client-ip"];
+        const peer = reverseProxy && socketLocal(req) && typeof proxyPeer === "string" && net.isIP(proxyPeer)
+          ? proxyPeer : req.socket.remoteAddress;
+        invitationRate(`public:${peer}`, 60);
+        if (route.endsWith("/claim")) {
+          invitationRate(`claim:${peer}`, 10);
+          invitationRate("claim:global", 60);
+        }
+        const body = await readObject(req, 16 * 1024);
+        admission();
+        const signedIn = () => {
+          const cookie = /(?:^|;\s*)rent_session=([^;]+)/.exec(req.headers.cookie || "")?.[1];
+          const session = cookie && store.db.prepare("SELECT user_id,expires_at FROM sessions WHERE token_hash=?").get(digest(cookie));
+          return Boolean(session && session.expires_at > Date.now() && store.read("users", session.user_id)?.active);
+        };
+        if (route.endsWith("/inspect")) return send(res, 200, { ...invitations.inspect(body), signedIn: signedIn() });
+        const claimGuard = () => {
+          admission();
+          requireThat(!signedIn(), "这台浏览器已有登录账号。请先在原工作窗口保存并退出，或使用独立浏览器打开邀请；不会替你切换账号。",
+            409, "INVITATION_ACCOUNT_ACTIVE");
+        };
+        claimGuard();
+        return send(res, 200, invitations.claim(body, claimGuard));
+      }
+      if (req.method === "POST" && route === "/api/setup") {
+        requireThat(!reverseProxy, "云端初始化仅可由维护人员在主机本地通过受保护的维护工具执行。", 403, "FORBIDDEN");
+        requireThat(!initialized() && setupToken, "系统已经完成初始化。", 409, "CONFLICT");
+        requireThat(loopback && socketLocal(req) && ["localhost", "127.0.0.1", "[::1]"].includes(origin.hostname),
+          "初始化只能通过本机回环地址进行。", 403, "FORBIDDEN");
+        requireThat(!["forwarded", "x-forwarded-for", "x-forwarded-host", "x-forwarded-proto", "x-real-ip"]
+          .some(header => req.headers[header] !== undefined), "初始化不接受代理转发请求。", 403, "FORBIDDEN");
+        const body = await readObject(req);
+        writeAdmission();
+        requireThat(equalToken(body.setupToken, setupToken), "初始化口令无效。", 403, "FORBIDDEN");
+        initializeAdmin(store, body);
+        return send(res, 200, { ok: true });
+      }
+      if (req.method === "POST" && route === "/api/login") {
+        const body = await readObject(req);
+        writeAdmission();
+        const username = string(body.username, "账号", 80);
+        requireThat(typeof body.password === "string" && body.password.length <= 128, "账号或密码错误。", 401, "UNAUTHORIZED");
+        const proxyPeer = req.headers["x-rent-client-ip"];
+        const peer = reverseProxy && socketLocal(req) && typeof proxyPeer === "string" && net.isIP(proxyPeer)
+          ? proxyPeer : req.socket.remoteAddress;
+        const key = `${peer}:${username.toLocaleLowerCase()}`;
+        const networkKey = `${peer}:*`;
+        const attempt = attempts.get(key);
+        if (attempt?.until > Date.now() || (attempts.get(networkKey)?.until || 0) > Date.now()) {
+          fail("登录尝试过多，请稍后再试。", 429, "RATE_LIMIT");
+        }
+        const row = store.db.prepare("SELECT * FROM users WHERE username=? COLLATE NOCASE").get(username);
+        const computed = hashPassword(body.password, row?.salt || "missing-user-salt-value");
+        const hash = Buffer.from(row?.password_hash || "0".repeat(128), "hex");
+        const valid = crypto.timingSafeEqual(Buffer.from(computed, "hex"), hash) && row && JSON.parse(row.json).active;
+        if (!valid) {
+          const count = (attempt?.since > Date.now() - 15 * 60_000 ? attempt.count : 0) + 1;
+          attempts.set(key, { since: Date.now(), count, until: count >= 6 ? Date.now() + 15 * 60_000 : 0 });
+          const network = attempts.get(networkKey);
+          const total = (network?.since > Date.now() - 15 * 60_000 ? network.count : 0) + 1;
+          attempts.set(networkKey, { since: Date.now(), count: total, until: total >= 30 ? Date.now() + 15 * 60_000 : 0 });
+          if (attempts.size > 5000) {
+            for (const [entry, value] of attempts) {
+              if (value.since < Date.now() - 30 * 60_000) attempts.delete(entry);
+            }
+            while (attempts.size > 5000) attempts.delete(attempts.keys().next().value);
+          }
+          fail("账号或密码错误。", 401, "UNAUTHORIZED");
+        }
+        attempts.delete(key);
+        const token = crypto.randomBytes(32).toString("base64url");
+        const csrf = crypto.randomBytes(32).toString("base64url");
+        const previousToken = /(?:^|;\s*)rent_session=([^;]+)/.exec(req.headers.cookie || "")?.[1];
+        const previousSession = previousToken && store.db.prepare("SELECT * FROM sessions WHERE token_hash=?").get(digest(previousToken));
+        // An expired cookie identifies only the old binding to revoke, never a valid business session.
+        const switchingAccount = Boolean(previousSession && previousSession.user_id !== row.id);
+        store.transaction(() => {
+          if (switchingAccount) {
+            pushHttp.logout(previousSession.user_id, req);
+            desktopNotifications.revokeSession(digest(previousToken));
+            store.db.prepare("DELETE FROM sessions WHERE token_hash=?").run(digest(previousToken));
+          }
+          store.db.prepare("INSERT INTO sessions(token_hash,user_id,csrf,expires_at) VALUES(?,?,?,?)")
+            .run(digest(token), row.id, csrf, Date.now() + sessionHours * 3600_000);
+        });
+        if (switchingAccount) {
+          workspaces.removeSession(digest(previousToken));
+        }
+        workspaces.touch(digest(token), JSON.parse(row.json), req.headers["x-rent-client-id"],
+          req.headers["x-rent-client-version"]);
+        return send(res, 200, { user: publicUser(JSON.parse(row.json)), csrfToken: csrf, serverId: store.serverId }, {
+          "Set-Cookie": `rent_session=${token}; Path=/; HttpOnly; SameSite=Strict${origin.protocol === "https:" ? "; Secure" : ""}`,
+        });
+      }
+      if (req.method === "GET" && !route.startsWith("/api/")) {
+        const files = new Map(Object.entries({
+          "/": ["index.html", "text/html; charset=utf-8"],
+          "/index.html": ["index.html", "text/html; charset=utf-8"],
+          "/app.js": ["app.js", "text/javascript; charset=utf-8"],
+          "/ui.js": ["ui.js", "text/javascript; charset=utf-8"],
+          "/invitation-entry.js": ["invitation-entry.js", "text/javascript; charset=utf-8"],
+          "/invitation-panel.js": ["invitation-panel.js", "text/javascript; charset=utf-8"],
+          "/navigation.js": ["navigation.js", "text/javascript; charset=utf-8"],
+          "/contract-form.js": ["contract-form.js", "text/javascript; charset=utf-8"],
+          "/update-client.js": ["update-client.js", "text/javascript; charset=utf-8"],
+          "/update-panel.js": ["update-panel.js", "text/javascript; charset=utf-8"],
+          "/business.js": ["business.js", "text/javascript; charset=utf-8"],
+          "/domain.js": ["domain.js", "text/javascript; charset=utf-8"],
+          "/offline.js": ["offline.js", "text/javascript; charset=utf-8"],
+          "/reporting.js": ["reporting.js", "text/javascript; charset=utf-8"],
+          "/base.css": ["base.css", "text/css; charset=utf-8"],
+          "/app.css": ["app.css", "text/css; charset=utf-8"],
+          "/mobile.css": ["mobile.css", "text/css; charset=utf-8"],
+          "/mobile.js": ["mobile.js", "text/javascript; charset=utf-8"],
+          "/native-client.js": ["native-client.js", "text/javascript; charset=utf-8"],
+          "/desktop-client.js": ["desktop-client.js", "text/javascript; charset=utf-8"],
+          "/desktop-update.js": ["desktop-update.js", "text/javascript; charset=utf-8"],
+          "/push-client.js": ["push-client.js", "text/javascript; charset=utf-8"],
+          "/push-panel.js": ["push-panel.js", "text/javascript; charset=utf-8"],
+          "/push-worker.js": ["push-worker.js", "text/javascript; charset=utf-8"],
+          "/icon.svg": ["icon.svg", "image/svg+xml"],
+          "/icons/icon-192.png": [path.join("icons", "icon-192.png"), "image/png"],
+          "/icons/icon-512.png": [path.join("icons", "icon-512.png"), "image/png"],
+          "/icons/maskable-512.png": [path.join("icons", "maskable-512.png"), "image/png"],
+          "/icons/apple-touch-icon.png": [path.join("icons", "apple-touch-icon.png"), "image/png"],
+          "/manifest.webmanifest": ["manifest.webmanifest", "application/manifest+json"],
+          "/sw.js": ["sw.js", "text/javascript; charset=utf-8"],
+        }));
+        const file = files.get(route);
+        if (file) {
+          const versionedResource = url.searchParams.has("v") || url.searchParams.has("r");
+          requireThat(!/\.(js|css)$/.test(file[0]) || !versionedResource ||
+            url.searchParams.getAll("v").length === 1 && url.searchParams.get("v") === APPLICATION_VERSION &&
+            url.searchParams.getAll("r").length === 1 && url.searchParams.get("r") === RESOURCE_REVISION,
+          "页面资源版本已经更新，请保存工作后重新打开页面。", 503, "CLIENT_UPDATE_REQUIRED");
+          const content = await fsp.readFile(path.join(__dirname, "..", "public", file[0]));
+          res.writeHead(200, { "Content-Type": file[1], "Cache-Control": file[0] === "index.html" ? "no-store" :
+            /\.(js|css)$/.test(file[0]) ? "no-cache" : "private, max-age=60",
+            "Content-Security-Policy": "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data: blob:; frame-src 'self' blob:; object-src 'none'; base-uri 'none'; frame-ancestors 'none'" });
+          return res.end(content);
+        }
+      }
+      if (await pushHttp.receipt({ req, res, route, writeAdmission, send })) return;
+      if (req.method === "GET" && route === "/api/desktop/notifications") {
+        requireThat(!url.search, "电脑通知接口不接受查询参数。");
+        const proof = /^Bearer ([A-Za-z0-9_-]{43})$/.exec(req.headers.authorization || "")?.[1];
+        return send(res, 200, desktopNotifications.poll(proof));
+      }
+      const token = /(?:^|;\s*)rent_session=([^;]+)/.exec(req.headers.cookie || "")?.[1] || "";
+      const session = token ? store.db.prepare("SELECT * FROM sessions WHERE token_hash=?").get(digest(token)) : null;
+      const user = session && session.expires_at > Date.now() ? store.read("users", session.user_id) : null;
+      requireThat(user?.active, "请先登录中心服务。", 401, "UNAUTHORIZED");
+      if (mutation.has(req.method)) {
+        const provided = req.headers["x-csrf-token"];
+        requireThat(equalToken(provided, session.csrf), "请求校验码无效，请刷新后重试。", 403, "CSRF");
+      }
+      const sessionKey = digest(token);
+      const nativeDownload = req.method === "GET" &&
+        (route.startsWith("/api/attachments/") || route === "/api/reports.xlsx") &&
+        !req.headers["x-rent-client-id"] && !req.headers["x-rent-client-version"];
+      const installationId = req.headers["x-rent-installation-id"];
+      const nativeIdentity = req.method === "GET" && route === "/api/me" &&
+        req.headers["x-rent-native-request"] === "session-metadata";
+      const nativeRead = req.method === "GET" && TAB_ID.test(installationId || "") &&
+        req.headers["x-rent-client-id"] === installationId &&
+        (route === "/api/me" || /^\/api\/attachments\/[0-9a-f-]{36}$/i.test(route) || route === "/api/reports.xlsx");
+      const pageKey = nativeDownload || nativeRead || nativeIdentity || isPushApiRoute(req.method, route) ? null : workspaces.touch(sessionKey, user, req.headers["x-rent-client-id"],
+        req.headers["x-rent-client-version"], mutation.has(req.method) && !control);
+      if (mutation.has(req.method) && !control && route !== "/api/logout") {
+        requireThat(req.headers["x-rent-client-version"] === APPLICATION_VERSION,
+          "页面版本已更新，请先保存本机工作，再刷新页面；原请求和草稿会保留。", 503, "CLIENT_UPDATE_REQUIRED");
+      }
+      function reauthenticate() {
+        if ((mutation.has(req.method) || route === "/api/reports.xlsx") && !control) writeAdmission();
+        const currentSession = store.db.prepare("SELECT user_id,expires_at FROM sessions WHERE token_hash=?").get(digest(token));
+        const currentUser = store.read("users", user.id);
+        requireThat(currentSession?.user_id === user.id && currentSession.expires_at > Date.now() && currentUser?.active,
+          "此请求的登录会话已经失效，请重新登录后提交。", 401, "UNAUTHORIZED");
+        return currentUser;
+      }
+      async function authenticatedBody() {
+        const body = await readObject(req);
+        reauthenticate();
+        return body;
+      }
+      if (await pushHttp.authenticated({ req, res, route, user, reauthenticate, send })) return;
+      if (req.method === "GET" && route === "/api/me") return send(res, 200, { user: publicUser(user), csrfToken: session.csrf, serverId: store.serverId });
+      if (req.method === "POST" && route === "/api/me/reminders") {
+        const body = await authenticatedBody();
+        requireThat(Object.keys(body).sort().join(",") === "expectedVersion,receiveReminders" &&
+          typeof body.receiveReminders === "boolean", "请明确是否接收提醒。");
+        const current = reauthenticate();
+        requireThat(current.roles.some(role => role !== "admin"), "当前账号没有业务查看权限。", 403, "FORBIDDEN");
+        expected(current, body.expectedVersion, "账号提醒设置");
+        const next = { ...current, receiveReminders: body.receiveReminders, version: current.version + 1 };
+        store.transaction(() => {
+          store.db.prepare("UPDATE users SET json=? WHERE id=?").run(json(next), current.id);
+          desktopNotifications.revokeUser(current.id);
+          push.revokeUser(current.id);
+          audit(store, "account.reminders", current.id, next.receiveReminders ? "本人开启提醒" : "本人关闭提醒",
+            { receiveReminders: current.receiveReminders }, { receiveReminders: next.receiveReminders });
+        });
+        return send(res, 200, { user: publicUser(next) });
+      }
+      if (req.method === "POST" && route === "/api/desktop/register") {
+        const body = await authenticatedBody();
+        return send(res, 201, desktopNotifications.register(reauthenticate(), sessionKey, body));
+      }
+      if (req.method === "POST" && route === "/api/desktop/update-access") {
+        const body = await authenticatedBody();
+        return send(res, 200, updateCache.issue(reauthenticate(), body, sessionKey));
+      }
+      if (req.method === "POST" && route === "/api/desktop/revoke") {
+        const body = await authenticatedBody();
+        requireThat(Object.keys(body).length === 0, "停用通知不需要其他参数。");
+        store.transaction(() => { desktopNotifications.revokeUser(user.id); store.changed(); });
+        return send(res, 200, { ok: true });
+      }
+      if (req.method === "GET" && route === "/api/system/status") {
+        return send(res, 200, { applicationVersion: APPLICATION_VERSION, maintenance: gateStatus() });
+      }
+      if (req.method === "POST" && route === "/api/workspaces/heartbeat") {
+        const body = await authenticatedBody();
+        requireThat(TAB_ID.test(req.headers["x-rent-client-id"] || "") &&
+          typeof body.ready === "boolean" &&
+          (body.maintenanceId === null || typeof body.maintenanceId === "string" && TAB_ID.test(body.maintenanceId)) &&
+          typeof body.reason === "string" && Object.hasOwn(WORKSPACE_REASONS, body.reason),
+        "工作页面状态格式无效。");
+        workspaces.heartbeat(pageKey, body);
+        return send(res, 200, { applicationVersion: APPLICATION_VERSION, maintenance: gateStatus() });
+      }
+      if (req.method === "POST" && route === "/api/logout") {
+        store.transaction(() => {
+          pushHttp.logout(user.id, req);
+          desktopNotifications.revokeSession(sessionKey);
+          store.db.prepare("DELETE FROM sessions WHERE token_hash=?").run(digest(token));
+        });
+        workspaces.removeSession(sessionKey);
+        return send(res, 200, { ok: true }, { "Set-Cookie": "rent_session=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0" });
+      }
+      if (req.method === "POST" && route === "/api/change-password") {
+        const body = await authenticatedBody();
+        requireThat(store.read("users", user.id)?.active &&
+          store.db.prepare("SELECT 1 FROM sessions WHERE token_hash=?").get(digest(token)),
+        "账号会话已经失效，请重新登录。", 401, "UNAUTHORIZED");
+        const failed = passwordAttempts.get(user.id);
+        if (failed?.until > Date.now()) fail("旧密码尝试过多，请稍后再试。", 429, "RATE_LIMIT");
+        password(body.newPassword);
+        const row = store.db.prepare("SELECT salt,password_hash FROM users WHERE id=?").get(user.id);
+        const validOld = typeof body.oldPassword === "string" && body.oldPassword.length <= 128 &&
+          crypto.timingSafeEqual(Buffer.from(hashPassword(body.oldPassword, row.salt), "hex"), Buffer.from(row.password_hash, "hex"));
+        if (!validOld) {
+          const count = (failed?.since > Date.now() - 15 * 60_000 ? failed.count : 0) + 1;
+          passwordAttempts.set(user.id, { since: Date.now(), count, until: count >= 6 ? Date.now() + 15 * 60_000 : 0 });
+          fail("旧密码不正确。", 403, "FORBIDDEN");
+        }
+        passwordAttempts.delete(user.id);
+        store.transaction(() => {
+          const previous = store.db.prepare("SELECT COUNT(*) AS count FROM sessions WHERE user_id=?").get(user.id).count;
+          const salt = crypto.randomBytes(24).toString("hex");
+          store.db.prepare("UPDATE users SET salt=?,password_hash=? WHERE id=?").run(salt, hashPassword(body.newPassword, salt), user.id);
+          store.db.prepare("DELETE FROM sessions WHERE user_id=?").run(user.id);
+          desktopNotifications.revokeUser(user.id);
+          push.revokeUser(user.id);
+          audit(store, "admin.password", user.id, "账号自行修改密码",
+            { activeSessions: previous }, { activeSessions: 0, passwordRotated: true });
+        });
+        return send(res, 200, { ok: true }, { "Set-Cookie": "rent_session=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0" });
+      }
+      if (req.method === "GET" && route === "/api/state") return send(res, 200, snapshot(store, user));
+      if (req.method === "POST" && route === "/api/preview") {
+        requireThat(user.roles.some(role => role !== "admin"), "当前账号没有业务权限。", 403, "FORBIDDEN");
+        const body = await authenticatedBody();
+        const fresh = store.read("users", user.id);
+        requireScope(fresh, parksOf(body.data));
+        requireKnownParks(store, parksOf(body.data));
+        const change = ["contractId", "expectedVersion", "effectiveDate"].some(key => Object.hasOwn(body, key)) ? body : null;
+        if (change) {
+          string(change.contractId, "关联合同", 80);
+          requireScope(fresh, scopeFor(store, "contract-change", change));
+        }
+        return send(res, 200, contractPreview(store, body.data, change));
+      }
+      if (req.method === "POST" && route === "/api/operations") {
+        const body = await authenticatedBody();
+        const result = applyOperation(store, user, body);
+        createNotifications(store);
+        return send(res, 200, result);
+      }
+      const operationId = /^\/api\/operations\/([0-9a-f-]{36})$/i.exec(route)?.[1];
+      if (req.method === "GET" && operationId) {
+        const row = store.db.prepare("SELECT result FROM operations WHERE actor=? AND id=?").get(user.id, operationId);
+        requireThat(row, "此操作没有服务器确认记录。", 404, "NOT_FOUND");
+        return send(res, 200, JSON.parse(row.result));
+      }
+      if (req.method === "POST" && route === "/api/attachments") return send(res, 200, await upload(req, store, user, url, reauthenticate));
+      const assetId = /^\/api\/attachments\/([0-9a-f-]{36})$/i.exec(route)?.[1];
+      if (req.method === "GET" && assetId) {
+        const row = store.db.prepare("SELECT * FROM attachments WHERE id=?").get(assetId);
+        requireThat(row && attachmentVisible(store, user, row.id), "附件不存在或当前账号无权读取。", 404, "NOT_FOUND");
+        const file = path.join(store.db._attachmentsDir, row.id);
+        requireThat(fs.existsSync(file) && fs.lstatSync(file).isFile(), "原始附件丢失，请联系管理员检查备份。", 409, "ARCHIVE");
+        const bytes = await fsp.readFile(file);
+        requireThat(bytes.length === row.size && digest(bytes) === row.sha256, "原始附件校验失败，请停止使用并检查备份。", 409, "ARCHIVE");
+        const fresh = reauthenticate();
+        requireThat(fresh?.active && attachmentVisible(store, fresh, row.id), "读取期间权限已变化。", 403, "FORBIDDEN");
+        res.writeHead(200, { "Content-Type": row.mime, "Content-Length": bytes.length,
+          "Cache-Control": "no-store", "X-Content-Type-Options": "nosniff",
+          "X-Frame-Options": "SAMEORIGIN", "Content-Security-Policy": "frame-ancestors 'self'",
+          "Content-Disposition": `${url.searchParams.get("download") === "1" || [".doc", ".docx"].includes(path.extname(row.name).toLowerCase()) ? "attachment" : "inline"}; filename*=UTF-8''${encodeURIComponent(row.name)}` });
+        return res.end(bytes);
+      }
+      if (req.method === "POST" && route === "/api/notifications/read") {
+        requireThat(user.receiveReminders, "当前账号未启用提醒权限。", 403, "FORBIDDEN");
+        const body = await authenticatedBody();
+        requireThat(Array.isArray(body.ids) && body.ids.length <= 200 && body.ids.every(id => typeof id === "string" && id.length <= 100), "提醒标识清单无效。");
+        store.transaction(() => {
+          const current = store.read("users", user.id);
+          requireThat(current?.active && current.receiveReminders, "提醒权限已变更。", 403, "FORBIDDEN");
+          const visible = new Set(snapshot(store, current).notifications.map(entry => entry.id));
+          for (const id of body.ids) {
+            requireThat(visible.has(id), "包含无权读取或已失效的提醒。", 403, "FORBIDDEN");
+            if (id.startsWith("application:")) {
+              store.db.prepare("INSERT OR IGNORE INTO inbox_reads(user_id,event_id) VALUES(?,?)").run(user.id, id);
+            } else store.db.prepare("INSERT OR IGNORE INTO notification_reads(id,user_id) VALUES(?,?)").run(id, user.id);
+          }
+          if (body.ids.length) store.changed();
+        });
+        return send(res, 200, { ok: true });
+      }
+      if (route.startsWith("/api/admin/")) requireRole(user, "admin");
+      if (req.method === "GET" && route === "/api/admin/pairings") {
+        return send(res, 200, pairing ? pairing.status() :
+          { available: false, error: "请先在主机窗口开启同事连接。", requests: [] });
+      }
+      const pairingAction = /^\/api\/admin\/pairings\/([0-9a-f-]{36})\/(approve|reject)$/.exec(route);
+      if (req.method === "POST" && pairingAction) {
+        const body = await authenticatedBody();
+        const actor = reauthenticate();
+        requireRole(actor, "admin");
+        requireThat(pairing, "同网配对尚未开启。", 409);
+        const result = pairingAction[2] === "approve" ? pairing.approve(actor.id, pairingAction[1], body) :
+          pairing.reject(pairingAction[1]);
+        store.transaction(() => audit(store, `admin.pairing.${pairingAction[2]}`, actor.id, "处理同网电脑配对",
+          undefined, { requestId: pairingAction[1] }));
+        return send(res, 200, result);
+      }
+      if (req.method === "GET" && route === "/api/admin/invitations") {
+        return send(res, 200, { ...invitations.list(user.id), delivery: invitationDelivery(publicOrigin, invitationPackageBuilder) });
+      }
+      if (req.method === "POST" && route === "/api/admin/invitations") {
+        const body = await readObject(req, 16 * 1024);
+        requireRole(reauthenticate(), "admin");
+        invitationRate(`issue:${user.id}`, 10);
+        const delivery = invitationDelivery(publicOrigin, invitationPackageBuilder);
+        requireThat(delivery.linkAvailable, delivery.reason, 409,
+          delivery.companyAccessRequired ? "COMPANY_ACCESS_REQUIRED" : "INVITATION_DELIVERY_UNAVAILABLE");
+        return send(res, 201, { ...invitations.create(user.id, body), delivery });
+      }
+      const invitationId = /^\/api\/admin\/invitations\/([0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12})\/revoke$/.exec(route)?.[1];
+      if (req.method === "POST" && invitationId) {
+        const body = await readObject(req, 16 * 1024);
+        requireRole(reauthenticate(), "admin");
+        return send(res, 200, invitations.revoke(user.id, invitationId, body));
+      }
+      if (req.method === "POST" && route === "/api/admin/invitations/package") {
+        const body = await readObject(req, 16 * 1024);
+        const authorize = () => {
+          requireRole(reauthenticate(), "admin");
+          requireThat(!closing, "主机正在停止，请稍后重试。", 503, "MAINTENANCE");
+          const delivery = invitationDelivery(publicOrigin, invitationPackageBuilder);
+          requireThat(delivery.packageAvailable, delivery.reason || "当前主机暂不能生成个人安装包。", 409,
+            delivery.companyAccessRequired ? "COMPANY_ACCESS_REQUIRED" : "INVITATION_PACKAGE_UNAVAILABLE");
+          return invitations.authorizePackage(user.id, body);
+        };
+        const invitation = authorize();
+        invitationRate(`package:${user.id}`, 6);
+        requireThat(!invitationPackageRunning, "主机正在生成另一份个人安装包，请稍后重试；不需要重复签发邀请。", 409, "INVITATION_PACKAGE_BUSY");
+        invitationPackageRunning = true;
+        try {
+          let bytes;
+          try {
+            bytes = await invitationPackageBuilder({ serverId: store.serverId, origin: publicOrigin, invitation });
+            requireThat(Buffer.isBuffer(bytes) && bytes.length >= 2 && bytes[0] === 0x4d && bytes[1] === 0x5a &&
+              bytes.length <= 32 * 1024 * 1024,
+              "安装包生成结果不可用。");
+          } catch {
+            // Builder failures can contain packet bytes or credentials; never forward their message or stack.
+            fail("个人安装包未能生成。邀请仍保留在当前页面，可重试下载，或撤销后重新签发；不要让员工配置网络。",
+              503, "INVITATION_PACKAGE_UNAVAILABLE");
+          }
+          authorize();
+          requireThat(!res.destroyed && !req.aborted, "下载连接已关闭，请在当前页面重试。", 409, "INVITATION_PACKAGE_INTERRUPTED");
+          invitations.packageDelivered(user.id, body, authorize);
+          res.writeHead(200, { "Content-Type": "application/octet-stream", "Content-Length": bytes.length,
+            "Cache-Control": "no-store", "Content-Disposition": `attachment; filename="employee-invitation-${invitation.id}.exe"` });
+          return res.end(bytes);
+        } finally { invitationPackageRunning = false; }
+      }
+      if (req.method === "GET" && route === "/api/admin/updates") return send(res, 200, updateStatus());
+      const updateAction = /^\/api\/admin\/updates\/(check|stage|install|cancel)$/.exec(route)?.[1];
+      if (req.method === "POST" && updateAction) {
+        const body = await authenticatedBody();
+        requireRole(store.read("users", user.id), "admin");
+        requireThat(updates && typeof updates[updateAction] === "function",
+          "当前启动方式不支持在线更新，请通过新版图形主机启动。", 409, "UPDATE_UNAVAILABLE");
+        requireThat(typeof body.requestId === "string" && TAB_ID.test(body.requestId), "更新请求标识无效。");
+        if (updateAction === "stage") string(body.releaseId, "更新版本标识", 160);
+        if (updateAction === "install") {
+          string(body.stagedId, "已下载更新标识", 160);
+          requireThat(body.expectedVersion === APPLICATION_VERSION, "当前程序版本已变化，请重新检查更新。", 409, "UPDATE_CONFLICT");
+        }
+        if (updateAction === "cancel") string(body.jobId, "更新任务标识", 160);
+        const responseSettled = new Promise(resolve => {
+          res.once("finish", resolve);
+          res.once("close", resolve);
+        });
+        const authorize = () => {
+          const current = reauthenticate();
+          requireRole(current, "admin");
+          return current.id;
+        };
+        let accepted;
+        try { accepted = await updates[updateAction](body, { actorId: user.id, responseSettled, authorize }); }
+        catch (error) {
+          if (error instanceof ApiError) throw error;
+          if (typeof error.code === "string" && error.code.startsWith("UPDATE_") &&
+            Number.isInteger(error.status) && error.status >= 400 && error.status < 600) {
+            const rejected = new ApiError(error.status, error.code, error.message);
+            if (/^[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/.test(error.diagnosticId || "")) {
+              rejected.diagnosticId = error.diagnosticId;
+            }
+            throw rejected;
+          }
+          throw error;
+        }
+        return send(res, 202, accepted);
+      }
+      if (req.method === "GET" && route === "/api/admin/users") return send(res, 200, { users: store.all("users").map(publicUser) });
+      if (req.method === "POST" && route === "/api/admin/users") {
+        const body = await authenticatedBody();
+        requireRole(store.read("users", user.id), "admin");
+        const details = userInput(store, body, true);
+        password(body.password);
+        requireThat(!store.db.prepare("SELECT id FROM users WHERE username=? COLLATE NOCASE").get(details.username), "账号已经存在。", 409, "CONFLICT");
+        let result;
+        store.transaction(() => {
+          const salt = crypto.randomBytes(24).toString("hex");
+          result = { id: uuid(), ...details, active: true, version: 1 };
+          store.db.prepare("INSERT INTO users(id,username,json,salt,password_hash) VALUES(?,?,?,?,?)")
+            .run(result.id, result.username, json(result), salt, hashPassword(body.password, salt));
+          audit(store, "admin.user.create", user.id, "建立账号", undefined, publicUser(result));
+        });
+        return send(res, 200, { user: publicUser(result) });
+      }
+      const userId = /^\/api\/admin\/users\/([0-9a-f-]{36})$/i.exec(route)?.[1];
+      if (req.method === "PUT" && userId) {
+        const body = await authenticatedBody();
+        requireRole(store.read("users", user.id), "admin");
+        const changes = userInput(store, body);
+        requireThat(typeof body.active === "boolean", "须明确账号启用状态。");
+        if (body.password !== undefined) password(body.password);
+        let result;
+        store.transaction(() => {
+          const old = store.read("users", userId);
+          expected(old, body.expectedVersion, "账号");
+          result = { ...old, ...changes, active: body.active, version: old.version + 1 };
+          if (old.roles.includes("admin") && old.active && (!result.roles.includes("admin") || !result.active)) {
+            requireThat(store.all("users").some(item => item.id !== old.id && item.active && item.roles.includes("admin")),
+              "至少保留一个启用的管理员账号。", 409, "CONFLICT");
+          }
+          store.db.prepare("UPDATE users SET json=? WHERE id=?").run(json(result), userId);
+          if (body.password !== undefined) {
+            const salt = crypto.randomBytes(24).toString("hex");
+            store.db.prepare("UPDATE users SET salt=?,password_hash=? WHERE id=?").run(salt, hashPassword(body.password, salt), userId);
+          }
+          const access = value => [value.roles, value.allParks, value.parks, value.canExport, value.receiveReminders, value.active];
+          if (body.password !== undefined || json(access(old)) !== json(access(result))) {
+            store.db.prepare("DELETE FROM sessions WHERE user_id=?").run(userId);
+            push.revokeUser(userId);
+            desktopNotifications.revokeUser(userId);
+          }
+          if (!result.active || !result.roles.includes("admin")) invitations.revokeIssuer(userId, user.id);
+          audit(store, "admin.user.update", user.id, "修改账号权限或密码", publicUser(old), publicUser(result));
+        });
+        return send(res, 200, { user: publicUser(result) });
+      }
+      if (req.method === "PUT" && route === "/api/admin/settings") {
+        const body = await authenticatedBody();
+        requireRole(store.read("users", user.id), "admin");
+        let next;
+        store.transaction(() => {
+          const old = JSON.parse(store.db.prepare("SELECT json FROM settings WHERE id=1").get().json);
+          next = validateSettings(body, old, Boolean(store.db.prepare("SELECT id FROM contracts LIMIT 1").get()));
+          store.db.prepare("UPDATE settings SET json=? WHERE id=1").run(json(next));
+          audit(store, "admin.settings.update", user.id, "调整提醒时间或离线期限", old, next);
+        });
+        return send(res, 200, { settings: next });
+      }
+      if (req.method === "GET" && route === "/api/admin/storage") {
+        const { scanBackups } = require("./backup.cjs");
+        const { backups, issues } = scanBackups(config.backupDir);
+        const attachmentBytes = store.db.prepare("SELECT COALESCE(SUM(size),0) AS total FROM attachments").get().total;
+        return send(res, 200, { dataDir: config.dataDir, backupDir: config.backupDir,
+          databaseBytes: fs.statSync(path.join(config.dataDir, "rent.sqlite")).size,
+          attachmentBytes, lastBackup: backups.find(item => item.path === lastBackup?.path) || backups[0] || null,
+          backupInventoryIssues: issues,
+          independentBackup: Boolean(independentBackup.status().lastSuccess),
+          independentBackupStatus: independentBackup.status(),
+          serverId: store.serverId, backupFailure, reminderFailure,
+          pendingBackup: Number(store.get("changes")) > Number(store.get("backed_up")) });
+      }
+      if (req.method === "POST" && route === "/api/admin/backup-target") {
+        const body = await authenticatedBody();
+        requireRole(store.read("users", user.id), "admin");
+        requireThat(Object.keys(body).sort().join(",") === "directory,expectedVersion" &&
+          typeof body.directory === "string" && Number.isSafeInteger(body.expectedVersion), "请填写独立备份文件夹并确认当前设置版本。");
+        requireThat(!backupRunning && !backupTargetSaving, "备份或设置正在进行，请稍后重试。", 409, "CONFLICT");
+        requireThat(body.expectedVersion === independentBackup.status().version, "备份位置已被修改，请重新打开系统管理。", 409, "CONFLICT");
+        backupTargetSaving = true;
+        let targetSaved = false;
+        try {
+          const candidate = await independentBackup.prepare(body.directory);
+          reauthenticate();
+          requireRole(store.read("users", user.id), "admin");
+          requireThat(body.expectedVersion === independentBackup.status().version, "备份位置已被修改，请重新打开系统管理。", 409, "CONFLICT");
+          independentBackup.save(candidate, body.expectedVersion, user.id);
+          targetSaved = true;
+          backupTargetSaving = false;
+          const result = await makeBackup();
+          reauthenticate();
+          requireRole(store.read("users", user.id), "admin");
+          return send(res, 200, { target: independentBackup.status(), backup: result });
+        } catch (error) {
+          reauthenticate();
+          requireRole(store.read("users", user.id), "admin");
+          if (targetSaved && error instanceof ApiError) {
+            error.backupTarget = independentBackup.status();
+            error.message = "备份位置已保存。" + error.message;
+          }
+          if (error.code === "INDEPENDENT_BACKUP") {
+            if (error.cause) console.error("独立备份位置检查失败：", error.cause.code || error.cause.name, error.cause.message);
+            throw new ApiError(400, "BACKUP_TARGET", error.message);
+          }
+          throw error;
+        } finally { backupTargetSaving = false; }
+      }
+      if (req.method === "POST" && route === "/api/admin/backup") {
+        await authenticatedBody();
+        requireRole(store.read("users", user.id), "admin");
+        store.transaction(() => audit(store, "admin.backup", user.id, "手动请求本机备份"));
+        const result = await makeBackup();
+        reauthenticate();
+        requireThat(store.read("users", user.id)?.active && store.read("users", user.id).roles.includes("admin"), "备份期间管理权限已变化。", 403, "FORBIDDEN");
+        return send(res, 200, { name: result.name, createdAt: result.createdAt, fileCount: result.fileCount, bytes: result.bytes,
+          independentBackup: result.independentBackup });
+      }
+      if ((req.method === "GET" && route === "/api/reports.xlsx") || (req.method === "POST" && route === "/api/exports/authorize")) {
+        requireThat(user.canExport && user.roles.some(role => role !== "admin"), "当前账号没有报表导出权限。", 403, "FORBIDDEN");
+        const input = req.method === "GET" ? Object.fromEntries(url.searchParams) : await authenticatedBody();
+        if (req.method === "POST") requireThat(input.format === "pdf", "仅支持授权当前可见的 PDF 打印报表。");
+        const current = store.read("users", user.id);
+        requireThat(current?.active && current.canExport && current.roles.some(role => role !== "admin"), "导出权限已变化。", 403, "FORBIDDEN");
+        const snap = snapshot(store, current);
+        const filters = Reporting.select(snap, input).filters;
+        store.transaction(() => audit(store, "business.export", user.id, `导出 ${req.method === "GET" ? "xlsx" : "pdf"} ${json(filters)}`));
+        if (req.method === "POST") return send(res, 200, { ok: true });
+        const bytes = buildWorkbook(snap, filters);
+        res.writeHead(200, { "Content-Type": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+          "Content-Disposition": `attachment; filename="rent-report-${filters.month}.xlsx"`, "Cache-Control": "no-store" });
+        return res.end(bytes);
+      }
+      fail("地址不存在。", 404, "NOT_FOUND");
+    } catch (error) {
+      if (error instanceof ApiError || error instanceof SetupError || error instanceof PushError || error instanceof InvitationError ||
+          error instanceof DesktopError || error instanceof PairingError || error instanceof UpdateCacheError ||
+          (error.status === 400 && error.code === "VALIDATION")) {
+        if (res.headersSent) { res.destroy(); return; }
+        send(res, error.status, { error: { code: error.code, message: error.message, details: [],
+          ...(error.diagnosticId ? { diagnosticId: error.diagnosticId } : {}) },
+          ...(error.backupTarget ? { backupTarget: error.backupTarget } : {}) });
+      } else {
+        const diagnostic = diagnoseFailure(error, {
+          programDirectory: programDirectory || path.resolve(__dirname, ".."),
+          updateDirectory: config.updateDir || programDirectory || path.resolve(__dirname, ".."),
+          dataDirectory: config.dataDir, backupDirectory: config.backupDir,
+        });
+        console.error("中心服务内部错误：", JSON.stringify({ event: "api.failure",
+          route: diagnosticRoute, method: ["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"].includes(req.method) ? req.method : "OTHER",
+          ...diagnostic }));
+        if (res.headersSent) { res.destroy(); return; }
+        send(res, 500, { error: { code: "INTERNAL",
+          message: `中心服务处理失败，请联系管理员查看主机日志。诊断编号：${diagnostic.diagnosticId}`,
+          diagnosticId: diagnostic.diagnosticId, details: [] } });
+      }
+    }
+  });
+  try {
+    await new Promise((resolve, reject) => {
+      server.once("error", reject);
+      server.listen(port, host, () => { server.off("error", reject); resolve(); });
+    });
+    const address = server.address();
+    publicOrigin = config.publicOrigin || `${config.tls ? "https" : "http"}://${host === "::1" ? "[::1]" : host}:${address.port}`;
+    if (port === 0 && loopback && !reverseProxy) publicOrigin = `${config.tls ? "https" : "http"}://${host === "::1" ? "[::1]" : host}:${address.port}`;
+    const origin = new URL(publicOrigin);
+    requireThat((config.tls || reverseProxy ? origin.protocol === "https:" : origin.protocol === "http:") &&
+      origin.pathname === "/" && !origin.search && !origin.hash && !origin.username && !origin.password &&
+      (reverseProxy || !loopback || ["localhost", "127.0.0.1", "[::1]"].includes(origin.hostname)),
+    "公开访问地址必须和监听方式匹配。");
+    try { if (!sealedForUpdate) createNotifications(store); }
+    catch (error) { console.error("启动时生成提醒失败：", error.name, error.code || ""); throw error; }
+    const currentNotifications = user => snapshot(store, user).notifications;
+    push = createPushService({
+      store, config: pushConfiguration, publicOrigin,
+      resolveUser: id => store.read("users", id), listNotifications: currentNotifications,
+      resolveNotification: (user, id) => currentNotifications(user).find(entry => entry.id === id),
+      isWritable: () => gateStatus().phase === "idle" && !sealedForUpdate && !quiescing && !closing && !backupRunning,
+      ...(pushTransports ? { transports: pushTransports } : {}),
+    });
+    pushHttp = createPushHttpAdapter(push, publicOrigin);
+    push.start();
+    if (pairingConnection) pairing = await startPairing({ config, connection: pairingConnection,
+      createInvitation: (actor, grants) => invitations.create(actor, grants),
+      writable: () => gateStatus().phase === "idle" && !sealedForUpdate && !quiescing && !closing });
+    reminderTimer = setInterval(() => {
+      if (gateStatus().phase !== "idle" || sealedForUpdate || closing) return;
+      try {
+        createNotifications(store);
+        if (reminderFailure) { reminderFailure = null; store.set("reminder_failure", ""); }
+      } catch (error) {
+        reminderFailure = { at: now(), message: error.message };
+        store.set("reminder_failure", json(reminderFailure));
+        console.error("定时生成提醒失败：", error.message);
+      }
+    }, 60_000);
+    if (backupMinutes > 0) backupTimer = setInterval(() => {
+      if (gateStatus().phase !== "idle" || sealedForUpdate || closing) return;
+      if (!backupRunning && !backupTargetSaving && (Number(store.get("changes")) > Number(store.get("backed_up")) ||
+          independentBackup.status().pending || backupFailure)) {
+        makeBackup().catch(() => { /* Failure is logged and exposed by /api/admin/storage. */ });
+      }
+    }, backupMinutes * 60_000);
+    return {
+      url: publicOrigin, server, store, setupToken, push,
+      initializeAdministrator(input) {
+        writeAdmission();
+        requireThat(!closing && !quiescing && gateStatus().phase === "idle",
+          "主机正在维护、准备更新或停止，请完成后再建立管理员账号。", 503, "MAINTENANCE");
+        requireThat(loopback && !reverseProxy && !lan,
+          "首次管理员只能在本机主机管理窗口建立，不能从同事或云端入口初始化。", 403, "FORBIDDEN");
+        return initializeAdmin(store, input);
+      },
+      quiesceForUpdate, finishUpdateMaintenance,
+      getUpdateGateStatus: () => gateStatus(true),
+      getUpdateIdentity: () => ({ serverId: store.serverId,
+        schemaVersion: store.db.prepare("PRAGMA user_version").get().user_version,
+        applicationVersion: APPLICATION_VERSION, initialized: initialized() }),
+      close: async () => {
+        closing = true;
+        clearInterval(reminderTimer);
+        clearInterval(backupTimer);
+        if (pairing) await pairing.close();
+        await push.close();
+        await closeServer();
+        while (backupRunning) await new Promise(resolve => setTimeout(resolve, 50));
+        await store.waitForBackups();
+        store.close();
+      },
+    };
+  } catch (error) {
+    closing = true;
+    clearInterval(reminderTimer);
+    clearInterval(backupTimer);
+    if (pairing) await pairing.close();
+    if (push) await push.close();
+    if (server.listening) await closeServer();
+    store.close();
+    throw error;
+  }
+}
+
+module.exports = { startServer };
+
+function processApproved(store, app, reviewer) {
+  const db = store.db;
+  const p = app.payload;
+  const kind = app.kind;
+  const at = now();
+  if (kind === "contract") {
+    const { data, rows } = validateContract(store, p.data, app.creator);
+    if (data.renewalOf) {
+      const old = store.read("contracts", data.renewalOf);
+      requireThat(old && old.status !== "void", "续租所依据的旧合同已变化。", 409, "CONFLICT");
+    }
+    requireThat(!store.all("contracts").some(contract => contract.data.number === data.number && contract.status !== "void"), "合同编号已存在。", 409, "CONFLICT");
+    const contract = { id: uuid(), version: 1, status: "active", data, approvedAt: at, approvedBy: reviewer.id,
+      versions: [{ version: 1, data, at, actor: reviewer.id, reason: app.reason }] };
+    store.put("contracts", contract);
+    for (const row of rows) store.put("invoices", invoiceFrom(row, contract));
+    return contract.id;
+  } else if (["contract-change", "contract-void", "termination", "opening-balance"].includes(kind)) {
+    const contract = store.read("contracts", p.contractId);
+    expected(contract, p.expectedVersion, "合同");
+    requireThat(contract.status === "active", "只有生效中的合同可以办理此项业务。", 409, "CONFLICT");
+    const invoices = db.prepare("SELECT json FROM invoices WHERE contract_id=? AND status='active'").all(contract.id).map(parsed);
+    if (kind === "contract-change") {
+      date(p.effectiveDate, "变更生效日");
+      requireThat(p.effectiveDate >= contract.data.managementStartDate, "生效日不能早于原合同管账起点。");
+      const { data, rows } = validateContract(store, p.data, app.creator, p);
+      requireThat(data.number === contract.data.number && data.renewalOf === contract.data.renewalOf,
+        "变更不能改写原合同编号或续租来源，请提出新合同申请。", 409, "CONFLICT");
+      requireThat(data.managementStartDate === contract.data.managementStartDate && data.startDate === contract.data.startDate &&
+        !data.openingPayments.some((entry, index) => json(entry) !== json(contract.data.openingPayments[index])) &&
+        data.openingPayments.length === contract.data.openingPayments.length,
+      "已建立的合同起租日、管账起点及期初已收不可由变更重写；请另行提交明确的账务申请。", 409, "CONFLICT");
+      requireThat(rows.some(row => row.periodStart === p.effectiveDate) && invoices.some(invoice => invoice.periodStart === p.effectiveDate),
+        "生效日必须是原合同和新合同共有的租金期次起点，不得跨越已有期间。", 409, "CONFLICT");
+      requireThat(!invoices.some(invoice => invoice.periodStart < p.effectiveDate && invoice.periodEnd >= p.effectiveDate),
+        "生效日穿过已有收费期间，请选择期次边界。", 409, "CONFLICT");
+      requireThat(!rows.some(row => row.periodStart < p.effectiveDate && row.periodEnd >= p.effectiveDate),
+        "生效日穿过新收费期间，请选择期次边界。", 409, "CONFLICT");
+      const future = invoices.filter(invoice => invoice.periodStart >= p.effectiveDate);
+      requireThat(future.every(invoice => invoice.paidCents === 0 && invoice.openingPaidCents === 0),
+        "未来期次已有已收或期初已收，不能自动替换；请先办理明确的退款／调整结算。", 409, "CONFLICT");
+      for (const invoice of future) {
+        invoice.status = "superseded";
+        invoice.version++;
+        store.put("invoices", invoice);
+      }
+      contract.version++;
+      contract.data = data;
+      contract.versions.push({ version: contract.version, data, at, actor: reviewer.id, reason: app.reason });
+      store.put("contracts", contract);
+      for (const row of rows.filter(row => row.periodStart >= p.effectiveDate)) store.put("invoices", invoiceFrom(row, contract));
+    } else if (kind === "contract-void") {
+      requireThat(invoices.every(invoice => invoice.paidCents === 0 &&
+        (invoice.amountCents === 0 || invoice.dueDate > today())),
+      "合同存在已收或已到期未结应收，不能直接作废；请办理退租并逐期核定结算。", 409, "CONFLICT");
+      for (const invoice of invoices) { invoice.version++; invoice.status = "void"; store.put("invoices", invoice); }
+      contract.version++;
+      contract.status = "void";
+      contract.versions.push({ version: contract.version, data: contract.data, at, actor: reviewer.id, reason: app.reason });
+      store.put("contracts", contract);
+    } else if (kind === "termination") {
+      date(p.terminationDate, "退租日期");
+      requireThat(p.terminationDate >= contract.data.startDate && p.terminationDate <= contract.data.endDate, "退租日期须在原合同范围内。");
+      const affected = invoices.filter(invoice => invoice.periodEnd > p.terminationDate);
+      requireThat(Array.isArray(p.adjustments) && p.adjustments.length === affected.length, "退租须为所有跨过退租日或此后结束的期次逐笔填写核定金额和原因（包含零元）。");
+      const ids = new Set();
+      for (const adjustment of p.adjustments) {
+        requireThat(record(adjustment) && !ids.has(adjustment.invoiceId), "退租调整期次不可重复。");
+        ids.add(adjustment.invoiceId);
+        const invoice = affected.find(item => item.id === adjustment.invoiceId);
+        expected(invoice, adjustment.expectedVersion, "退租期次");
+        cents(adjustment.amountCents, "退租后核定金额");
+        string(adjustment.reason, "退租核定原因");
+        requireThat(adjustment.amountCents >= invoice.paidCents, "退租核定金额不能低于已收净额；请先明确办理退款。", 409, "CONFLICT");
+        invoice.amountCents = adjustment.amountCents;
+        invoice.manual = true;
+        invoice.reason = adjustment.reason.trim();
+        invoice.version++;
+        store.put("invoices", invoice);
+      }
+      contract.version++;
+      contract.status = "terminated";
+      contract.terminationDate = p.terminationDate;
+      contract.versions.push({ version: contract.version, data: contract.data, at, actor: reviewer.id, reason: app.reason });
+      store.put("contracts", contract);
+    } else {
+      requireThat(Business.feeKinds.includes(string(p.kind, "期初欠款类别", 80)), "请选择有效的费用类别。");
+      string(p.label, "期初欠款名称", 120);
+      cents(p.amountCents, "期初欠款金额");
+      date(p.periodStart, "欠款所属期起日");
+      date(p.periodEnd, "欠款所属期止日");
+      date(p.dueDate, "欠款到期日");
+      requireThat(p.periodStart <= p.periodEnd && p.periodEnd < contract.data.managementStartDate, "期初欠款只用于管账前结束的历史期间，须人工核定后审批。");
+      const originalData = contract.versions[0].data;
+      const invoice = { id: uuid(), rowId: `opening:${uuid()}`, version: 1, contractId: contract.id,
+        kind: p.kind.trim(), label: p.label.trim(), tenant: contract.data.tenant, locations: contract.data.locations,
+        rentTaxMode: originalData.rentTaxMode, lessorId: originalData.lessorId,
+        lessorOtherName: originalData.lessorOtherName,
+        propertyOwner: originalData.propertyOwner,
+        periodStart: p.periodStart, periodEnd: p.periodEnd, dueDate: p.dueDate, amountCents: p.amountCents,
+        openingPaidCents: 0, paidCents: 0, status: "active", manual: true, reason: app.reason, flags: ["人工期初欠款"] };
+      store.put("invoices", invoice);
+      contract.version++;
+      contract.versions.push({ version: contract.version, data: contract.data, at, actor: reviewer.id, reason: app.reason });
+      store.put("contracts", contract);
+    }
+  } else {
+    const payment = kind === "payment-void" ? store.read("payments", p.paymentId) : null;
+    if (kind === "payment-void") expected(payment, p.expectedVersion, "收款");
+    const invoice = store.read("invoices", payment?.invoiceId || p.invoiceId);
+    requireThat(invoice && invoice.status === "active", "应收期次已变更或作废，请重新同步。", 409, "CONFLICT");
+    if (kind !== "payment-void") expected(invoice, p.expectedVersion, "应收期次");
+    if (kind === "payment") {
+      cents(p.amountCents, "到账金额", true);
+      date(p.payDate, "实际到账日");
+      string(p.method, "收款方式", 120);
+      string(p.note, "收款备注", 2000, false);
+      const attachments = attachmentsIn(store, p.attachments, app.creator);
+      requireThat(invoice.paidCents + p.amountCents <= invoice.amountCents, "本笔收款超过该期剩余应收，请重新核对分配金额。", 409, "CONFLICT");
+      store.put("payments", { id: uuid(), version: 1, contractId: invoice.contractId, invoiceId: invoice.id,
+        amountCents: p.amountCents, payDate: p.payDate, method: p.method.trim(), note: p.note.trim(),
+        attachments, status: "active", approvedBy: reviewer.id, approvedAt: at });
+      invoice.paidCents += p.amountCents;
+    } else if (kind === "payment-void") {
+      requireThat(payment.status === "active", "收款已经作废。", 409, "CONFLICT");
+      requireThat(invoice.paidCents >= payment.amountCents, "此笔收款之后已有退款，作废将导致已收为负；请先处理退款结算。", 409, "CONFLICT");
+      invoice.paidCents -= payment.amountCents;
+      payment.version++;
+      payment.status = "void";
+      store.put("payments", payment);
+    } else if (kind === "refund") {
+      cents(p.amountCents, "退款金额", true);
+      date(p.refundDate, "实际退款日");
+      requireThat(["reopen", "reduce-charge"].includes(p.effect), "退款必须明确选定重新形成应收或同时减少应收。");
+      requireThat(invoice.paidCents >= p.amountCents, "退款不能超过该期已收净额。", 409, "CONFLICT");
+      const attachments = attachmentsIn(store, p.attachments, app.creator);
+      store.put("refunds", { id: uuid(), invoiceId: invoice.id, contractId: invoice.contractId,
+        amountCents: p.amountCents, refundDate: p.refundDate, effect: p.effect,
+        reason: app.reason, attachments, approvedBy: reviewer.id, approvedAt: at });
+      invoice.paidCents -= p.amountCents;
+      if (p.effect === "reduce-charge") invoice.amountCents -= p.amountCents;
+    } else if (kind === "invoice-adjustment") {
+      cents(p.amountCents, "调整后应收金额");
+      date(p.dueDate, "调整后到期日");
+      requireThat(p.amountCents >= invoice.paidCents, "调整后的应收不能低于已收净额，请先明确办理退款。", 409, "CONFLICT");
+      invoice.amountCents = p.amountCents;
+      invoice.dueDate = p.dueDate;
+      invoice.manual = true;
+      invoice.reason = app.reason;
+    }
+    invoice.version++;
+    store.put("invoices", invoice);
+    const contract = store.read("contracts", invoice.contractId);
+    contract.version++;
+    store.put("contracts", contract);
+  }
+}

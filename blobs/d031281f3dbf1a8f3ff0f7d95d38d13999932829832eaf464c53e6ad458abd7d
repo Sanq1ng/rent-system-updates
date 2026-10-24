@@ -1,0 +1,81 @@
+"use strict";
+
+const path = require("node:path");
+const crypto = require("node:crypto");
+const { constants } = require("node:os");
+
+const moduleProgram = path.resolve(__dirname, "..");
+const diagnosticIds = new WeakMap();
+const errorCodes = new Set([...Object.keys(constants.errno), "ERR_SQLITE_ERROR", "ERR_STREAM_PREMATURE_CLOSE",
+  "ERR_INVALID_ARG_TYPE", "ERR_OUT_OF_RANGE", "ERR_HTTP_HEADERS_SENT"]);
+const errorNames = new Set(["Error", "TypeError", "RangeError", "SyntaxError", "AbortError", "AggregateError"]);
+const fileOperations = new Set(["open", "close", "read", "write", "rename", "stat", "lstat", "fstat",
+  "mkdir", "rmdir", "unlink", "fsync", "scandir", "access", "copyfile", "chmod", "chown"]);
+
+function describeFailure(error, {
+  programDirectory = moduleProgram, updateDirectory, dataDirectory, backupDirectory,
+} = {}) {
+  const object = error !== null && (typeof error === "object" || typeof error === "function");
+  if (object && !diagnosticIds.has(error)) diagnosticIds.set(error, crypto.randomUUID());
+  const diagnosticId = object ? diagnosticIds.get(error) : crypto.randomUUID();
+  const roots = [[updateDirectory, "<update>"], [dataDirectory, "<data>"],
+    [backupDirectory, "<backup>"], [programDirectory, "<program>"]]
+    .filter(([directory]) => typeof directory === "string" && path.isAbsolute(directory));
+  function relativeTo(directory, file) {
+    const relative = path.relative(directory, file);
+    return relative === "" || relative !== ".." && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative)
+      ? relative.split(path.sep).join("/") : null;
+  }
+  function fileLocation(file) {
+    if (typeof file !== "string" || !path.isAbsolute(file)) return "<redacted>";
+    for (const [directory, label] of roots) {
+      const relative = relativeTo(directory, file);
+      if (relative === null) continue;
+      const known = label === "<update>" &&
+        /^update-state\/(?:state\.json(?:\.pending-[a-f0-9-]{36})?|owner\.sqlite(?:-journal)?)$/.test(relative);
+      return `${label}/${known ? relative : "<redacted>"}`;
+    }
+    return "<outside-known-directories>";
+  }
+  function frames(error) {
+    const stack = error.stack;
+    if (typeof stack !== "string" || typeof error.name !== "string" || typeof error.message !== "string") return [];
+    const header = error.message ? `${error.name}: ${error.message}` : error.name;
+    if (!stack.startsWith(header) || !["", "\n", "\r"].includes(stack.charAt(header.length))) return [];
+    const result = [];
+    for (const line of stack.slice(header.length, header.length + 16384).split("\n").slice(1, 25)) {
+      const match = line.match(/(?:\(|\s)([A-Za-z]:[\\/][^()\r\n]+|\/[^()\r\n]+|node:[a-z0-9_/-]+):(\d{1,8}):(\d{1,8})\)?$/i);
+      if (!match) continue;
+      const [, file, row, column] = match;
+      const relative = path.isAbsolute(file)
+        ? relativeTo(programDirectory, file) ?? relativeTo(moduleProgram, file) : null;
+      const source = relative !== null && relative.length <= 160 &&
+        /^(?:[A-Za-z0-9_-]+\/){0,3}[A-Za-z0-9_.-]+\.(?:cjs|js)$/.test(relative);
+      if (source || file.startsWith("node:")) {
+        result.push(`${source ? `<program>/${relative}` : file}:${row}:${column}`);
+        if (result.length === 6) break;
+      }
+    }
+    return result;
+  }
+  const causes = [], seen = new Set();
+  let current = error;
+  while (current && typeof current === "object" && !seen.has(current) && causes.length < 3) {
+    seen.add(current);
+    const item = {
+      name: errorNames.has(current.name) ? current.name : "Error",
+      code: errorCodes.has(current.code) ? current.code : "UNCLASSIFIED",
+      frames: frames(current),
+    };
+    if (Number.isSafeInteger(current.errno)) item.errno = current.errno;
+    if (Number.isSafeInteger(current.errcode)) item.errcode = current.errcode;
+    if (fileOperations.has(current.syscall)) item.syscall = current.syscall;
+    if (typeof current.path === "string") item.path = fileLocation(current.path);
+    if (typeof current.dest === "string") item.dest = fileLocation(current.dest);
+    causes.push(item);
+    current = current.cause;
+  }
+  return { diagnosticId, causes };
+}
+
+module.exports = { describeFailure };

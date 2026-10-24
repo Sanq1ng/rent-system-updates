@@ -1,0 +1,371 @@
+# Signed updates
+
+## Maintenance diagnostics (development, not retrofitted into sealed 0.4.19)
+
+Unexpected API failures display a diagnostic UUID matching the host maintenance
+log. Update state writes log that same exception UUID, the attempted job ID,
+action and phase, and whether acceptance, a transition or cancellation failed.
+Acceptance failures still reject the request before publishing a job receipt or
+starting downloads; no filesystem retry, lock deletion or success fallback is
+introduced. A later explicit request can retry once the underlying fault is
+resolved. Existing fatal journal failures still disable updates and request a
+safe host stop.
+
+If acceptance itself cannot save its journal, the API rejects with HTTP503 and
+`UPDATE_STATE_UNWRITABLE`, explicitly stating that no new update began. Its
+diagnostic UUID matches the filesystem failure log. A separate in-memory
+`requestError` keeps the update panel from presenting the preceding successful
+check as the result of that rejected request. It does not invent a successful
+job receipt or initiate work after a failed save, and is cleared only by a later durably accepted
+operation or a new process. An actual OS sharing/permission denial is respected,
+not bypassed with lock deletion or implicit repeated writes.
+
+The diagnostic implementation lives under `server/` so an immutable business
+release slot includes its own dependency. The stable host passes its diagnostic
+function into that slot, retaining a single exception identity across the
+bootstrap/update engine and the active business code. Direct server starts use
+the versioned implementation locally; the rotating log writer remains in the
+stable bootstrap, not a new mandatory root file inside business-only slots.
+
+The native host's anonymous-pipe writer serializes commands in submission order,
+not just individual writes under a mutex. A later status request must never
+overtake the initial start handshake or an earlier update command when the
+ThreadPool schedules tasks in a different order. Status requests remain
+coalesced, writes remain asynchronous, and disposal still prevents queued
+commands from writing into an exited worker. The strict child protocol is not
+relaxed to compensate for reordered commands.
+
+Diagnostics allowlist OS error codes, filesystem operations, numeric errno and
+bounded program/Node source locations. Update state and pending-file names are
+shown relative to `<update>`; private directory names and other file names are
+redacted. Error messages, first stack lines, request URLs/queries, bodies,
+cookies, tokens, account IDs and signed envelopes are not copied into these
+records. At most three cause records and six source locations per cause are
+included. This is not a blanket sanitizer for unrelated existing log producers.
+Preserve the diagnostic number and host logs before maintenance. A controlled
+Windows no-delete file handle reproduces a rejected rename, but does not prove
+the historical EPERM had that same cause.
+
+Do not poll a live Windows journal file to observe an update, including from a
+"read-only" diagnostic script. Controlled VM checks observed `EPERM/rename`
+while readers held the destination even with `FileShare.ReadWrite|Delete`.
+Use the authenticated host update-status API, or a fixture's in-memory status
+endpoint. Verify the actual journal only after its owning worker has stopped.
+The GUI smoke test uses an in-memory fixture bootstrap snapshot while running,
+then its parent verifies the durable phase, selected release and ledger after
+normal shutdown. Sharing flags alone are not a noninterference guarantee.
+
+Whole-program native helpers likewise never poll `state.json` while the new
+host is committing. Packages declaring `updateCompletionProtocol: 1` publish a
+small immutable `done-<job>.json` after the durable terminal state, identity
+checks and maintenance release; recovery handoff uses a separate immutable
+`handoff-<job>.json`. Existing matching notices are verified, never rewritten,
+so an observer cannot block a later journal replacement by reading them. Normal
+startup can republish a missing notice for an already committed, identity-matched
+job without reapplying the update. Helpers validate company, job, version and
+result, and never infer success from an absent notice. Legacy packages without
+this capability reopen with an explicit manual-confirmation message instead of
+falling back to live-journal polling or claiming automatic completion.
+
+Normal duplicate launch/resume also respects the existing full-update mutex
+before inspecting recovery records. The updater's own verified relaunch carries
+the already-supported update job flag, including client relaunches, so it does
+not deadlock on its own lease.
+
+## Windows 0.4.0 and later
+
+The managed Windows installation now supports signed **whole-program** updates:
+business code, the host launcher, the independent Windows client, notification
+code, the bundled Node runtime and reviewed database migrations. Configuration,
+certificates, ledger, originals, backups, account credentials and the persistent
+`电脑端资料` workspace are not update payloads.
+
+The host checks automatically after startup and periodically thereafter. It
+downloads and verifies an available release without stopping business work.
+The owner confirms installation in System Management. Observed pages must save
+and acknowledge the exact maintenance window. Unresponsive or busy pages block
+installation; drafts are never cleared or forcibly reloaded.
+
+An application review page is also unfinished work, even though it is not a
+dialog. Background synchronization and offline/online transitions retain the
+displayed original, checklist and review notes. The displayed decision remains
+bound to that application version; a newer server version must be reopened and
+checked, not approved with old ticks. An active review or inline original blocks
+page refresh, maintenance acknowledgement and native safe exit until the user
+finishes or leaves that page. Unsubmitted review notes are page-local, not a
+persisted draft: submit or copy them before deliberately leaving the page.
+
+Before replacement, the host verifies a complete backup and tries the declared
+migration on a private database copy, checking company identity and financial
+records. A separate native helper waits for the old processes to exit, copies
+only the signed allowlist with atomic per-file replacement, then verifies the
+whole result. The new host must pass identity/version/schema checks before
+opening business writes. Journaled interruptions resume through the original
+launcher. A same-schema, uncommitted failure can select the prior program.
+**After a schema change, incompatible old code is not restarted, and a backup
+is never automatically restored over the current ledger.**
+
+Employee installations follow only their paired host's committed release and
+still verify it against their own preinstalled publishing key. They download
+changed files automatically. An open window displays an update button; a hidden
+idle window can apply the host-approved release after its save handshake. No
+employee-side ledger is created. Unchanged large files are reused only after
+hash verification. Both sides retain the same profile path and company origin.
+
+### Resumable large-file downloads (0.4.10 and later)
+
+Host and employee staging share the same downloader. Signed files of at least
+4 MiB use 1 MiB HTTPS byte ranges, at most three requests concurrently. Each
+range has a 60-second deadline and at most three attempts, with bounded delays
+for transient network failures and HTTP 408/429/500/502/503/504. Invalid ranges,
+compression, redirects, unsafe destinations and integrity errors are not retried
+as transient failures. Servers must return an exact, uncompressed single 206
+range with the declared total and length; unsupported servers fail visibly
+rather than silently falling back to another source.
+
+Completed ranges and their checksums are durably saved beneath the external
+update storage's `downloads` directory. Cache identity includes the full URL,
+signed size, SHA-256 and chunk size. Repeating a download after cancellation,
+process exit or a failed attempt rechecks those ranges and requests only missing
+ones. A partly received range is downloaded again, not treated as complete.
+Cancellation stops and settles all active workers before releasing the update
+lease. Corrupt persisted ranges fail explicitly and require maintenance.
+
+The entire assembled file must still match its signed size and SHA-256. Only
+then can normal staging seal and reverify the complete release, and installation
+still requires the existing signature, authorization, backup and save handshake.
+Successful downloads remove their own chunk cache; failed/cancelled downloads
+retain it for retry. These records are not business data and never enter the
+signed release slot or public website. Abandoned download identities are retained,
+not automatically deleted along with unrelated update records.
+
+Small files and manifest requests retain whole-file HTTPS downloads. A large
+download without a signed digest and an external resume directory also retains
+the original transport; this includes the standalone website verification tool.
+Browser downloads of the first installer are a separate path: browser/download
+manager resume support is not an installer feature and is not changed here.
+Existing 0.4.9 clients must acquire the next signed release with their old
+downloader once; only subsequent staging can use the new capability. Do not
+modify the sealed 0.4.9 artifacts to bootstrap it.
+
+The current native client correlates each exit/save request with a fresh ID,
+negotiated through the page's `hello.exitRequestIds` capability. Late or untagged
+replies cannot authorize a different request. After saving, the page rechecks
+workspace generation, dirty work, busy operations, files, dialogs and navigation.
+The native window disables editing and defers notification navigation until the
+attempt ends; a failed attempt restores editing and the deferred target.
+
+For older pages without this capability, the client permits only one unanswered
+legacy request. A timeout keeps the window open and blocks another legacy
+request until the old reply arrives or a new document loads. That late reply
+only clears the wait; a fresh confirmation is still required. New pages also
+accept the old native protocol, but older executables must be updated to gain
+the native request-correlation protection.
+
+The older business-only format remains supported for compatible releases.
+The Linux supervisor supports that format, not the Windows native replacement
+protocol. Platform, API, workspace and supervisor compatibility remain explicit.
+Windows 0.3.3 and earlier do not gain this native updater by receiving a new
+web page: their initial transition requires stopped, backed-up maintenance.
+Existing browser drafts must first be synchronized or exported and imported;
+they do not automatically become a WebView2 profile.
+
+## Initial trust and publishing identity
+
+`config.example.json` has no feed or publisher key. Release builds include only
+`updates\trust-public.json`, containing an Ed25519 **public** key. The private key
+belongs on the developer's machine outside the program and delivery trees, in a
+directory restricted to the current Windows user and SYSTEM. Keep an independent
+encrypted backup. Do not send the key to employees or upload it with the website.
+
+The official policy may also contain `feedUrl`. The first-install wizard validates
+this public HTTPS URL and the Ed25519 keys before publication, then creates the
+external update configuration automatically. It does not enable company LAN
+access or override an existing installation's configuration or source sidecar.
+An absent default remains explicitly unconfigured; malformed defaults fail.
+
+Create a publishing identity once on the development computer:
+
+```powershell
+.\scripts\New-UpdatePublisher.ps1 `
+  -PrivateDirectory 'E:\租赁维护私密\发布身份' `
+  -NodePath 'D:\nodejs\node.exe'
+```
+
+The intended parent directory must already exist. This command refuses existing
+keys or public policy files instead of silently replacing the publishing identity.
+It reports paths and the public fingerprint, never the private key contents.
+
+## Preparing a release
+
+After changing and validating the code:
+
+```powershell
+.\scripts\Publish-WindowsRelease.ps1 `
+  -Version 0.4.1 -Sequence 2 `
+  -PrivateKey 'E:\租赁维护私密\发布身份\publisher-private.pem' `
+  -OutputDirectory 'E:\租赁发布\0.4.1' `
+  -NodePath 'D:\nodejs\node.exe'
+```
+
+For the dedicated public GitHub Pages repository, authenticate with the official
+GitHub CLI on the maintenance computer and run:
+
+```powershell
+node .\scripts\publish-github-pages.cjs `
+  'E:\租赁发布\0.4.6\website' 'Sanq1ng/rent-system-updates' `
+  'E:\租赁发布\github-pages-0.4.6' --confirm-public
+```
+
+The worktree must be new and outside the program and sealed website. The tool
+accepts only the signed manifest, verified hash-named blobs, installer and public
+download information. It refuses unapproved entries, validates the installer
+digest, enforces Git's 100 MiB file limit and Pages' 1 GB site limit, and preserves
+previous immutable blobs. Binary Git attributes prevent line-ending and filter
+rewrites. Publishing is one commit, so the site cannot promote a manifest before
+its files. No ledger, credential or private key is uploaded.
+
+The result means **pushed**, not verified live. Wait for Pages to finish building,
+then verify the real HTTPS manifest, signature, installer and every blob download:
+
+```powershell
+node .\scripts\publish-github-pages.cjs --verify-live 'E:\租赁发布\0.4.6\website'
+```
+
+This uses the product's public-only HTTPS transport and compares every published
+file with the sealed site, including the installer and download page. It neither
+uploads business information nor changes the release. A different signed release,
+damaged download, redirect, compressed response or TLS error fails verification.
+Do not assume mainland reachability from one development-network check. A hosting
+failure delays updates, not local accounting. The first installer is still not
+Authenticode-signed: verify its origin and digest through a trusted channel.
+
+Use a new output directory and a strictly increasing sequence. This prepares
+version declarations, rebuilds all three Windows components, packages a data-free
+installer, signs a whole-program manifest, and creates a simple download page.
+The chosen signing key must match the public policy included in the program.
+It does **not** upload anything or provision a hosting account.
+
+Only publish the resulting `website` directory. Upload immutable `blobs` first,
+then the installer and page, and switch `manifest.json` last. Keep old blobs
+available during downloads. The fixed HTTPS location must serve complete files
+directly, without redirects, authentication cookies, query strings or content
+compression. SHA-256 checks do not replace HTTPS or the release signature.
+The initial installer currently has no Authenticode signature; the Ed25519 update
+signature must not be advertised as a Windows publisher certificate.
+
+## Connecting the office host once
+
+After the publishing site is selected, deployed and reachable, stop the office
+host and run its bundled maintenance tool locally:
+
+```powershell
+.\runtime\node.exe .\maintenance.cjs configure-update-source `
+  --config 'C:\公司的软件\配置\config.json' `
+  --feed-url 'https://实际发布网站/rent/manifest.json' `
+  --source-stopped confirmed
+```
+
+This retains the exact previous configuration, uses the preinstalled public key,
+checks lifecycle leases and changes only update settings. It does not upload
+business data, start a host, create a new ledger, or prove the website is online.
+In 0.4.4 and later, these settings are saved beside the selected configuration as
+`config.json.updates.json`, not written into the network configuration. The exact
+LAN configuration, original snapshot and recovery hashes therefore remain valid.
+An existing separate source is backed up before replacement; malformed or linked
+records fail explicitly instead of falling back to another feed. Older embedded
+`updates` settings remain readable when no separate source exists. Preserve the
+separate source with the rest of the configuration when backing up or moving an
+installation; signed program updates never replace it. Network disable/restore
+does not revert the publishing source.
+Restart the original host and verify a real release end to end. Normal transport
+requires publicly routed HTTPS; explicit trusted private-network feeds remain
+available for controlled testing, not as a shortcut around TLS validation.
+
+Publishing storage is not a remote-control service. Automatic updates do not
+allow the developer to browse the office ledger or operate the office computer.
+The client can export a deliberately limited diagnostic file; further access
+requires a separately authorized support channel.
+
+## Recovery and retention
+
+Keep `更新\releases`, `更新\update-state`, `更新\client-runtime`, and the complete
+pre-update backups. Do not delete a journal to "unlock" installation. The native
+helper will refuse changed identities, damaged signatures, changed originals,
+invalid migration declarations and unsafe paths. Failed copies can be retried;
+failed schema compatibility requires maintenance, not an automatic downgrade.
+
+Online server backups do not contain employees' unsynchronized local work.
+Keep an independent backup device and a retention policy. The software does not
+delete old releases or backups without an explicit maintenance policy.
+
+## Approved office-LAN downloads
+
+The next Windows program supports fetching employee updates from the paired
+office host. This is not a new arbitrary private-network feed. The permanent
+public feed and publisher keys remain unchanged, and an older client can still
+bootstrap through that feed.
+
+Only the current, publisher-verified Windows release can be served. After a fresh
+installation, a check of the same published version first compares the complete
+local program inventory to its signed manifest. Only an exact match can seed the
+cache from local files, without downloading or replacing program blobs; mismatched
+same-version content fails visibly. This lets old employees obtain the new host's
+approved release even before that host has performed its first online upgrade.
+After an upgrade, the normally committed release supplies this cache.
+
+The host exposes a
+release-id and SHA-256 addressed file endpoint, never a file-system path, general
+proxy, future staged release, business attachment or backup. Single exact byte
+ranges are supported. Open handles are checked against the signed file size and
+digest; verified identities are cached by inode, size, modification and change
+times, so every chunk does not reread an entire large runtime. A changed identity
+forces verification again. Readers participate in the ordinary update drain and
+are bounded to three simultaneous transfers.
+
+Normal authenticated desktop login obtains a program-only grant, including for
+users who do not receive reminders. Grants are bound to the company, installation,
+active account, credential identity and existing desktop-device revocation record.
+Reminder registration completes first, so issuing a program grant does not
+invalidate the reminder token. Grants expire within 30 days; local copies use a
+separate Windows-user DPAPI purpose. Explicit logout clears the local grant and
+revokes the device through the existing session revocation mechanism. Restore
+revokes these device records even with the preceding format-7 restore machinery;
+the new restore code also removes the program-grant signing secret.
+
+The employee derives the one allowed private HTTPS origin and CA certificate from
+its saved, validated company connection. Credentials travel only in headers to
+that origin, never to the public feed or in a URL. Missing authorization or an
+ordinary host outage can use the original signed public route with an explicit
+notice. Certificate, company-identity, redirect and integrity failures stop the
+operation; they are not hidden by another download attempt. If the host is
+unreachable before its approved release metadata is obtained, employees do not
+independently select a newer public release.
+
+This cache reduces repeated employee Internet downloads. It does not make the
+host's initial Internet route faster and is unavailable while the office host is
+off or not reachable. Old clients require one normal upgrade before they can use
+the LAN path. No firewall changes, shares or extra cloud services are enabled.
+
+## Measuring a small update
+
+Staging reuses valid installed files, completed temporary files and identical new
+content already obtained under another signed path. Identical launch aliases do
+not need duplicate downloads. The journal records reused file counts, changed-file
+body sizes and, when supplied by the transport, actual received program-body bytes
+including resumed transfers. HTTP metadata and TLS overhead are not included.
+
+`scripts\Publish-WindowsRelease.ps1` accepts `-PreviousWebsiteDirectory` pointing
+to the actual older signed site. It writes `update-download-plan.json` beside the
+installer, outside the public site. Both signatures and release ordering are
+checked. The estimate assumes valid old files and no previous new-version cache;
+it is not a first-install ZIP size. Without a baseline the estimate is explicitly
+unknown, not zero.
+
+After building and testing the selected version, `-ReuseVerifiedBuild` keeps the
+exact current source-bound native artifacts instead of recompiling them again
+while sealing the release. Every existing artifact verifier must pass; failure
+stops packaging rather than silently reusing or rebuilding an unexpected program.
+Normal version preparation still preserves the existing whole-product native
+version/identity contract. This option does not allow stale component versions
+to be mixed merely to reduce a download.

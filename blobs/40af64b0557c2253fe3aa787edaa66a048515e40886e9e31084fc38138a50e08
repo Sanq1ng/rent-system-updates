@@ -1,0 +1,193 @@
+"use strict";
+const fs = require("node:fs");
+const fsp = require("node:fs/promises");
+const path = require("node:path");
+const { DatabaseSync } = require("node:sqlite");
+const { fail, readJSON, writeJSON, regularFile, hashFile, sameOrInside, payloadPath, verifyEnvelope, ensureDirectory } = require("./files.cjs");
+const { verifySlot, slotDirectory, setActive } = require("./releases.cjs");
+const { loadState, saveState, acquireUpdateLease, configFingerprint, HANDOFF, outcomeFile } = require("./state.cjs");
+const { resolveUpdateConfig } = require("./transport.cjs");
+
+function receiptFile(storage) { return path.join(storage, "update-state", "full-apply.json"); }
+function assertApplyPaths(program, storage, files) {
+  for (const item of files) {
+    const parts = payloadPath(item.path, true);
+    for (const file of [path.join(storage, "releases", "0".repeat(64), ...parts),
+      path.join(program, ...parts) + ".update-" + "0".repeat(32)]) {
+      if (file.length > 240 || file.slice(path.parse(file).root.length).split(path.sep).some(part => part.length > 120))
+        fail("UPDATE_PATH", "安装或更新目录过长，无法安全替换完整程序。请维护人员先迁移到较短的安装路径；未停机或改动账本。");
+    }
+  }
+}
+function databaseIdentity(config) {
+  const file = path.join(config.dataDir, "rent.sqlite");
+  regularFile(file);
+  const db = new DatabaseSync(path.toNamespacedPath(file), { readOnly: true });
+  try { return { serverId: db.prepare("SELECT value FROM meta WHERE key='server_id'").get()?.value,
+    schemaVersion: db.prepare("PRAGMA user_version").get().user_version }; }
+  finally { db.close(); }
+}
+function rootGuard(program, config, configFile) {
+  if (process.platform !== "win32") fail("UPDATE_COMPATIBILITY", "整程序交接只支持 Windows。");
+  for (const protectedPath of [config.dataDir, config.backupDir, config.updateDir, configFile, config.tls?.keyFile,
+    config.tls?.certFile, config.pushCredentialsFile].filter(Boolean)) {
+    if (sameOrInside(program, protectedPath) || sameOrInside(protectedPath, program))
+      fail("UPDATE_PATH", "整程序更新要求账本、配置、备份和更新暂存目录均位于程序目录之外。");
+  }
+}
+async function checkJob(program, config, jobId) {
+  const storage = config.updateDir;
+  if (!storage) fail("UPDATE_PATH", "整程序更新需要独立的更新目录。");
+  const state = loadState(storage), job = state.job;
+  if (!job || job.id !== jobId || !HANDOFF.has(job.phase) || job.fingerprint !== configFingerprint(config))
+    fail("UPDATE_STATE", "整程序更新交接记录与当前安装不符。");
+  const previous = await verifySlot(storage, job.previousReleaseId);
+  const settings = resolveUpdateConfig(config.updates);
+  const checked = verifyEnvelope(state.staged?.envelope, settings.trustedKeys);
+  if (checked.releaseId !== job.candidateReleaseId || checked.manifest.packageKind !== "windows-program" ||
+      checked.manifest.version !== job.targetVersion || checked.manifest.sequence < Math.max(state.highestSequence, state.highestSeenSequence || 0))
+    fail("UPDATE_SIGNATURE", "整程序更新没有匹配的可信签名。");
+  const candidate = await verifySlot(storage, checked.releaseId);
+  if (previous.manifest.packageKind !== "windows-program" || previous.manifest.version !== job.identity.applicationVersion)
+    fail("UPDATE_STATE", "缺少完整的更新前程序，不能交接。");
+  const identity = databaseIdentity(config);
+  if (identity.serverId !== job.identity.serverId || ![job.identity.schemaVersion, candidate.manifest.compatibility.schema].includes(identity.schemaVersion))
+    fail("UPDATE_IDENTITY", "账本身份或格式在交接期间发生变化。");
+  const { verifyBackup } = require(path.join(previous.root, "server", "backup.cjs"));
+  if (!job.backup || await hashFile(path.join(job.backup.path, "manifest.json")) !== job.backup.manifestHash ||
+      await hashFile(path.join(job.backup.path, "update-context.json")) !== job.backup.contextHash)
+    fail("UPDATE_BACKUP", "升级前备份或配置记录不完整。");
+  await verifyBackup(job.backup.path);
+  return { storage, state, job, previous, candidate, identity };
+}
+async function withLocks(program, config, action) {
+  const releaseUpdate = acquireUpdateLease(config.updateDir);
+  let releaseData;
+  try {
+    const { acquireLock } = require(path.join(__dirname, "..", "host.cjs"));
+    releaseData = acquireLock(config.dataDir);
+    return await action();
+  } finally { try { if (releaseData) releaseData(); } finally { releaseUpdate(); } }
+}
+
+async function prepareApply(program, config, configFile, jobId, rollback = false) {
+  rootGuard(program, config, configFile);
+  return withLocks(program, config, async () => {
+    const checked = await checkJob(program, config, jobId);
+    const { storage, state, job, previous, candidate, identity } = checked;
+    if (rollback && identity.schemaVersion !== job.identity.schemaVersion)
+      fail("UPDATE_SCHEMA_COMMITTED", "账本格式已经升级，不能降级旧程序，也不会拿旧备份覆盖账本。请保留当前程序与备份联系维护人员。");
+    const selected = rollback ? previous : candidate;
+    assertApplyPaths(program, storage, selected.manifest.files);
+    if (!rollback && !candidate.manifest.migrateFrom.includes(identity.schemaVersion))
+      fail("UPDATE_COMPATIBILITY", "新版没有声明支持当前账本格式。");
+    const original = Object.create(null);
+    for (const item of selected.manifest.files) {
+      const file = path.join(program, ...payloadPath(item.path, true));
+      if (fs.existsSync(file)) { regularFile(file); original[item.path] = await hashFile(file); }
+    }
+    const root = path.dirname(program);
+    const aliases = [
+      { source: "desktop/园区租赁主机.exe", target: path.join(root, "启动园区租赁.exe") },
+      { source: "desktop/园区租赁主机.exe", target: path.join(program, "园区租赁主机.exe") },
+    ].map(item => ({ ...item, sha256: selected.manifest.files.find(file => file.path === item.source).sha256 }));
+    const obsolete = (rollback ? candidate : previous).manifest.files.filter(file => !selected.manifest.files.some(item => item.path === file.path))
+      .map(file => ({ path: file.path, sha256: file.sha256 }));
+    const plan = { format: "industrial-rent-full-apply", formatVersion: 1, jobId, program, root, configFile,
+      storage, source: selected.root, sourceId: selected.releaseId, targetVersion: selected.manifest.version,
+      completionProtocol: readJSON(path.join(selected.root, "package.json")).updateCompletionProtocol === 1 ? 1 : 0,
+      completionFile: outcomeFile(storage, jobId), handoffFile: outcomeFile(storage, jobId, true),
+      serverId: job.identity.serverId, previousVersion: previous.manifest.version,
+      helper: path.join(candidate.root, "desktop", "应用程序更新.exe"),
+      helperSha256: candidate.manifest.files.find(file => file.path === "desktop/应用程序更新.exe").sha256,
+      rollback, files: selected.manifest.files, original, aliases, obsolete,
+      phase: "copying", createdAt: new Date().toISOString() };
+    writeJSON(receiptFile(storage), plan);
+    job.phase = "full-applying"; job.fullProgram = true; job.fullRollback = rollback; saveState(storage, state);
+    return plan;
+  });
+}
+
+async function verifyApplied(program, config, configFile, jobId) {
+  rootGuard(program, config, configFile);
+  return withLocks(program, config, async () => {
+    const { storage, state, job, previous, candidate } = await checkJob(program, config, jobId);
+    const receipt = readJSON(receiptFile(storage));
+    const selected = receipt.rollback ? previous : candidate;
+    if (receipt.format !== "industrial-rent-full-apply" || receipt.formatVersion !== 1 || receipt.jobId !== jobId ||
+        receipt.program !== program || receipt.configFile !== configFile || receipt.sourceId !== selected.releaseId)
+      fail("UPDATE_STATE", "复制结果不属于本次程序交接。");
+    for (const file of selected.manifest.files) {
+      const target = path.join(program, ...payloadPath(file.path, true));
+      if (regularFile(target).size !== file.bytes || await hashFile(target) !== file.sha256)
+        fail("UPDATE_HASH", `程序文件尚未完整替换：${file.path}。保留交接记录，可重新打开软件继续。`);
+    }
+    for (const alias of receipt.aliases) if (await hashFile(alias.target) !== alias.sha256) fail("UPDATE_HASH", "稳定启动入口尚未更新完整。");
+    if (!receipt.rollback) {
+      const migration = require(path.join(candidate.root, "server", "schema-update.cjs"));
+      if (migration.SCHEMA_VERSION !== candidate.manifest.compatibility.schema) fail("UPDATE_COMPATIBILITY", "数据库迁移组件与签名声明不符。");
+      job.schemaMigration = migration.migrateForUpdate(path.join(config.dataDir, "rent.sqlite"), job.identity);
+    } else if (databaseIdentity(config).schemaVersion !== job.identity.schemaVersion) fail("UPDATE_COMPATIBILITY", "不能将升级后的账本交给旧程序。");
+    setActive(storage, selected.releaseId);
+    job.phase = receipt.rollback ? "rollback-trial" : "trial";
+    job.nativeApplied = true; job.updatedAt = new Date().toISOString(); saveState(storage, state);
+    receipt.phase = "trial"; writeJSON(receiptFile(storage), receipt);
+    return { jobId, version: selected.manifest.version, rollback: receipt.rollback, configFile, root: receipt.root };
+  });
+}
+
+async function preflightBundle(config, candidate, identity, previousRoot) {
+  const database = path.join(config.dataDir, "rent.sqlite");
+  regularFile(database);
+  const trialRoot = path.join(config.updateDir, "preflight", `${candidate.releaseId}-${require("node:crypto").randomUUID()}`);
+  ensureDirectory(trialRoot);
+  const trialFile = path.join(trialRoot, "rent.sqlite");
+  try {
+    const db = new DatabaseSync(path.toNamespacedPath(database), { readOnly: true });
+    try {
+      const { backup } = require("node:sqlite");
+      await backup(db, path.toNamespacedPath(trialFile));
+    } finally { db.close(); }
+    const migration = require(path.join(candidate.root, "server", "schema-update.cjs"));
+    if (migration.SCHEMA_VERSION !== candidate.manifest.compatibility.schema) fail("UPDATE_COMPATIBILITY", "候选程序的账本声明与迁移组件不一致。");
+    migration.migrateForUpdate(trialFile, identity);
+    const verify = new DatabaseSync(path.toNamespacedPath(trialFile), { readOnly: true });
+    try {
+      if (verify.prepare("PRAGMA user_version").get().user_version !== candidate.manifest.compatibility.schema ||
+          verify.prepare("SELECT value FROM meta WHERE key='server_id'").get()?.value !== identity.serverId)
+        fail("UPDATE_IDENTITY", "私有副本试迁移没有保留原账套身份。");
+      const old = new DatabaseSync(path.toNamespacedPath(database), { readOnly: true });
+      try {
+        const { financialDigest } = require(path.join(previousRoot, "server", "schema-update.cjs"));
+        if (financialDigest(old) !== financialDigest(verify)) fail("UPDATE_IDENTITY", "私有副本试迁移改变了既有财务记录。");
+      } finally { old.close(); }
+    } finally { verify.close(); }
+  } finally {
+    for (const name of ["rent.sqlite", "rent.sqlite-wal", "rent.sqlite-shm"]) {
+      const file = path.join(trialRoot, name);
+      if (fs.existsSync(file)) { regularFile(file); await fsp.unlink(file); }
+    }
+    await fsp.rmdir(trialRoot);
+  }
+}
+
+async function main(args = process.argv.slice(2)) {
+  const [command, ...rest] = args;
+  const options = {};
+  for (let index = 0; index < rest.length; index += 2) {
+    const key = rest[index];
+    if (!["--program", "--config", "--job", "--rollback"].includes(key) || Object.hasOwn(options, key) || !rest[index + 1])
+      fail("UPDATE_REQUEST", "整程序交接参数无效。");
+    options[key] = rest[index + 1];
+  }
+  if (!["prepare", "verify"].includes(command) || !options["--program"] || !options["--config"] || !options["--job"] ||
+      options["--rollback"] !== undefined && options["--rollback"] !== "yes") fail("UPDATE_REQUEST", "整程序交接缺少明确路径或任务编号。");
+  const program = path.resolve(options["--program"]), configFile = path.resolve(options["--config"]);
+  const { resolveConfig } = require(path.join(__dirname, "..", "config.cjs"));
+  const config = resolveConfig(configFile, { programDirectory: program });
+  const result = command === "prepare" ? await prepareApply(program, config, configFile, options["--job"], options["--rollback"] === "yes") :
+    await verifyApplied(program, config, configFile, options["--job"]);
+  console.log(JSON.stringify(result));
+}
+if (require.main === module) main().catch(error => { console.error(error.message); process.exitCode = 1; });
+module.exports = { receiptFile, assertApplyPaths, databaseIdentity, checkJob, rootGuard, prepareApply, verifyApplied, preflightBundle };
