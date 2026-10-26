@@ -1,0 +1,42 @@
+"use strict";
+const VERSION = "0.4.21";
+const RESOURCE_REVISION = "1";
+const RESOURCE_QUERY = `v=${VERSION}&r=${RESOURCE_REVISION}`;
+importScripts(`/push-client.js?${RESOURCE_QUERY}`, `/push-worker.js?${RESOURCE_QUERY}`);
+const SHELL = `rent-shell-v${VERSION}-r${RESOURCE_REVISION}`;
+const PATHS = ["/", "/index.html", "/base.css", "/app.css", "/mobile.css", "/mobile.js", "/app.js", "/offline.js",
+  "/domain.js", "/business.js", "/reporting.js", "/ui.js", "/navigation.js", "/contract-form.js", "/invitation-entry.js", "/invitation-panel.js",
+  "/update-client.js", "/update-panel.js", "/native-client.js", "/desktop-update.js", "/desktop-client.js", "/push-client.js", "/push-panel.js", "/push-worker.js", "/icon.svg", "/manifest.webmanifest",
+  "/icons/icon-192.png", "/icons/icon-512.png", "/icons/maskable-512.png", "/icons/apple-touch-icon.png"];
+const ASSETS = PATHS.map(path => /\.(js|css)$/.test(path) ? `${path}?${RESOURCE_QUERY}` : path);
+self.addEventListener("install", event => {
+  event.waitUntil(caches.open(SHELL).then(cache => cache.addAll(ASSETS)));
+});
+// 由已保存工作且明确点击刷新的页面激活；不强制刷新其他正在填写的窗口。
+self.addEventListener("message", event => {
+  if (event.data?.type === "GET_APP_INFO") event.ports?.[0]?.postMessage({ version: VERSION, pushProtocol: 1 });
+  if (event.data?.type === "ACTIVATE_UPDATE") event.waitUntil(self.skipWaiting());
+});
+self.addEventListener("activate", event => {
+  event.waitUntil(Promise.all([
+    caches.keys().then(keys => Promise.all(keys.filter(key => key.startsWith("rent-shell-") && key !== SHELL)
+      .map(key => caches.delete(key)))),
+    self.clients.claim(),
+  ]));
+});
+self.addEventListener("fetch", event => {
+  if (event.request.method !== "GET") return;
+  const url = new URL(event.request.url);
+  if (url.origin !== self.location.origin || url.pathname.startsWith("/api/")) return;
+  if (!PATHS.includes(url.pathname)) return;
+  event.respondWith(fetch(event.request).then(response => {
+    if (response.ok) {
+      const saved = response.clone();
+      event.waitUntil(caches.open(SHELL).then(cache => cache.put(event.request, saved)));
+    }
+    return response;
+  }).catch(async () => (await (await caches.open(SHELL)).match(event.request)) ||
+    new Response("离线应用外壳不完整；请连接主机重新打开页面。", {
+      status: 503, headers: { "Content-Type": "text/plain; charset=utf-8" },
+    })));
+});

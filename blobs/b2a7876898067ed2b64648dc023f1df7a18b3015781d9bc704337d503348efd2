@@ -1,0 +1,144 @@
+(function (root, factory) {
+  "use strict";
+  if (typeof module === "object" && module.exports) module.exports = factory(require("./desktop-update.js"));
+  else root.RentDesktopClient = factory(root.RentDesktopUpdate);
+})(globalThis, function (DesktopUpdate) {
+  "use strict";
+  const UUID = /^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/;
+  function create(environment, { request, onTarget, onError, workState, saveWork }) {
+    const enabled = /\bRentWindows\/1\b/.test(environment.navigator.userAgent) &&
+      typeof environment.chrome?.webview?.postMessage === "function";
+    let identity = null, registering = null, registered = "", pendingTarget = null, generation = 0, accountEpoch = 0, exitGeneration = 0;
+    let status = "请登录后接收通知。";
+    let hostDirectoryPicker = false, directoryRequest = null;
+    const send = value => { if (enabled) environment.chrome.webview.postMessage({ protocol: 1, ...value }); };
+    function acceptTarget(value) {
+      if (!value || !["notifications", "application", "invoice"].includes(value.kind) ||
+          value.kind !== "notifications" && !UUID.test(value.id || "")) return false;
+      pendingTarget = value;
+      onTarget();
+      return true;
+    }
+    let resolveHello;
+    const hello = new Promise(resolve => { resolveHello = resolve; });
+    if (enabled) {
+      environment.chrome.webview.addEventListener("message", async event => {
+        const message = event.data;
+        if (message?.protocol !== 1) return;
+        if (message.kind === "configuration" && UUID.test(message.installationId || "")) {
+          identity = message.installationId;
+          hostDirectoryPicker = message.hostDirectoryPicker === true;
+          resolveHello(identity);
+        } else if (message.kind === "open") acceptTarget(message.target);
+        else if (message.kind === "notification-status" && typeof message.text === "string") {
+          status = message.text.slice(0, 200);
+          const label = environment.document.getElementById("desktop-notification-state");
+          if (label) label.textContent = status;
+        } else if (message.kind === "backup-directory-selected") {
+          if (!directoryRequest || message.requestId !== directoryRequest.id) return;
+          const pending = directoryRequest;
+          directoryRequest = null;
+          clearTimeout(pending.timer);
+          if (message.failed === true) pending.reject(new Error("主机文件夹选择未完成，请在保管账本的电脑上重试。原备份设置未改动。"));
+          else if (message.cancelled === true) pending.resolve(null);
+          else if (message.cancelled === false && typeof message.directory === "string" &&
+              message.directory.length > 0 && message.directory.length <= 190 && /^[A-Za-z]:\\/.test(message.directory))
+            pending.resolve(message.directory);
+          else pending.reject(new Error("备份文件夹选择结果无效，请重新选择。"));
+        } else if (message.kind === "prepare-exit") {
+          const attempt = ++exitGeneration;
+          const reply = (ready, reason) => {
+            if (attempt !== exitGeneration) return;
+            send({ kind: "exit-ready", ...(message.requestId == null ? {} : { requestId: message.requestId }), ready, reason });
+          };
+          const blocked = state => state.modalOpen || state.fileBusy || state.busy || state.navigating;
+          try {
+            if (message.requestId != null && !UUID.test(message.requestId)) throw new Error("电脑端退出请求无效，请重试。");
+            const state = workState();
+            const workspace = state.generation;
+            if (blocked(state)) {
+              reply(false, "请先完成当前填写或上传，再退出。");
+              return;
+            }
+            await saveWork();
+            const after = workState();
+            reply(!after.editorDirty && !blocked(after) && after.generation === workspace, "工作状态已变化，请核对并保存后重试。");
+          } catch (error) { onError(error); reply(false, "保存未完成，窗口仍保留。"); }
+        }
+      });
+      send({ kind: "hello", exitRequestIds: true });
+    }
+    async function installationId() {
+      if (!enabled) return null;
+      if (identity) return identity;
+      let timer;
+      try {
+        send({ kind: "hello", exitRequestIds: true });
+        return await Promise.race([hello, new Promise((resolve, reject) => {
+          timer = setTimeout(() => reject(new Error("电脑端连接未就绪，请重新打开软件。")), 5000);
+        })]);
+      } finally { clearTimeout(timer); }
+    }
+    const updates = DesktopUpdate.create({ request, installationId, send });
+    async function notificationAccount(user, serverId) {
+      if (!enabled) return;
+      const key = `${serverId}:${user.id}:${user.version}`;
+      if (!user.receiveReminders) {
+        if (registered !== key) { clearNotifications(); registered = key; }
+        return;
+      }
+      if (registered === key) return;
+      if (registering) return registering;
+      const epoch = generation;
+      registering = (async () => {
+        const result = await request("/api/desktop/register", { installationId: await installationId() });
+        if (generation !== epoch) return;
+        if (result.serverId !== serverId || result.userId !== user.id || !UUID.test(result.id || "") ||
+            !/^[A-Za-z0-9_-]{43}$/.test(result.token || "")) throw new Error("电脑通知授权与当前账号不符。");
+        send({ kind: "notification-account", ...result });
+        registered = key;
+      })();
+      try { await registering; }
+      finally { registering = null; }
+    }
+    async function account(user, serverId) {
+      if (!enabled) return;
+      const epoch = accountEpoch;
+      await notificationAccount(user, serverId).finally(() => {
+        if (epoch === accountEpoch) return updates.account(user, serverId).catch(onError);
+      });
+    }
+    function clearNotifications() { generation++; registered = ""; send({ kind: "notification-clear" }); }
+    function clear() {
+      accountEpoch++; clearNotifications(); updates.clear(); send({ kind: "update-clear" });
+      if (directoryRequest) {
+        const pending = directoryRequest; directoryRequest = null;
+        clearTimeout(pending.timer);
+        pending.reject(new Error("账号已退出或切换，本次备份文件夹选择未应用。"));
+      }
+    }
+    async function selectBackupDirectory() {
+      const epoch = accountEpoch;
+      await installationId();
+      if (epoch !== accountEpoch) throw new Error("账号已变化，本次备份文件夹选择未开始。");
+      if (!hostDirectoryPicker) throw new Error("请在保管账本的电脑上打开新版软件，再选择独立备份文件夹。");
+      if (directoryRequest) throw new Error("文件夹选择窗口已经打开，请先完成当前选择。");
+      return new Promise((resolve, reject) => {
+        const id = environment.crypto.randomUUID();
+        const timer = setTimeout(() => {
+          if (directoryRequest?.id !== id) return;
+          directoryRequest = null; reject(new Error("文件夹选择尚未确认，请关闭旧选择窗口后重试。"));
+        }, 300000);
+        directoryRequest = { id, resolve, reject, timer };
+        send({ kind: "backup-directory-select", requestId: id });
+      });
+    }
+    return { enabled, installationId, account, clear, status: () => status,
+      takeTarget: () => { const value = pendingTarget; pendingTarget = null; return value; },
+      test: () => send({ kind: "notification-test" }),
+      canSelectBackupDirectory: () => hostDirectoryPicker,
+      selectBackupDirectory,
+      support: () => send({ kind: "support-export" }) };
+  }
+  return Object.freeze({ create });
+});
